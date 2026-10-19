@@ -1,0 +1,63 @@
+.inspection-results{margin-top:24px}
+.video-status-filters{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 12px}
+.video-status-filters button{display:flex;align-items:center;justify-content:center;gap:10px;min-height:44px;padding:10px 14px;background:#eef3ed;color:#315c45;font-size:13px}
+.video-status-filters button[aria-pressed=true]{background:#315c45;color:#fff}
+.video-status-filters button:hover:not(:disabled){background:#e0e9df}
+.video-status-filters button[aria-pressed=true]:hover:not(:disabled){background:#234a35}
+.video-status-filters button span{font-variant-numeric:tabular-nums;font-weight:500}
+.status-filter-hint{max-width:75ch;font-size:13px;color:#526357;line-height:1.7;margin:0 0 20px}
+@media(max-width:700px){.video-status-filters{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}.video-status-filters button{font-size:14px;justify-content:space-between}.status-filter-hint{font-size:14px}}
+.inspection-tabs{display:flex;gap:24px;border-bottom:1px solid #dce4d9}
+.inspection-tabs button{background:transparent;color:#526456;border-radius:0;padding:12px 2px;border-bottom:2px solid transparent;min-height:44px;font-size:14px}
+.inspection-tabs button[aria-pressed=true]{color:#234a35;border-bottom-color:#315c45}
+.inspection-tabs button:hover:not(:disabled){background:#f0f4ee}
+.inspection-tabs button span{margin-left:7px;font-variant-numeric:tabular-nums}
+.inspection-toolbar{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-top:16px}
+.inspection-toolbar p,.group-empty{font-size:13px;color:#526357;line-height:1.7;margin:0;max-width:75ch}
+.inspection-toolbar button{min-height:44px;font-size:13px}
+.inspection-reason{color:#80512c;max-width:36ch;line-height:1.6}
+.group-empty{padding:24px 0}
+.inspection-results th{color:#526357}.inspection-results td{font-variant-numeric:tabular-nums}
+.batch-list{display:flex;flex-direction:column;gap:12px}
+.batch-group{border:1px solid #dce4d9;border-radius:14px;background:#fff;overflow:clip}
+.batch-group>summary{display:flex;align-items:center;gap:14px;list-style:none;cursor:pointer;padding:20px 22px;min-height:82px}
+.batch-group>summary::-webkit-details-marker{display:none}
+.batch-group>summary:hover{background:#f7f9f4}
+.batch-group>summary:focus-visible{outline-offset:-4px}
+.batch-chevron{color:#315c45;flex-shrink:0;transition:transform .18s ease-out}
+.batch-group[open] .batch-chevron{transform:rotate(90deg)}
+.batch-title{display:flex;flex-direction:column;gap:6px;min-width:0}
+.batch-title strong{font-size:15px;font-variant-numeric:tabular-nums}
+.batch-title small{font-size:12px;color:#526357;overflow-wrap:anywhere}
+.batch-counts{margin-left:auto;display:flex;justify-content:flex-end;align-items:center;flex-wrap:wrap;gap:8px;color:#526357;font-size:12px;font-variant-numeric:tabular-nums}
+.batch-count{white-space:nowrap}.batch-count.review,.batch-count.deleting{color:#80512c}.batch-count.saved{color:#315c45}
+.batch-expand{margin-left:8px;color:#315c45;font-size:12px}
+.batch-group[open] .batch-expand{display:none}
+.batch-group[open]{background:transparent;border-color:transparent;overflow:visible}
+.batch-group[open]>summary{background:#fff;border:1px solid #dce4d9;border-radius:14px}
+.batch-toolbar{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;padding:14px 0 16px;font-size:12px;color:#526357}
+.batch-toolbar .actions{margin:0}.batch-toolbar button{min-height:44px}
+.batch-video-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,360px),1fr));gap:16px;align-items:start}
+.batch-record{min-width:0}
+.batch-record>.video-card{border:1px solid #dce4d9;border-radius:14px;box-shadow:none;padding:18px}
+.batch-record .video-head h3{font-size:18px;overflow-wrap:anywhere}
+.batch-record .subtle{color:#526357}
+.batch-record .video-versions{margin:12px 0}
+.batch-record .version{grid-template-columns:minmax(0,1fr) auto auto;gap:6px 10px;color:#526357}
+.batch-record .version.current{color:#244d35}
+.batch-record .version strong{grid-column:1/-1;grid-row:2;white-space:normal;overflow-wrap:anywhere;line-height:1.6}
+.batch-record .version>span{min-width:0;overflow-wrap:anywhere}
+.version-history summary{display:flex;align-items:center;min-height:40px;cursor:pointer;font-size:12px;color:#315c45}
+.version-history summary::before{content:'';width:6px;height:6px;border-right:1px solid currentColor;border-bottom:1px solid currentColor;transform:rotate(-45deg);margin-right:9px}
+.version-history[open] summary::before{transform:rotate(45deg)}
+.batch-record .actions button{white-space:normal;min-height:44px}
+.batch-record .correction-fields{grid-template-columns:repeat(2,minmax(0,1fr))}
+.batch-record .correction-fields label{min-width:0}
+.batch-record .correction-fields label:last-child{grid-column:1/-1}
+.batch-record .saved-path{line-height:1.6}
+.capture-submit{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:16px;margin-top:20px}
+.capture-submit>div:first-child{max-width:70ch;color:#526357;font-size:13px;line-height:1.7;overflow-wrap:anywhere}
+.capture-submit p{margin:4px 0 0}.capture-submit .actions{margin:0}
+@media(max-width:700px){.inspection-toolbar{align-items:flex-start;flex-direction:column;gap:10px}.inspection-results .mobile-record small{color:#526357}.inspection-tabs{gap:20px}.batch-group>summary{padding:16px;gap:10px;flex-wrap:wrap}.batch-title{flex:1}.batch-counts{margin-left:28px;justify-content:flex-start;width:100%}.batch-toolbar{padding:14px 0}.batch-toolbar .actions{width:100%}.batch-toolbar button{flex:1;white-space:normal}.batch-video-grid{grid-template-columns:minmax(0,1fr);gap:12px}.batch-record>.video-card{padding:18px 16px}.batch-record .correction-fields{grid-template-columns:minmax(0,1fr)}.capture-submit .actions{width:100%}.capture-submit button{flex:1;white-space:normal;min-height:44px}}
+@media(prefers-reduced-motion:reduce){.batch-chevron{transition:none}}
+@media(max-width:700px){.site-header nav{flex-wrap:wrap;justify-content:flex-start}.section-title{align-items:flex-start;flex-wrap:wrap}.job-list>div{flex-wrap:wrap;gap:10px}.job-list>div span{margin-left:0;width:100%}}

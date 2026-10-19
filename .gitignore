@@ -1,0 +1,53 @@
+# 系统与编辑器
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# 本地环境变量与密钥
+.env
+.env.*
+!.env.example
+!.env.*.example
+/secrets/
+*.pem
+*.key
+*.p12
+*.pfx
+
+# 依赖与虚拟环境
+node_modules/
+.venv/
+venv/
+env/
+
+# 缓存与测试产物
+__pycache__/
+*.py[cod]
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage/
+
+# 构建、日志与临时文件
+build/
+dist/
+*.egg-info/
+logs/
+*.log
+tmp/
+temp/
+
+# 本地数据与采集结果，仅跟踪目录占位文件
+/data/*
+!/data/.gitkeep
+/outputs/*
+!/outputs/.gitkeep
+/out/
