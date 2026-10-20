@@ -290,6 +290,26 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
     async def archive_retry(identity: str):
         return await files.retry(identity)
 
+    @application.post("/api/slicing/classify/preview")
+    async def preview_slice_classification(payload: DirectoryInput):
+        from .slice_classify import plan_moves
+        return plan_moves(slicing.packages.store.list("items"), payload.directory)
+
+    @application.post("/api/slicing/classify/confirm")
+    async def confirm_slice_classification(payload: DirectoryInput):
+        from .slice_classify import apply_moves, plan_moves
+        plan = plan_moves(slicing.packages.store.list("items"), payload.directory)
+        result = apply_moves(plan)
+        for item in slicing.packages.store.list("items"):
+            path = item.get("path")
+            if not path:
+                continue
+            for destination in result["moved"]:
+                if Path(destination).name == Path(path).name:
+                    item["path"] = destination
+                    slicing.packages.store.save("items", item)
+        return {**plan, **result}
+
     @application.post("/api/slicing/packages/{identity}/confirm")
     async def confirm_slice_package(identity: str):
         return slicing.confirm_package(identity)

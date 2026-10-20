@@ -11,7 +11,6 @@ import { InspectionResults, VideoBatches, VideoStatusFilters } from './RecordGro
 import { batchDate, canDownload, syncVideoSelection, videoStatusOptions } from './record-groups';
 import type { CollectionJob, InspectionRecord } from './record-groups';
 
-const UploadAudit = lazy(() => import('./UploadAudit'));
 const Slicing = lazy(() => import('./Slicing'));
 
 type SessionEntry = {connected: boolean; user: string; hasSavedCredentials?: boolean; savedAccount?: string; credentialWarning?: string};
@@ -223,7 +222,8 @@ function VideoCard({video, directory, onRefresh, selected, onSelect}: {video: Vi
 export default function App() {
   const [tab, setTab] = useState<'collect' | 'videos' | 'audit' | 'slicing'>(() => {
     try {const saved=sessionStorage.getItem('simple-active-tab');
-      if (saved === 'videos' || saved === 'audit' || saved === 'slicing') return saved;
+      if (saved === 'audit' || saved === 'slicing') return 'slicing';
+      if (saved === 'videos') return saved;
     } catch { /* The initial page also works when local preferences are unavailable. */ }
     return 'collect';
   });
@@ -314,7 +314,7 @@ export default function App() {
     });
   }
   return <div className="app-shell"><header className="site-header"><div className="brand"><span className="brand-symbol">映</span><div><strong>简易版质检视频采集</strong><small>人工查看 · 手动更正 · 最终版留存</small></div></div>
-    <nav><button className={tab === 'collect' ? 'selected' : ''} onClick={() => setTab('collect')}>查询与批量采集</button><button className={tab === 'videos' ? 'selected' : ''} onClick={() => setTab('videos')}>视频查看与更正 <span>{state.totalCount}</span></button><button className={tab === 'audit' ? 'selected' : ''} onClick={() => setTab('audit')}>上传核对</button><button className={tab === 'slicing' ? 'selected' : ''} onClick={() => setTab('slicing')}>模型识别与切片</button></nav></header>
+    <nav><button className={tab === 'collect' ? 'selected' : ''} onClick={() => setTab('collect')}>查询与批量采集</button><button className={tab === 'videos' ? 'selected' : ''} onClick={() => setTab('videos')}>视频查看与更正 <span>{state.totalCount}</span></button><button className={tab === 'slicing' ? 'selected' : ''} onClick={() => setTab('slicing')}>模型识别与切片</button></nav></header>
     <main><section className={`hero ${tab === 'slicing' || tab === 'audit' ? 'compact' : ''}`}><div>{tab !== 'slicing' && <p className="eyebrow">独立简易版 · 北京时间</p>}<h1>{tab === 'slicing' ? '按模型识别视频片段' : tab === 'audit' ? '找出还没上传的视频' : tab === 'collect' ? '从质检实绩发起采集' : '亲自决定留下哪一版'}</h1><p>{tab === 'slicing' ? '从未切片视频中识别车斗和磁盘吊片段，保留原视频并将结果图片切到对应数据集。' : tab === 'audit' ? '读取本地目录中的视频文件名，分别核对车斗检测与磁盘吊的导入日志。' : tab === 'collect' ? '初次采集固定为质检开始后 5 分钟，时长 60 分钟。提交前逐条核对。' : '平台完成后先在线播放；确认原版或手动更正，最终才下载到你指定的文件夹。'}</p></div><div className="rule-card"><span>{tab === 'slicing' ? '默认模型抽样' : tab === 'audit' ? '共用一份本地清单' : '默认采集规则'}</span><strong>{tab === 'slicing' ? '30 秒 · 150 张' : tab === 'audit' ? '2 个数据集' : '+5 分钟'}</strong><small>{tab === 'slicing' ? '按目标区间自动选择切片间隔' : tab === 'audit' ? '各自读取日志 · 分别显示缺失名单' : '从质检开始时间计算 · 采集 60 分钟'}</small></div></section>
     {(tab === 'collect' || tab === 'videos') && <div className="connections"><Login service="source" connected={session.source.connected} user={session.source.user}
       savedAccount={session.source.savedAccount} hasSavedCredentials={session.source.hasSavedCredentials} credentialWarning={session.source.credentialWarning} onDone={refresh} />
@@ -323,7 +323,7 @@ export default function App() {
     {error && <p className="error global" role="alert">{error}</p>}{message && <p className="success global" role="status">{message}</p>}
     {bulkErrors.length > 0 && <div className="notice"><strong>这些条目已保留</strong><ul>{bulkErrors.map((item,i) => <li key={i}>{item}</li>)}</ul></div>}
     <PageBoundary key={tab}><Suspense fallback={<section className="panel" role="status">正在打开页面…</section>}>
-    {tab === 'slicing' ? <Slicing onConnect={() => setTab('audit')} /> : tab === 'audit' ? <UploadAudit defaultDirectory={state.directory} /> : tab === 'collect' ? <><section className="panel"><div className="section-title"><div><p className="eyebrow">第一步</p><h2>筛选质检实绩</h2></div><span>按保存的准入条件区分已批准与未批准</span></div>
+    {tab === 'slicing' ? <Slicing onConnect={() => setTab('slicing')} /> : tab === 'collect' ? <><section className="panel"><div className="section-title"><div><p className="eyebrow">第一步</p><h2>筛选质检实绩</h2></div><span>按保存的准入条件区分已批准与未批准</span></div>
       <AdmissionSettings<Search> searchId={search?.status === 'complete' ? search.id : undefined}
         disabled={!!busy || search?.status === 'running'} onBlockedChange={admissionChanged}
         onApplied={result => {if (result.search) setSearch(result.search);setSelected(new Set());setPlan(null);}} />

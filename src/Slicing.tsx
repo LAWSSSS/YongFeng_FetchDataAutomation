@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import type { FormEvent } from 'react';
 import { usePolling } from './usePolling';
 import { physicalFiles, physicalState, slicePage, sliceTitle, slicingControls } from './slicing-view';
 import './slicing.css';
@@ -69,6 +70,55 @@ function parseIntervals(value: string) {
     if (!match) throw new Error('区间请按“开始-结束秒”填写，多个区间用逗号分开。');
     return {start:Number(match[1]), end:Number(match[2])};
   });
+}
+
+function SliceLogin({onConnected}: {onConnected: (state: State) => void}) {
+  const [account, setAccount] = useState('');
+  const [password, setPassword] = useState('');
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    setBusy(true); setError('');
+    try {
+      const response = await fetch('/api/upload-audit/login', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({account, password})});
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.message || data.detail || '连接失败。');
+      setPassword('');
+      onConnected(await request<State>(''));
+    } catch (failure) { setError((failure as Error).message); }
+    finally { setBusy(false); }
+  }
+  return <form className="login-form" onSubmit={submit}><p className="notice">连接视觉AI平台后才能上传切片压缩包。这里不处理视频上传。</p>
+    <input aria-label="视觉AI账号" placeholder="账号" value={account} onChange={event => setAccount(event.target.value)} required />
+    <input aria-label="视觉AI密码" type="password" placeholder="密码" value={password} onChange={event => setPassword(event.target.value)} required />
+    <button disabled={busy}>{busy ? '连接中…' : '连接平台'}</button>
+    {error && <p className="error">{error}</p>}</form>;
+}
+
+function SliceClassify() {
+  const [root, setRoot] = useState('data/slices');
+  const [plan, setPlan] = useState<{items: {id: string; name: string; kind: string; message: string}[]} | null>(null);
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+  async function run(path: string) {
+    setBusy(true); setError('');
+    try {
+      const response = await fetch(`/api/slicing/classify/${path}`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({directory: root})});
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.message || data.detail || '分类失败。');
+      setPlan(data);
+    } catch (failure) { setError((failure as Error).message); }
+    finally { setBusy(false); }
+  }
+  return <section className="panel"><div className="section-title"><h2>按上传状态移动切片</h2><span>两处都未导入的留在原处</span></div>
+    <p className="slice-detail">车斗看 27892，磁盘吊看 27893。都已导入的进入已上传，只缺一边的进入对应文件夹。</p>
+    <label>分类根目录<input value={root} onChange={event => setRoot(event.target.value)} /></label>
+    <div className="actions"><button disabled={busy} onClick={() => void run('preview')}>预览分类</button>
+      <button className="secondary" disabled={busy || !plan} onClick={() => void run('confirm')}>确认移动</button></div>
+    {error && <p className="error">{error}</p>}
+    {plan && <ul>{plan.items.map(item => <li key={item.id}>{item.name} · {item.message}</li>)}</ul>}
+  </section>;
 }
 
 function CategoryCard({item, categoryName, category, packages = [], onUpdated}: {item: Item; categoryName: 'bed'|'magnet'; category: Category; packages?: SlicePackage[]; onUpdated: (state: State) => void}) {
@@ -225,7 +275,7 @@ export default function Slicing({onConnect}: {onConnect: () => void}) {
           return <span key={id}>{title}：{target?.name || name}{target?.selectedId ? ` · 数据集 ${target.selectedId}` : ''}</span>;
         })}
       </div>
-      {!state.connected && <p className="notice">切片需要视觉AI平台会话。<button className="link" onClick={onConnect}>前往“上传核对”连接</button></p>}
+      {!state.connected && <SliceLogin onConnected={acceptState} />}
       <div className="actions slice-main-actions">
         <button disabled={!!busy || settingsDirty} onClick={() => void run('execute', () => request('/execute-all',{requestId:uid(),expectedRevision:state.settingsRevision}), '已加入全部切片流程。')}>{busy === 'execute' ? '正在启动…' : '全部切片'}</button>
         <button className="secondary" disabled={!state.enabled || !!busy} onClick={() => void run('pause', () => request('/pause',{}),'已暂停，进度保留。')}>暂停</button>
@@ -233,6 +283,7 @@ export default function Slicing({onConnect}: {onConnect: () => void}) {
         <button className="link" disabled={!!busy} onClick={() => void run('refresh', () => request<State>(''),'状态已更新。')}>刷新</button>
       </div>
       <p className="slice-flow">扫描去重 → 共用抽帧 → 本地打包 → 排队导入。关闭网页后上传继续。</p>
+      <SliceClassify />
       {!!state.packages?.targets.length && <div className="slice-overall">{state.packages.targets.map(target =>
         <span key={target.id}>{target.name} · 上传 {target.uploading} · 导入 {target.importing} · 排队 {target.queued}</span>)}</div>}
       <div className="slice-overall"><span>{groups.length} 个视频</span><span>完成 {groups.filter(group=>group.records.every(item=>['complete','no_target'].includes(item.state))).length}</span><span>需处理 {groups.filter(group=>groupState(group) === 'attention').length}</span><span>已归档 {state.archive?.counts.complete || 0}</span></div>
