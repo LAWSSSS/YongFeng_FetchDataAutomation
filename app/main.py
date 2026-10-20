@@ -69,7 +69,7 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
     videos = VideoManager(jobs, target, data_dir, fixed_directory=fixed_directory,
                           require_mounted_external=production_data and video_directory is None,
                           staging_directory=staging_directory)
-    upload_audit = UploadAuditManager(store, audit_client)
+    upload_audit = UploadAuditManager(store, audit_client or AthenaClient(persist_connection=production_data))
     audit_moves = AuditMoveManager(store, upload_audit, videos)
     leases = FileLeases()
     videos.file_leases = leases
@@ -88,6 +88,8 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
     credential_errors: dict[str, str] = {}
 
     async def restore_saved_credentials():
+        if not production_data:
+            return
         for service, client in (("source", source), ("target", target)):
             try:
                 saved = await asyncio.to_thread(credentials.load, service)
@@ -405,7 +407,7 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
                 client.clear()
                 raise
             videos.wake.set()
-        if payload.remember:
+        if payload.remember and production_data:
             try:
                 await asyncio.to_thread(credentials.save, service, payload.account.strip(), payload.password)
                 saved_credentials[service] = {"account": payload.account.strip(), "password": payload.password}

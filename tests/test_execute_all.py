@@ -468,3 +468,17 @@ async def test_cross_volume_archive_updates_collection_upload_and_slicing_togeth
     assert indexed['links']['uploads']==['linked-upload'] and len(indexed['links']['collection'])==1
     assert not list(destination.parent.glob('*.moving'))
     await close_app(app)
+
+
+@pytest.mark.asyncio
+async def test_isolated_database_never_reads_or_saves_machine_connections(tmp_path,monkeypatch):
+    def forbidden(*args,**kwargs):
+        pytest.fail('isolated app touched real machine credentials')
+    monkeypatch.setattr('app.main.credentials.load',forbidden)
+    monkeypatch.setattr('app.main.credentials.save',forbidden)
+    monkeypatch.setattr('app.secure_store.load_connection',forbidden)
+    app=create_app(data_dir=tmp_path/'offline')
+    assert not app.state.upload_audit.client.persist_connection
+    async with app.router.lifespan_context(app):
+        assert not app.state.upload_audit.client.connected
+        assert not app.state.slicing.store.settings['enabled']
