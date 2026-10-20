@@ -16,7 +16,7 @@ class SlicingWorkflow:
             # A refresh scan must not write stale copies over a running worker.
             # Coalesce clicks into one durable follow-up scan instead.
             workflow = self.store.settings.get('workflow') or {}
-            workflow.update(enabled=True, phase='scan', requestedAt=now_iso(),
+            workflow.update(enabled=True, phase='scan', generation=workflow.get('generation', 0) + 1, requestedAt=now_iso(),
                             settingsRevision=expected_revision, requestId=request_id)
             self.store.settings['workflow'] = workflow
             self.store.settings['enabled'] = True
@@ -35,6 +35,7 @@ class SlicingWorkflow:
             return False
         from uuid import uuid4
         workflow = self.store.settings['workflow']
+        generation = workflow.get('generation', 0)
         self.run = self.store.get('runs', self.store.settings.get('latestRunId'))
         if not self.run:
             self.run = {'id': uuid4().hex, 'items': [], 'issues': [], 'excluded': {}, 'startedAt': now_iso()}
@@ -52,8 +53,14 @@ class SlicingWorkflow:
             await self._recover_moved_sources()
             if self.files:
                 self.files.refresh()
-            # Clicks arriving during the scan are coalesced into this refresh.
             workflow = self.store.settings['workflow']
+            # A click after either inventory was read needs a new snapshot;
+            # coalesce those clicks into one follow-up scan, not a lost intent.
+            if workflow.get('generation', 0) != generation:
+                workflow['phase'] = 'scan'
+                self.store.save_settings()
+                self.wake.set()
+                return False
             workflow.update(phase='processing', scannedAt=now_iso())
             self.store.settings['workflow'] = workflow
             self.store.save_settings()

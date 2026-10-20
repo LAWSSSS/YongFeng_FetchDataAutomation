@@ -415,3 +415,56 @@ async def test_manual_reclassification_rearchives_from_empty_to_completed(enviro
     assert len(files.rows('file_moves'))==2
     assert files.rows('files')[0]['archiveKind']=='complete'
     await close_app(app)
+
+
+@pytest.mark.asyncio
+async def test_click_during_inventory_schedules_one_follow_up_scan(environment,monkeypatch):
+    app,manager=environment
+    entered=asyncio.Event();release=asyncio.Event();scans=[]
+    original=manager._scan
+    async def delayed(identity):
+        scans.append(identity)
+        entered.set();await release.wait();await original(identity)
+    monkeypatch.setattr(manager,'_scan',delayed)
+    await manager.execute_all('first-scan',0)
+    running=asyncio.create_task(manager._workflow_scan())
+    await entered.wait()
+    await manager.execute_all('second-scan',0)
+    await manager.execute_all('third-scan',0)
+    release.set()
+    assert not await running
+    assert manager.store.settings['workflow']['phase']=='scan'
+    assert await manager._workflow_scan()
+    assert len(scans)==2 and scans[0]==scans[1]
+    assert manager.store.settings['workflow']['phase']=='processing'
+    await close_app(app)
+
+
+@pytest.mark.asyncio
+async def test_cross_volume_archive_updates_collection_upload_and_slicing_together(environment,tmp_path,monkeypatch):
+    from app.audit_moves import fingerprint
+    from tests.test_audit_moves import registered
+    app,manager=environment
+    bed,magnet=pair(manager,tmp_path,('complete','complete'))
+    path=Path(bed['path'])
+    collected=registered(app,path)
+    uploaded={'id':'linked-upload','dataset':'27912','name':path.name,'path':str(path),
+              'fileVersion':fingerprint(path.stat()),'state':'complete'}
+    app.state.uploads.store.save('items',uploaded)
+    monkeypatch.setattr('app.file_index.same_device',lambda *args:False)
+    await app.state.files.tick()
+    destination=tmp_path/'切片完成'/path.name
+    assert destination.read_bytes()==b'immutable file fixture' and not path.exists()
+    current=app.state.videos.store.get(collected['id'])
+    for field in ('revision','acceptedRevision','activeRevision','requests'):
+        assert current[field]==collected[field]
+    assert current['versions'][0]['filePath']==str(destination)
+    assert current['versions'][0]['startTime']==collected['versions'][0]['startTime']
+    upload=app.state.uploads.store.get('items','linked-upload')
+    assert upload['path']==str(destination) and upload['state']=='complete'
+    assert upload['uploadFileVersion']==uploaded['fileVersion']
+    indexed=app.state.files.state()['items'][0]
+    assert indexed['links']['slicing']==['bed','magnet']
+    assert indexed['links']['uploads']==['linked-upload'] and len(indexed['links']['collection'])==1
+    assert not list(destination.parent.glob('*.moving'))
+    await close_app(app)
