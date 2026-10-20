@@ -375,8 +375,12 @@ async def test_scan_uses_video_endpoint_when_generic_category_conflicts_and_dedu
     assert result["run"]["state"] == "scanning"
     state = manager.state()
     assert state["run"]["state"] == "complete", state["run"]
-    assert {row["sourceVideoId"] for row in state["items"]} == {"33", "34"}
-    assert state["run"]["excluded"] == {"cut": 1, "active": 1, "complete": 1, "submitted": 0}
+    assert {row["sourceVideoId"] for row in state["items"]} == {"31", "33", "34"}
+    active = next(row for row in state["items"] if row["sourceVideoId"] == "31")
+    assert active["state"] == "platform_processing"
+    assert active["categories"]["bed"]["taskId"] == "101"
+    assert active["categories"]["bed"]["state"] == "waiting"
+    assert state["run"]["excluded"] == {"cut": 1, "active": 0, "complete": 1, "submitted": 0}
     assert state["run"]["taskLogIndex"] and all(row["type"] in {"21", "22"} for row in state["run"]["taskLogIndex"])
 
 
@@ -779,3 +783,81 @@ async def test_slicing_state_and_settings_are_separate_and_revisioned(tmp_path):
     assert saved["settings"]["targetDatasetIds"] == {"27912": "801", "27944": "802"}
     with pytest.raises(Exception, match="已被其他页面修改"):
         manager.update_settings({**payload, "requestId": "settings-test-2"})
+
+
+def test_open_platform_work_shortens_the_next_check_without_changing_idle_wait(tmp_path):
+    from app.slicing import ACTIVE_TICK_SECONDS, TICK_SECONDS
+    from app.uploads import ACTIVE_POLL_SECONDS, CHECK_SECONDS
+    from app.videos import ACTIVE_POLL_SECONDS as VIDEO_ACTIVE, IDLE_POLL_SECONDS
+    app = create_app(data_dir=tmp_path / "poll-data")
+    assert app.state.videos._poll_timeout() == IDLE_POLL_SECONDS == 30
+    assert app.state.uploads._poll_timeout() == CHECK_SECONDS == 30
+    assert app.state.slicing._poll_timeout() == TICK_SECONDS == 30
+    app.state.videos.store.save({"id": "waiting-video", "versions": [{"state": "waiting"}]})
+    app.state.uploads.store.save("items", {"id": "queued-upload", "state": "queued", "dataset": "27912"})
+    app.state.slicing.store.save("items", {"id": "cutting", "state": "platform_processing", "categories": {}})
+    assert app.state.videos._poll_timeout() == VIDEO_ACTIVE == 8
+    assert app.state.uploads._poll_timeout() == ACTIVE_POLL_SECONDS == 8
+    assert app.state.slicing._poll_timeout() == ACTIVE_TICK_SECONDS == 8
+    app.state.uploads.store.save("items", {"id": "queued-upload", "state": "complete", "dataset": "27912"})
+    assert app.state.uploads._poll_timeout() == 30
+
+
+def test_progress_updates_keep_the_slicing_revision_until_the_outcome_changes(tmp_path):
+    app = create_app(data_dir=tmp_path / "revision-data")
+    manager = app.state.slicing
+    item = {"id": "analysis", "sourceDatasetId": "27912", "sourceVideoId": "7", "state": "analyzing",
+            "revision": 4, "progress": 1, "categories": {"bed": {"state": "pending", "intervals": []},
+                                                        "magnet": {"state": "not_applicable", "intervals": []}}}
+    manager.store.save("items", item)
+    item.update(progress=40, analysisDone=3, analysisPosition=12, revision=99)
+    manager._save_analysis_item(item)
+    assert manager.store.get("items", "analysis")["revision"] == 4
+    item["categories"]["bed"].update(state="ready", intervals=[{"start": 0, "end": 10}])
+    manager._save_analysis_item(item)
+    assert manager.store.get("items", "analysis")["revision"] == 5
+
+
+@pytest.mark.asyncio
+async def test_two_slots_cut_different_videos_and_a_duplicate_reuses_the_existing_task(tmp_path):
+    app = create_app(data_dir=tmp_path / "slots")
+    manager = app.state.slicing
+    manager.auth.access = "isolated"
+    remote = FakeSlicingRemote()
+    manager.remote = remote
+    manager.store.settings["targetDatasetIds"] = {"27912": "900", "27944": "901"}
+    created = []
+
+    async def create_cut(source, video, target, intervals, seconds, prefix, request):
+        created.append(str(video))
+        task = {"id": str(800 + len(created)), "type": 21, "status": 1,
+                "config": {"source": {"datasets": [{"videos": {"ids": [int(video)]}}]},
+                           "target": {"dataset": {"id": int(target)}}}}
+        remote.job_rows[str(source)]["21"].append(task)
+        return task
+
+    remote.create_cut = create_cut
+    for number in (1, 2, 3):
+        path = tmp_path / f"v{number}.mp4"
+        path.write_bytes(b"video")
+        manager.store.save("items", {"id": f"item-{number}", "sourceDatasetId": "27912", "sourceVideoId": str(number),
+            "name": path.name, "path": str(path), "fileVersion": source_version(path), "state": "platform_processing",
+            "revision": 2, "categories": {"bed": {"state": "ready", "intervals": [{"start": 0, "end": 10}],
+                "intervalSeconds": 1, "modelFingerprint": "bed"}, "magnet": {"state": "not_applicable", "intervals": []}}})
+        remote.video_rows["27912"].append({"id": number, "name": path.name, "cutStatus": 0})
+    duplicate = tmp_path / "dup.mp4"
+    duplicate.write_bytes(b"video")
+    manager.store.save("items", {"id": "item-dup", "sourceDatasetId": "27912", "sourceVideoId": "1",
+        "name": duplicate.name, "path": str(duplicate), "fileVersion": source_version(duplicate),
+        "state": "platform_processing", "revision": 2,
+        "categories": {"bed": {"state": "ready", "intervals": [{"start": 0, "end": 10}],
+            "intervalSeconds": 1, "modelFingerprint": "bed"}, "magnet": {"state": "not_applicable", "intervals": []}}})
+    for item in manager.store.list("items"):
+        if any(category.get("state") in {"ready", "waiting_slot"} for category in item["categories"].values()):
+            await manager._submit_ready(manager.store.get("items", item["id"]))
+    saved = {row["id"]: row for row in manager.store.list("items")}
+    assert created == ["1", "2"]
+    assert saved["item-3"]["categories"]["bed"]["state"] == "waiting_slot"
+    assert saved["item-dup"]["categories"]["bed"]["state"] == "waiting"
+    assert saved["item-dup"]["categories"]["bed"]["taskId"] == saved["item-1"]["categories"]["bed"]["taskId"]
+    assert saved["item-1"]["categories"]["bed"]["state"] == "waiting"

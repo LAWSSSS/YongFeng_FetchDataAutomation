@@ -21,6 +21,7 @@ from .upload_remote import UploadRemote, source_keys, video_names
 from .videos import Conflict
 
 CHECK_SECONDS = 30
+ACTIVE_POLL_SECONDS = 8
 STALL_SECONDS = 600
 RETRY_DELAYS = (10, 30, 60)
 MAX_FILE_BYTES = 10 * 1024 ** 3
@@ -248,9 +249,19 @@ class UploadManager:
                     self.target_info(dataset["id"])["message"] = "上传调度暂未完成，进度已保留，下一轮重新核对。"
                 self.store.save_settings()
             try:
-                await asyncio.wait_for(self.wake.wait(), CHECK_SECONDS)
+                await asyncio.wait_for(self.wake.wait(), self._poll_timeout())
             except TimeoutError:
                 pass
+
+    def _poll_timeout(self):
+        """Backoff stays on CHECK_SECONDS. Open imports and queued files are polled sooner."""
+        for item in self.store.list("items"):
+            if item.get("state") in {"queued", "importing"}:
+                return ACTIVE_POLL_SECONDS
+        for batch in self.store.list("batches"):
+            if batch.get("state") in {"importing", "verifying", "submitting"}:
+                return ACTIVE_POLL_SECONDS
+        return CHECK_SECONDS
 
     def scan(self, directory, request_id):
         directory = str(Path(directory or DEFAULT_DIRECTORY).expanduser())

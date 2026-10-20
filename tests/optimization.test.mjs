@@ -46,6 +46,14 @@ test('hidden pages do not poll and returning to the page resumes immediately',as
   visible=true;await poller.refresh();assert.equal(calls,2);poller.stop();
 });
 
+test('unsliced videos stay listed until the cut is finished',()=>{
+  const rows=[{name:'open',sourceVideoId:'1',sourceDatasetId:'27912',state:'platform_processing',categories:{bed:{state:'waiting'}}},
+    {name:'done',sourceVideoId:'2',sourceDatasetId:'27912',state:'complete',categories:{bed:{state:'complete'}}},
+    {name:'empty',sourceVideoId:'3',sourceDatasetId:'27944',state:'no_target',categories:{magnet:{state:'no_target'}}}];
+  const view=slicePage(rows,{status:'unsliced',source:'all',search:'',page:1,pageSize:12});
+  assert.deepEqual(view.rows.map(row=>row.sourceVideoId),['1']);
+});
+
 test('slicing filters compose before pagination and shrinking results clamp the page',()=>{
   const rows=Array.from({length:117},(_,index)=>({name:'视频 '+index,sourceVideoId:String(index),
     sourceDatasetId:index%2 ? '27912':'27944',state:index<100 ? 'pending':'complete',categories:{bed:{state:'pending'}}}));

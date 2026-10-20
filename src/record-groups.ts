@@ -25,6 +25,28 @@ export const videoStatusOptions: {value: 'all' | VideoCategory; label: string}[]
   {value:'deleting',label:categoryLabels.deleting},
 ];
 
+export type VideoSelection = {id: string; version: number; expectedRevision: number};
+
+export function syncVideoSelection<T extends {id: string; revision: number; activeRevision: number}>(
+  selection: Map<string, VideoSelection>, videos: T[],
+) {
+  if (!selection.size) return selection;
+  let changed = false;
+  const next = new Map(selection);
+  for (const [id, chosen] of selection) {
+    const video = videos.find(row => row.id === id);
+    if (!video) continue;
+    if (video.activeRevision !== chosen.version) {
+      next.delete(id);
+      changed = true;
+    } else if (video.revision !== chosen.expectedRevision) {
+      next.set(id, {...chosen, expectedRevision: video.revision});
+      changed = true;
+    }
+  }
+  return changed ? next : selection;
+}
+
 export function splitInspections(records: InspectionRecord[]) {
   return {approved: records.filter(record => !record.issue), unapproved: records.filter(record => !!record.issue)};
 }

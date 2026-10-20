@@ -290,6 +290,19 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
     async def archive_retry(identity: str):
         return await files.retry(identity)
 
+    @application.post("/api/slicing/packages/{identity}/confirm")
+    async def confirm_slice_package(identity: str):
+        return slicing.confirm_package(identity)
+
+    @application.get("/api/slicing/packages/{identity}/images/{name}")
+    async def slice_package_image(identity: str, name: str):
+        from fastapi.responses import FileResponse
+        try:
+            path = slicing.package_image(identity, name)
+        except ValueError as error:
+            raise HTTPException(404, str(error)) from None
+        return FileResponse(path, media_type="image/jpeg", headers={"Cache-Control": "private, no-store"})
+
     @application.post("/api/slicing/settings")
     async def slicing_settings(payload: SlicingSettingsInput):
         return slicing.update_settings(payload.model_dump())

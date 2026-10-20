@@ -84,6 +84,13 @@ def choose_slice_interval(
     return {"interval": seconds, "count": count, "withinTarget": True, "tooMany": False}
 
 
+def category_image_target(settings: dict, category: str) -> int:
+    """Bed stays at 180 for new videos. Magnet keeps the shared 150 target."""
+    if category == "bed":
+        return int(settings.get("bedTargetImages") or 180)
+    return int(settings.get("targetImages") or 150)
+
+
 def build_category_result(
     observations: Iterable[dict], *, interval: int, duration: float, positive_labels: set[str],
     target: int = 150, minimum: int = 100, maximum: int = 200,

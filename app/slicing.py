@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 import math
@@ -18,10 +19,15 @@ from pathlib import Path
 from uuid import uuid4
 
 from .slicing_workflow import SlicingWorkflow
-from .slicing_analysis import SharedSlicingAnalysis
+from .audit_moves import source_fingerprint
+from .slicing_analysis import SharedSlicingAnalysis, outcome_changed, revision_after_outcome
+from .slice_export import (package_identity, photo_names, read_jpeg, slice_timestamps, write_image_archive,
+                           PACKAGE_DATASETS)
+from .slice_packages import SlicePackageManager
+from .upload_remote import UploadRemote
 from .domain import now_iso
 from .file_leases import FileLeases
-from .slicing_core import build_category_result, sample_points
+from .slicing_core import build_category_result, category_image_target, sample_points
 from .slicing_remote import (ACTIVE_STATUSES, CUT_TYPES, FAILED_STATUSES, SUCCESS_STATUSES,
                              SlicingRemote, log_matches_video, parse_config, source_video_ids,
                              target_dataset_id, task_state)
@@ -32,6 +38,8 @@ ROOT = Path(__file__).resolve().parents[1]
 POLICY_VERSION = 1
 SAMPLING_VERSION = 2
 TICK_SECONDS = 30
+ACTIVE_TICK_SECONDS = 8
+PLATFORM_SLOT_LIMIT = 2
 SOURCE = {
     "27912": {"category": "bed", "name": "车斗", "targetName": "永锋车斗检测"},
     "27944": {"category": "magnet", "name": "磁盘吊", "targetName": "永锋-磁盘吊检测"},
@@ -310,6 +318,8 @@ def normalize_item_categories(item):
     active = descriptor["category"]
     for name, category in item.get("categories", {}).items():
         if name != active and not category.get("taskId") and category.get("state") != "not_applicable":
+            if category.get("intervals") or category.get("modelFingerprint") or category.get("packageId"):
+                continue
             category.update(state="not_applicable", errorCode="", message="此视频集不使用该类别模型。")
     category = item.get("categories", {}).get(active, {})
     if item.get("state") == "complete" and category.get("state") == "no_target":
@@ -359,9 +369,11 @@ class SlicingStore:
                 "workerPythonPath": python_path or str(ROOT / ".venv-slicing" / "bin" / "python"),
                 "sharedSampling": True, "sampleIntervalSeconds": 30, "magnetIntervalSeconds": 30,
                 "bedIntervalSeconds": 30, "magnetConfidence": 0.25, "targetImages": 150,
+                "bedTargetImages": 180,
                 "targetDatasetIds": {"27912": None, "27944": None}, "enabled": False,
                 "latestRunId": "", "settingsRequestIds": {}, "autoArchive": True,
-                "archiveCompletedDirectory": "切片完成", "archiveEmptyDirectory": "未检出目标"}
+                "archiveCompletedDirectory": "切片完成", "archiveEmptyDirectory": "未检出目标",
+                "reviewBeforeUpload": True, "localExport": True}
 
     def save_settings(self):
         self.db.execute("INSERT INTO simple_slicing_settings VALUES(1,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload",
@@ -403,6 +415,8 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
         self.start_lock = asyncio.Lock()
         self.fingerprint_cache = {}
         self.files = None
+        self.packages = SlicePackageManager(store.db, UploadRemote(auth), clock=self.clock)
+        self.slice_reader = read_jpeg
         self.leases.subscribe_moves(self.moved)
         self.run = self.store.get("runs", self.store.settings.get("latestRunId"))
         if self.run and self.run.get("state") in {"scanning", "running"}:
@@ -471,7 +485,8 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
                 "connected": bool(self.auth.connected), "user": self.auth.user if self.auth.connected else "",
                 "settings": self._safe_settings(), "settingsRevision": self.store.settings["revision"],
                 "run": run, "items": public_items, "counts": counts, "busy": self.busy,
-                "enabled": bool(self.store.settings.get("enabled"))}
+                "enabled": bool(self.store.settings.get("enabled")),
+                "packages": self.packages.state()}
 
     def update_settings(self, data):
         request = self.store.settings.get("settingsRequestIds", {})
@@ -712,12 +727,11 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
                         matched_job = job
                         status = task_state(job)
                         if status == "active":
-                            run["excluded"]["active"] += 1
                             break
                         if status == "complete":
                             run["excluded"]["complete"] += 1
                             break
-                    if matched_job and task_state(matched_job) in {"active", "complete"}:
+                    if matched_job and task_state(matched_job) == "complete":
                         continue
                     name = video_name(remote_video)
                     matches = local_by_name.get(name.casefold(), []) if name else []
@@ -729,6 +743,8 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
                             if category_name == applicable_category(source_id):
                                 category.update(state="attention", errorCode="task_log_unavailable",
                                                 message="平台切片任务日志无法核对，暂不自动提交。")
+                    elif matched_job and task_state(matched_job) == "active":
+                        self._bind_platform_job(item, matched_job)
                     if matched_job:
                         item["previousTask"] = {"id": str(matched_job["id"]), "state": task_state(matched_job),
                                                  "type": str(matched_job.get("type", ""))}
@@ -908,52 +924,64 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
         self.store.save("items", item)
         settings = self.store.settings
         active_category = applicable_category(item["sourceDatasetId"])
-        intervals = {active_category: int(settings[f"{active_category}IntervalSeconds"] if not settings["sharedSampling"] else settings["sampleIntervalSeconds"])}
-        fingerprints = {active_category: self._model_fingerprint(active_category)}
+        run_categories = ("bed", "magnet") if settings.get("sharedSampling", True) else (active_category,)
+        for name in run_categories:
+            slot = item["categories"].setdefault(name, {"state": "pending", "intervals": []})
+            if name != active_category and slot.get("state") == "not_applicable" and not slot.get("taskId"):
+                slot.update(state="pending", errorCode="", message="与另一模型共用抽帧，同时识别。")
+        intervals = {}
+        fingerprints = {}
+        for category in run_categories:
+            slot = item["categories"][category]
+            if slot.get("intervalSeconds") and slot.get("state") not in {"pending"}:
+                continue
+            if slot.get("state") in {"complete", "waiting", "submitting", "review", "queued", "uploading", "uploaded", "importing"}:
+                continue
+            intervals[category] = int(settings[f"{category}IntervalSeconds"] if not settings.get("sharedSampling", True) else settings["sampleIntervalSeconds"])
+            fingerprints[category] = self._model_fingerprint(category)
         results = {}
+        phase = "initial"
         for phase in ("initial", "refine"):
             points_by_category = {}
             keys_by_category = {}
-            active_categories = (active_category,) if phase == "initial" or active_category == "magnet" else ()
+            active_categories = tuple(intervals) if phase == "initial" else tuple(name for name in intervals if name == "magnet")
             for category in active_categories:
                 sample_interval = 10 if phase == "refine" else intervals[category]
                 points = sample_points(float(metadata["duration"]), sample_interval, float(metadata.get("frameRate") or 25))
                 keys, missing = {}, []
                 for point in points:
                     key = self._observation_key(item, category, point, fingerprints[category])
-                    cached = self._get_observation(key)
-                    if cached:
-                        keys[point] = key
-                    else:
-                        keys[point] = key
+                    keys[point] = key
+                    if not self._get_observation(key):
                         missing.append(point)
                 points_by_category[category] = missing
                 keys_by_category[category] = keys
             if any(points_by_category.values()):
                 await self._run_worker(item, metadata, points_by_category, keys_by_category, phase)
+            for category in active_categories:
+                sample_interval = 10 if phase == "refine" else intervals[category]
+                results[category] = self._category_observations(item, category,
+                    sample_points(metadata["duration"], sample_interval, metadata.get("frameRate", 25)),
+                    keys_by_category.get(category, {}), fingerprints[category])
             if phase == "initial":
-                results[active_category] = self._category_observations(item, active_category,
-                    sample_points(metadata["duration"], intervals[active_category], metadata.get("frameRate", 25)),
-                    keys_by_category.get(active_category, {}), fingerprints[active_category])
-                initial_result = build_category_result(results[active_category], interval=intervals[active_category],
-                    duration=metadata["duration"], positive_labels={"target"}, target=settings["targetImages"])
-                needs_refine = active_category == "magnet" and (initial_result["estimatedImages"] < 100 or initial_result["estimatedImages"] > 200)
-                if not needs_refine:
+                magnet = results.get("magnet", [])
+                if "magnet" not in intervals:
                     break
-            else:
-                results[active_category] = self._category_observations(item, active_category,
-                    sample_points(metadata["duration"], 10, metadata.get("frameRate", 25)),
-                    keys_by_category.get(active_category, {}), fingerprints[active_category])
+                initial_result = build_category_result(magnet, interval=intervals["magnet"],
+                    duration=metadata["duration"], positive_labels={"target"}, target=category_image_target(settings, "magnet"))
+                if not (initial_result["estimatedImages"] < 100 or initial_result["estimatedImages"] > 200):
+                    break
         analyzed = {}
         for category, sample_interval in intervals.items():
             observations = results.get(category, [])
-            expected_points = sample_points(metadata["duration"], 10 if phase == "refine" else sample_interval,
+            refined = category == "magnet" and phase == "refine"
+            expected_points = sample_points(metadata["duration"], 10 if refined else sample_interval,
                                             metadata.get("frameRate", 25))
             uncertain = [row for row in observations if row["label"] == "uncertain"]
             error = next((row.get("code") for row in observations if row.get("code")), "")
-            final_interval = 10 if category == "magnet" and len({r["time"] for r in observations}) > len(sample_points(metadata["duration"], sample_interval, metadata.get("frameRate", 25))) else sample_interval
+            final_interval = 10 if refined else sample_interval
             result = build_category_result(observations, interval=final_interval, duration=metadata["duration"],
-                positive_labels={"target"}, target=settings["targetImages"])
+                positive_labels={"target"}, target=category_image_target(settings, category))
             categories = item["categories"][category]
             categories.update(intervals=result["intervals"], intervalSeconds=result["intervalSeconds"],
                               estimatedImages=result["estimatedImages"], observations=len(observations),
@@ -976,6 +1004,7 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
                 categories.update(state="ready", errorCode="", message="识别完成，准备核对平台任务槽位。")
             target_key = "27912" if category == "bed" else "27944"
             categories["targetDatasetId"] = settings.get("targetDatasetIds", {}).get(target_key)
+        self.store.save("items", item)
         return metadata
 
     def _category_observations(self, item, category, points, keys, model_fingerprint):
@@ -1044,7 +1073,6 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
                         observations += 1
                         item["progress"] = min(90, int(10 + 80 * observations / max(1, sum(len(v) for v in points.values()))))
                         item.update(analysisDone=observations, analysisPosition=timestamp)
-                        item["revision"] += 1
                         self._save_analysis_item(item)
                     elif kind == "error":
                         failed.append({"category": event.get("category", "both"), "code": event.get("code", "inference_failed"),
@@ -1388,7 +1416,7 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
             duration = float((item.get("metadata") or {}).get("duration") or item.get("remote", {}).get("duration") or 0)
             if duration <= 0 or any(end > duration for _, end in intervals):
                 raise ValueError("人工区间超出视频时长。")
-            choice = choose_slice_interval(intervals, target=self.store.settings["targetImages"])
+            choice = choose_slice_interval(intervals, target=category_image_target(self.store.settings, category))
             selected = data.get("intervalSeconds") or choice["interval"]
             count = sum(max(1, math.floor((end - start) / selected + 1e-9) + 1) for start, end in intervals)
             if count > 200:
@@ -1424,6 +1452,7 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
         await self._recover_moved_sources()
         if self.files:
             self.files.refresh()
+        await self.packages.start()
         if self.store.settings.get("enabled"):
             self._wake_scheduler()
 
@@ -1484,6 +1513,7 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
 
     async def shutdown(self):
         self.stopping = True
+        await self.packages.shutdown()
         if self.files:
             await self.files.shutdown()
         for task in (self.scan_task, self.scheduler_task, self.analysis_task):
@@ -1523,9 +1553,19 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
             if not self.store.settings.get("enabled") or self.stopping:
                 break
             try:
-                await asyncio.wait_for(self.wake.wait(), timeout=TICK_SECONDS)
+                await asyncio.wait_for(self.wake.wait(), timeout=self._poll_timeout())
             except TimeoutError:
                 pass
+
+    def _poll_timeout(self):
+        """Idle queue stays at 30s. Platform cuts and filled slots are checked again in 8s."""
+        for item in self.store.list("items"):
+            if item.get("state") in {"waiting", "waiting_slot", "platform_processing"}:
+                return ACTIVE_TICK_SECONDS
+            for category in (item.get("categories") or {}).values():
+                if isinstance(category, dict) and category.get("state") in {"waiting", "waiting_slot"}:
+                    return ACTIVE_TICK_SECONDS
+        return TICK_SECONDS
 
     async def _tick(self):
         if not self.auth.connected and self.store.settings.get("workflow", {}).get("enabled"):
@@ -1557,16 +1597,18 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
             submit_items = self.store.list("items")
             if single_item_id:
                 submit_items = [item for item in submit_items if item.get("id") == single_item_id]
-            checked_targets = set()
             for item in submit_items:
                 if item.get("state") in {"attention", "excluded", "complete", "no_target", "analyzing"}:
                     continue
                 if any(category.get("state") in {"ready", "waiting_slot"} for category in item.get("categories", {}).values()):
-                    source = item.get("sourceDatasetId")
-                    if source in checked_targets:
-                        continue
-                    checked_targets.add(source)
-                    await self._submit_ready(item)
+                    local = self.store.settings.get("localExport", True) and not (
+                        self.run and (self.run.get("pilotMode") or self.run.get("singleMode")))
+                    if local:
+                        await self._export_ready(item)
+                    else:
+                        await self._submit_ready(item)
+            if self.packages.store.list("items"):
+                await self.packages.tick()
             if not self.analysis_task:
                 for item in submit_items:
                     if item.get("state") == "pending" and item.get("path"):
@@ -1639,7 +1681,6 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
                 item.update(state="platform_processing", progress=90, message="识别完成，平台切片任务按目标队列继续。")
         except asyncio.CancelledError:
             item.update(state="pending", message="识别已暂停，已保存的有效观察可恢复。")
-            self.store.save("items", item)
             raise
         except (AuditError, OSError, ValueError) as error:
             code = error.code if isinstance(error, AuditError) else str(error) if str(error) in ERROR_TEXT else "worker_failed"
@@ -1655,13 +1696,13 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
                                                      message=ERROR_TEXT[code])
             item.update(state="attention", errorCode=code, message=ERROR_TEXT[code],
                         failureType=type(error).__name__)
-            item["revision"] += 1
-            self.store.save("items", item)
             raise
         finally:
             guard.close()
-        item["revision"] += 1
-        self.store.save("items", item)
+            if item.get("id"):
+                stored = self.store.get("items", item["id"])
+                revision_after_outcome(stored, item, outcome_changed(stored, item))
+                self.store.save("items", item)
 
     async def _jobs_for_all_sources(self):
         queries = [(source_id, kind) for source_id in SOURCE for kind in ("21", "22")]
@@ -1680,7 +1721,7 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
             self.store.save("items", item)
         return update
 
-    def _save_category_progress(self, item):
+    def _save_category_progress(self, item, baseline=None):
         categories = list(item.get("categories", {}).values())
         if categories and all(c.get("state") in {"complete", "no_target", "not_applicable"} for c in categories):
             no_target = not any(c.get("state") == "complete" for c in categories)
@@ -1692,9 +1733,14 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
                         message=failure.get("message") or "本条需要核对；其他视频可独立继续。")
         elif categories and all(c.get("state") in {"pilot_deferred", "complete", "no_target", "not_applicable"} for c in categories):
             item.update(state="pilot_deferred", errorCode="", message="该类别已通过试切，等待开放批量切片。")
+        elif any(c.get("state") == "review" for c in categories):
+            item.update(state="review", errorCode="", message="请查看切片照片后再上传。")
+        elif any(c.get("state") in {"queued", "uploading", "uploaded", "importing", "submitting"} for c in categories):
+            item.update(state="platform_processing", errorCode="", message="切片压缩包正在上传或等待导入。")
         else:
             item.update(state="platform_processing", errorCode="", message="平台切片处理中，原视频保留。")
-        item["revision"] = int(item.get("revision", 0)) + 1
+        previous = baseline if baseline is not None else (self.store.get("items", item["id"]) if item.get("id") else None)
+        revision_after_outcome(previous, item, outcome_changed(previous, item))
         self.store.save("items", item)
 
     async def _reconcile_waiting(self, single_item_id=None):
@@ -1747,7 +1793,7 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
                 category["lastPolledAt"] = now_iso()
                 if status == "active":
                     category["state"] = "waiting"
-                    category["message"] = "平台正在切片；每30秒核对一次。"
+                    category["message"] = "平台正在切片；有任务时每8秒核对一次。"
                 elif status == "failed":
                     category.update(state="attention", errorCode="platform_failed", message="平台切片任务失败；可核对原视频或调整区间后单条重试。")
                     operation = self.store.get("operations", category.get("operationId"))
@@ -1788,14 +1834,151 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
                             category.update(state="attention", errorCode="output_unverified", message=ERROR_TEXT["output_unverified"])
             self._save_category_progress(item)
 
+    def _bind_platform_job(self, item, job):
+        """Show an in-progress platform cut in the unsliced list without creating another task."""
+        category_name = applicable_category(item["sourceDatasetId"])
+        category = item.setdefault("categories", {}).setdefault(category_name, {})
+        category.update(state="waiting", taskId=str(job["id"]), errorCode="",
+                        message="已绑定平台上的切片任务，等待完成。")
+        item.update(state="platform_processing", errorCode="", message=category["message"])
+        item["revision"] = int(item.get("revision", 0)) + 1
+
+    def _platform_jobs_for_video(self, jobs, source_id, video_id):
+        identity = str(video_id)
+        found = []
+        for job in jobs.get(str(source_id), []):
+            if str(job.get("type", "")) not in CUT_TYPES:
+                continue
+            if identity not in source_video_ids(job):
+                continue
+            if task_state(job) in {"active", "complete"}:
+                found.append(job)
+        return found
+
+    def _local_cut_for_video(self, item, category_name):
+        identity = str(item.get("sourceVideoId"))
+        source = str(item.get("sourceDatasetId"))
+        for other in self.store.list("items"):
+            if other.get("id") == item.get("id"):
+                continue
+            if str(other.get("sourceDatasetId")) != source or str(other.get("sourceVideoId")) != identity:
+                continue
+            category = (other.get("categories") or {}).get(category_name) or {}
+            if category.get("taskId") or category.get("state") in {"submitting", "waiting", "complete"}:
+                return category
+        return None
+
+    def _occupied_slots(self, jobs):
+        active_ids = set()
+        active_videos = set()
+        for source_id, rows in jobs.items():
+            for job in rows:
+                if task_state(job) != "active" or str(job.get("type", "")) not in CUT_TYPES:
+                    continue
+                active_ids.add(str(job.get("id")))
+                for video_id in source_video_ids(job):
+                    active_videos.add((str(source_id), str(video_id)))
+        extra = set()
+        for stored in self.store.list("items"):
+            video_key = (str(stored.get("sourceDatasetId")), str(stored.get("sourceVideoId")))
+            for category in (stored.get("categories") or {}).values():
+                if not isinstance(category, dict) or category.get("state") not in {"submitting", "waiting"}:
+                    continue
+                task_id = str(category.get("taskId") or "")
+                if task_id and task_id in active_ids:
+                    continue
+                if not task_id and video_key in active_videos:
+                    continue
+                extra.add(task_id or f"local:{stored.get('id')}")
+        return len(active_ids) + len(extra)
+
+    async def _export_ready(self, item):
+        names = [name for name, category in (item.get("categories") or {}).items()
+                 if isinstance(category, dict) and category.get("state") in {"ready", "waiting_slot"}
+                 and category.get("intervals") and not category.get("packageId")]
+        for category_name in names:
+            await self._export_category(item, category_name)
+
+    async def _export_category(self, item, category_name):
+        category = item["categories"].get(category_name, {})
+        if category.get("state") not in {"ready", "waiting_slot"} or category.get("packageId"):
+            return
+        existing = self.packages.store.find(str(item["sourceDatasetId"]), item.get("sourceVideoId"), category_name)
+        if existing:
+            category.update(packageId=existing["id"], imageCount=existing.get("imageCount"),
+                            state="review" if existing.get("state") == "review" else "queued",
+                            message=existing.get("message") or "已有这个视频的切片压缩包，未重复导出。")
+            self._save_category_progress(item)
+            return
+        intervals, seconds = category.get("intervals") or [], category.get("intervalSeconds")
+        if not intervals or not seconds:
+            category.update(state="no_target", message="未检出目标")
+            self._save_category_progress(item)
+            return
+        if not item.get("path"):
+            category.update(state="attention", errorCode="local_video_missing", message=ERROR_TEXT["local_video_missing"])
+            self._save_category_progress(item)
+            return
+        try:
+            points = slice_timestamps(intervals, seconds)
+            names = photo_names(item.get("name"), len(points))
+            frames = []
+            for stamp in points:
+                frames.append(await asyncio.to_thread(
+                    self.slice_reader, item["path"], self.store.settings["frameToolPath"], stamp))
+            folder = self.data_dir / "slices" / category_name / str(item["sourceVideoId"])
+            image_dir = folder / "image"
+            image_dir.mkdir(parents=True, exist_ok=True)
+            for name, blob in zip(names, frames):
+                (image_dir / name).write_bytes(blob)
+            archive = folder / f"{Path(names[0]).stem.rsplit('_', 1)[0]}.zip"
+            write_image_archive(archive, names, frames)
+        except (OSError, RuntimeError, ValueError):
+            category.update(state="attention", errorCode="frame_extract_failed", message=ERROR_TEXT["frame_extract_failed"])
+            self._save_category_progress(item)
+            return
+        # Bed exports are already accepted and can upload immediately. Magnet stays for review.
+        review = category_name == "magnet" and bool(self.store.settings.get("reviewBeforeUpload", True))
+        record = {"id": package_identity(item["sourceDatasetId"], item["sourceVideoId"], category_name),
+                  "dataset": PACKAGE_DATASETS[category_name], "category": category_name,
+                  "sourceDatasetId": str(item["sourceDatasetId"]), "sourceVideoId": str(item["sourceVideoId"]),
+                  "itemId": item["id"], "name": archive.name, "path": str(archive), "imageDir": str(image_dir),
+                  "images": names, "size": archive.stat().st_size, "fileVersion": source_fingerprint(archive),
+                  "imageCount": len(names), "bytes": 0, "retries": 0,
+                  "state": "review" if review else "queued",
+                  "message": "请查看切片照片后再上传。" if review else "正在排队上传切片压缩包。"}
+        saved = self.packages.remember(record)
+        category.update(packageId=saved["id"], imageCount=saved["imageCount"],
+                        state="review" if saved.get("state") == "review" else "queued", message=saved["message"])
+        self._save_category_progress(item)
+        self.packages.wake.set()
+
+    def confirm_package(self, identity):
+        package = self.packages.confirm(identity)
+        for item in self.store.list("items"):
+            for category in item.get("categories", {}).values():
+                if category.get("packageId") == identity and category.get("state") == "review":
+                    category.update(state="queued", message="已确认照片，正在排队上传。")
+                    self._save_category_progress(item)
+        return self.state() | {"package": package}
+
+    def package_image(self, identity, name):
+        package = self.packages.store.get("items", identity)
+        if not package or name not in set(package.get("images") or []):
+            raise ValueError("切片照片不存在。")
+        root = Path(package["imageDir"]).resolve()
+        path = (root / name).resolve()
+        if path.parent != root or not path.is_file():
+            raise ValueError("切片照片不存在。")
+        return path
+
     async def _submit_ready(self, item):
         if not self.auth.connected:
             return
+        outcome_baseline = copy.deepcopy(self.store.get("items", item["id"]) or item)
         for category in item.get("categories", {}).values():
             if category.get("state") in {"ready", "waiting_slot"}:
                 category.update(message="正在核对现有平台切片任务。")
-        item["revision"] += 1
-        self.store.save("items", item)
         jobs = await self._jobs_for_all_sources()
         active_category = applicable_category(item["sourceDatasetId"])
         for category_name, category in item["categories"].items():
@@ -1813,28 +1996,37 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
                 continue
             if self.run and self.run.get("pilotMode") and target_id in set(self.run.get("pilotDoneTargets", [])):
                 category.update(state="pilot_deferred", message="此图片目标集已完成一条试切；剩余视频将在批量核验后继续。")
-                item["revision"] += 1
-                self.store.save("items", item)
+                continue
+            related = self._platform_jobs_for_video(jobs, source_id, item.get("sourceVideoId"))
+            if len(related) > 1:
+                category.update(state="attention", errorCode="submit_uncertain",
+                                message="平台存在多条与该视频相关的切片任务，未重复提交。")
+                continue
+            if len(related) == 1:
+                category.update(state="waiting", taskId=str(related[0]["id"]), errorCode="",
+                                message="已绑定平台上的切片任务，未重复提交。")
+                continue
+            local_cut = self._local_cut_for_video(item, category_name)
+            if local_cut:
+                if local_cut.get("taskId"):
+                    category.update(state="waiting", taskId=local_cut["taskId"], errorCode="",
+                                    message="已绑定这条视频已有的切片任务，未重复提交。")
+                else:
+                    category.update(state="attention", errorCode="submit_uncertain",
+                                    message="同一视频已有切片操作，未重复提交。")
                 continue
             category.update(message="正在核验目标图片集身份。")
-            item["revision"] += 1
-            self.store.save("items", item)
             target_info = await self.remote.dataset(target_id)
-            expected_name = SOURCE[target_key]["targetName"]
             if not await target_dataset_verified(self.remote, target_id, target_info, SOURCE[target_key]):
                 category.update(state="attention", errorCode="target_dataset_unresolved", message=ERROR_TEXT["target_dataset_unresolved"])
                 continue
-            active = [job for rows in jobs.values() for job in rows
-                      if task_state(job) == "active" and target_dataset_id(job) == target_id]
-            if active:
-                category.update(state="waiting_slot", message="目标图片集已有平台切片任务，等待它结束后再提交。")
+            if self._occupied_slots(jobs) >= PLATFORM_SLOT_LIMIT:
+                category.update(state="waiting_slot", message="已有两条平台切片任务，等待空位后再提交。")
                 continue
             if not item.get("path") or source_version(item["path"]) != item.get("fileVersion"):
                 category.update(state="attention", errorCode="source_changed", message=ERROR_TEXT["source_changed"])
                 continue
             category.update(message="正在确认源视频仍处于未切片状态。")
-            item["revision"] += 1
-            self.store.save("items", item)
             current_sources = await self.remote.videos(source_id)
             source_video = next((row for row in current_sources if str(row.get("id")) == item["sourceVideoId"]), None)
             if not source_video or str(source_video.get("cutStatus", source_video.get("cut_status", 0))) != "0":
@@ -1850,8 +2042,6 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
             if category.get("submissionRevision"):
                 prefix += f"_R{category['submissionRevision']}"
             category.update(message="正在核对本视频相关图片，建立提交前快照。")
-            item["revision"] += 1
-            self.store.save("items", item)
             image_rows = await self.remote.image_rows(target_id, prefix=prefix,
                 progress=self._image_progress(item, category, "核对已有图片"))
             baseline = [str(row["id"]) for row in image_rows]
@@ -1877,7 +2067,6 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
             category.update(state="submitting", operationId=operation_id, targetDatasetId=target_id,
                             preSubmitTaskIds=operation["preSubmitTaskIds"], preSubmitImageIds=baseline, prefix=prefix,
                             message="已保存提交前快照，正在提交唯一的21类手动切片任务。")
-            item["revision"] += 1
             self.store.save("items", item)
             try:
                 result = await self.remote.create_cut(source_id, item["sourceVideoId"], target_id, intervals,
@@ -1896,13 +2085,11 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
             category.update(state="waiting", taskId=task_id, platformStatus=str(result.get("status", "")),
                             message="平台已接收切片任务，等待完成后关联核验图片。")
             self.store.save("operations", operation)
-            item["revision"] += 1
             self.store.save("items", item)
-            # Update this tick's snapshot so a second local category never
-            # opens a second task for the same platform target.
+            # Keep this tick's snapshot so another category of the same item cannot open a second task.
             jobs.setdefault(source_id, []).append({"id": task_id, "type": "21", "status": result.get("status", "1"),
                 "config": {"target": {"dataset": {"id": target_id}}, "source": {"datasets": [{"videos": {"ids": [item["sourceVideoId"]]}}]}}})
-        self._save_category_progress(item)
+        self._save_category_progress(item, outcome_baseline)
 
     async def frame(self, identity, timestamp):
         item = self.store.get("items", identity)

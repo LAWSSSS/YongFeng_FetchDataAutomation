@@ -8,7 +8,7 @@ import type { AdmissionRule } from './admission';
 import { correctionInterval, correctionReviewCurrent, prepareCorrection } from './corrections';
 import type { PreparedCorrection } from './corrections';
 import { InspectionResults, VideoBatches, VideoStatusFilters } from './RecordGroups';
-import { batchDate, canDownload, videoStatusOptions } from './record-groups';
+import { batchDate, canDownload, syncVideoSelection, videoStatusOptions } from './record-groups';
 import type { CollectionJob, InspectionRecord } from './record-groups';
 
 const UploadAudit = lazy(() => import('./UploadAudit'));
@@ -260,6 +260,7 @@ export default function App() {
       tab === 'collect' || tab === 'videos' ? api<Job[]>('/jobs?summary=true') : Promise.resolve(null)]);
     if (sequence !== refreshSequence.current) return;
     setSession(s); setState(v); if (j) setJobs(j); setDirectory(old => old || v.directory);
+    setVideoSelection(before => syncVideoSelection(before, v.videos));
   }, [appliedVideoFilters, tab]);
   useEffect(() => {void refresh().catch(() => undefined);}, [refresh]);
   usePolling(refresh, tab === 'videos' ? 4000 : tab === 'collect' ? 10000 : 30000, {immediate:false});

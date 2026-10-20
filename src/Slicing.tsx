@@ -6,7 +6,7 @@ import './slicing.css';
 type Category = {
   state: string; intervals: {start: number; end: number}[]; intervalSeconds: number | null;
   estimatedImages: number | null; actualImages: number | null; targetDatasetId?: string | null;
-  taskId?: string; platformStatus?: string; message?: string; errorCode?: string; lastPolledAt?: string;
+  taskId?: string; packageId?: string; platformStatus?: string; message?: string; errorCode?: string; lastPolledAt?: string;
   observations?: number; samplingIntervalSeconds?: number; outputImageIds?: string[];
   imageQueryProgress?: {read: number; total: number | null; pages: number; phase: string};
   failure?: {stage?: string; time?: number | null};
@@ -23,27 +23,30 @@ type Settings = {
   bedDeployDirectory: string; bedModelPath: string; bedGeometryPath: string; frameToolPath: string;
   workerPythonPath: string; sharedSampling: boolean; sampleIntervalSeconds: number;
   magnetIntervalSeconds: number; bedIntervalSeconds: number; magnetConfidence: number;
-  autoArchive: boolean; archiveCompletedDirectory: string; archiveEmptyDirectory: string;
-  targetImages: number; targetDatasetIds: Record<string, string | null>;
+  autoArchive: boolean; reviewBeforeUpload: boolean; archiveCompletedDirectory: string; archiveEmptyDirectory: string;
+  targetImages: number; bedTargetImages: number; targetDatasetIds: Record<string, string | null>;
 };
 type Candidate = {id: string; name: string; category: string; namespace: string; namespaceInferred?: boolean; verified?: boolean; selected?: boolean};
 type DatasetChoice = {name: string; candidates: Candidate[]; selectedId: string | null; resolved: boolean};
 type Run = {executeAll?:boolean; id: string; state: string; message: string; itemCount?: number; items?: string[];
   singleMode?: boolean; singleItemId?: string; finishedAt?: string; settingsRevision?: number;
   excluded?: Record<string, number>; targetDatasets?: Record<string, DatasetChoice>; issues?: {path: string; message: string}[]};
+type SlicePackage = {id: string; dataset: string; category: string; name: string; state: string; message?: string;
+  images?: string[]; imageCount?: number};
 type State = {phase?:string; connected: boolean; user: string; settings: Settings; settingsRevision: number;
+  packages?: {targets: {id: string; name: string; importing: number; uploading: number; queued: number}[]; items: SlicePackage[]};
   archive?: {items: {id:string; path:string; archiveState:string; archivePath?:string; archiveMessage?:string}[]; counts:Record<string,number>};
   run: Run | null; items: Item[]; counts: Record<string, number>; busy: boolean; enabled: boolean};
 
 const emptySettings: Settings = {revision: 0, directories: ['/Volumes/out/视频'], magnetDeployDirectory: '', magnetModelPath: '',
   bedDeployDirectory: '', bedModelPath: '', bedGeometryPath: '', frameToolPath: '', workerPythonPath: '', sharedSampling: true,
   sampleIntervalSeconds: 30, magnetIntervalSeconds: 30, bedIntervalSeconds: 30, magnetConfidence: .25,
-  autoArchive:true, archiveCompletedDirectory:'切片完成', archiveEmptyDirectory:'未检出目标',
-  targetImages: 150, targetDatasetIds: {'27912': null, '27944': null}};
+  autoArchive:true, reviewBeforeUpload:true, archiveCompletedDirectory:'切片完成', archiveEmptyDirectory:'未检出目标',
+  targetImages: 150, bedTargetImages: 180, targetDatasetIds: {'27912': null, '27944': null}};
 const empty: State = {connected: false, user: '', settings: emptySettings, settingsRevision: 0, run: null, items: [], counts: {}, busy: false, enabled: false};
-const labels: Record<string,string> = {pending:'待处理',analyzing:'识别中',platform_processing:'平台处理中',waiting:'等待平台结果',waiting_slot:'等待平台空位',
+const labels: Record<string,string> = {pending:'待处理',analyzing:'识别中',platform_processing:'平台处理中',review:'待校对',queued:'排队上传',uploading:'正在上传',uploaded:'等待导入',importing:'正在导入',waiting:'等待平台结果',waiting_slot:'等待平台空位',
   submitting:'提交核对中',ready:'准备切片',pilot_deferred:'待批量切片',no_target:'未检出目标',not_applicable:'不适用',complete:'完成',attention:'需处理',waiting_connection:'等待连接',paused:'已暂停',excluded:'平台已有任务'};
-const filters = [['all','全部'],['pending','待处理'],['waiting_connection','等待连接'],['analyzing','识别中'],['platform_processing','平台处理中'],['attention','需处理'],['complete','已完成'],['no_target','未检出']];
+const filters = [['all','全部'],['unsliced','未切片'],['pending','待处理'],['waiting_connection','等待连接'],['analyzing','识别中'],['platform_processing','平台处理中'],['attention','需处理'],['complete','已完成'],['no_target','未检出']];
 const uid = () => crypto.randomUUID();
 const formatDuration = (seconds?: number | null) => seconds == null ? '—' : `${Math.floor(Math.round(seconds) / 60)}分${Math.round(seconds) % 60}秒`;
 const stageLabels: Record<string,string> = {checking_media:'检查视频末段',loading_model:'加载模型',sampling:'抽帧识别'};
@@ -68,7 +71,7 @@ function parseIntervals(value: string) {
   });
 }
 
-function CategoryCard({item, categoryName, category, onUpdated}: {item: Item; categoryName: 'bed'|'magnet'; category: Category; onUpdated: (state: State) => void}) {
+function CategoryCard({item, categoryName, category, packages = [], onUpdated}: {item: Item; categoryName: 'bed'|'magnet'; category: Category; packages?: SlicePackage[]; onUpdated: (state: State) => void}) {
   const [editing, setEditing] = useState(false);
   const [intervals, setIntervals] = useState(() => intervalText(category.intervals));
   const [path, setPath] = useState(item.path);
@@ -97,6 +100,7 @@ function CategoryCard({item, categoryName, category, onUpdated}: {item: Item; ca
     } catch (failure) {setError((failure as Error).message);}
     finally {setFrameBusy(false);}
   }
+  const pack = packages.find(row => row.id === category.packageId);
   const expected = category.estimatedImages == null ? '未计算' : `${category.estimatedImages} 张`;
   const actual = category.actualImages == null ? '尚未完成' : `${category.actualImages} 张`;
   const analyzing = item.state === 'analyzing' && category.state === 'pending';
@@ -117,6 +121,12 @@ function CategoryCard({item, categoryName, category, onUpdated}: {item: Item; ca
       ])}</div>
     </details>}
     {frameUrl && <div className="slice-frame"><img src={frameUrl} alt={`${title} ${frameTime} 秒关键画面`} /><span>{frameTime?.toFixed(1)} 秒</span></div>}
+    {category.state === 'review' && pack && <div className="slice-review-photos">
+      <div className="slice-photos">{(pack.images || []).slice(0, 12).map(name =>
+        <img key={name} src={`/api/slicing/packages/${pack.id}/images/${encodeURIComponent(name)}`} alt={name} />)}</div>
+      <p className="slice-detail">共 {pack.imageCount || pack.images?.length || 0} 张。确认后才会上传。</p>
+      <button disabled={working} onClick={() => void request<State>(`/packages/${pack.id}/confirm`, {}).then(onUpdated).catch(failure => setError((failure as Error).message))}>确认并上传这个压缩包</button>
+    </div>}
     {(category.state === 'attention' || category.state === 'ready' || category.state === 'no_target') && <details className="slice-review" open={editing} onToggle={event => setEditing(event.currentTarget.open)}>
       <summary>核对原片或调整区间</summary>
       {editing && <div className="slice-review-body">
@@ -177,8 +187,11 @@ export default function Slicing({onConnect}: {onConnect: () => void}) {
   const groups = useMemo(() => physicalFiles(state.items), [state.items]);
   const groupState = (group:typeof groups[number]) => state.archive?.items.some(file=>file.path === group.records[0].path && file.archiveState === 'attention') ? 'attention' : physicalState(group.records);
   const filtered = groups.filter(group => {
-    if (source === 'all' && filter !== 'all' && groupState(group) !== filter) return false;
-    return slicePage(group.records,{status:source === 'all' ? 'all' : filter,source,search,page:1,pageSize:group.records.length}).total > 0;
+    const overall = groupState(group);
+    if (filter === 'unsliced' && ['complete','no_target'].includes(overall)) return false;
+    if (source === 'all' && filter !== 'all' && filter !== 'unsliced' && overall !== filter) return false;
+    const recordStatus = filter === 'unsliced' ? 'unsliced' : source === 'all' ? 'all' : filter;
+    return slicePage(group.records,{status:recordStatus,source,search,page:1,pageSize:group.records.length}).total > 0;
   });
   const pages = Math.max(1,Math.ceil(filtered.length/12));
   const currentPage = Math.min(page,pages);
@@ -219,7 +232,9 @@ export default function Slicing({onConnect}: {onConnect: () => void}) {
         <button className="secondary" disabled={!controls.canResume || !!busy || settingsDirty} onClick={() => void run('resume', () => request('/resume',{requestId:uid()}),'正在继续。')}>继续</button>
         <button className="link" disabled={!!busy} onClick={() => void run('refresh', () => request<State>(''),'状态已更新。')}>刷新</button>
       </div>
-      <p className="slice-flow">扫描去重 → 共用抽帧 → 自动切片 → 核验归档。关闭网页后继续处理。</p>
+      <p className="slice-flow">扫描去重 → 共用抽帧 → 本地打包 → 排队导入。关闭网页后上传继续。</p>
+      {!!state.packages?.targets.length && <div className="slice-overall">{state.packages.targets.map(target =>
+        <span key={target.id}>{target.name} · 上传 {target.uploading} · 导入 {target.importing} · 排队 {target.queued}</span>)}</div>}
       <div className="slice-overall"><span>{groups.length} 个视频</span><span>完成 {groups.filter(group=>group.records.every(item=>['complete','no_target'].includes(item.state))).length}</span><span>需处理 {groups.filter(group=>groupState(group) === 'attention').length}</span><span>已归档 {state.archive?.counts.complete || 0}</span></div>
       {settingsDirty && <p className="notice">设置有未保存修改，请先保存，或重新载入已保存的设置。</p>}
       {settingsStale && <p className="notice">模型或目录设置已变化，请重新扫描，再选择待处理视频。已有结果会保留。</p>}
@@ -242,10 +257,12 @@ export default function Slicing({onConnect}: {onConnect: () => void}) {
         {settings.sharedSampling ? <label>共用抽样间隔（秒）<input type="number" min={1} max={3600} value={settings.sampleIntervalSeconds} onChange={event => set('sampleIntervalSeconds',Number(event.target.value))} /></label> : <>
           <label>磁盘吊抽样间隔（秒）<input type="number" min={1} max={3600} value={settings.magnetIntervalSeconds} onChange={event => set('magnetIntervalSeconds',Number(event.target.value))} /></label>
           <label>车斗抽样间隔（秒）<input type="number" min={1} max={3600} value={settings.bedIntervalSeconds} onChange={event => set('bedIntervalSeconds',Number(event.target.value))} /></label></>}
+        <label className="wide check-label"><input type="checkbox" checked={settings.reviewBeforeUpload ?? true} onChange={event=>set('reviewBeforeUpload',event.target.checked)} />上传前查看切片照片；关闭后抽完直接上传</label>
         <label className="wide check-label"><input type="checkbox" checked={settings.autoArchive ?? true} onChange={event=>set('autoArchive',event.target.checked)} />两类处理结束后自动剪切归档</label>
         <label>完成文件夹名<input value={settings.archiveCompletedDirectory || '切片完成'} onChange={event=>set('archiveCompletedDirectory',event.target.value)} /></label>
         <label>未检出文件夹名<input value={settings.archiveEmptyDirectory || '未检出目标'} onChange={event=>set('archiveEmptyDirectory',event.target.value)} /></label>
-        <label>目标图片数（100–200）<input type="number" min={100} max={200} value={settings.targetImages} onChange={event => set('targetImages',Number(event.target.value))} /></label>
+        <label>车斗目标图片数（100–200，仅后续视频）<input type="number" min={100} max={200} value={settings.bedTargetImages ?? 180} onChange={event => set('bedTargetImages',Number(event.target.value))} /></label>
+        <label>磁盘吊目标图片数（100–200）<input type="number" min={100} max={200} value={settings.targetImages} onChange={event => set('targetImages',Number(event.target.value))} /></label>
         <label>磁盘吊置信度<input type="number" min={0} max={1} step="0.01" value={settings.magnetConfidence} onChange={event => set('magnetConfidence',Number(event.target.value))} /></label>
         {(['27912','27944'] as const).map(id => {
           const target = state.run?.targetDatasets?.[id];
@@ -284,7 +301,7 @@ export default function Slicing({onConnect}: {onConnect: () => void}) {
             const name = item.sourceDatasetId === '27912' ? 'bed' : 'magnet';
             return <div key={item.id}>
               {item.state === 'analyzing' && <div className="slice-analysis"><p>{stageLabels[item.analysisStage || ''] || '准备识别'}{item.analysisTotal ? ` · ${item.analysisDone || 0}/${item.analysisTotal}` : ''}</p><progress max="100" value={item.progress} aria-label="识别进度" /></div>}
-              <CategoryCard item={item} categoryName={name} category={item.categories[name]} onUpdated={acceptState} />
+              <CategoryCard item={item} categoryName={name} category={item.categories[name]} packages={state.packages?.items} onUpdated={acceptState} />
               <div className="actions">
                 {canSingleSlice(item) && <button className="secondary" disabled={!state.connected || !controls.idle || settingsDirty || settingsStale || !!busy} onClick={() => void run(`single-${item.id}`, () => request('/start',{requestId:uid(),expectedRevision:state.settingsRevision,mode:'single',itemId:item.id}),'本条已启动。')}>执行本类</button>}
                 {item.state === 'attention' && <button className="secondary" disabled={!state.connected || (state.busy && !state.enabled) || !!busy || settingsDirty} onClick={() => void run(`retry-${item.id}`, () => request(`/${item.id}/retry`,{requestId:uid(),expectedRevision:item.revision}),'本条恢复中。')}>重试本类</button>}

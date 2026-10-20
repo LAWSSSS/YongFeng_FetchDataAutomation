@@ -27,7 +27,9 @@ export function slicePage<T extends SliceItem>(items: T[], options: {
   const needle = options.search.trim().toLocaleLowerCase();
   const filtered = items.filter(item => {
     const statuses = Object.values(item.categories).map(category => category.state);
+    const finished = item.state === 'complete' || item.state === 'no_target';
     const matching = options.status === 'all' || item.state === options.status ||
+      (options.status === 'unsliced' && !finished) ||
       (options.status === 'platform_processing' && statuses.some(state => ['ready','waiting_slot','waiting','submitting'].includes(state)));
     return matching && (options.source === 'all' || item.sourceDatasetId === options.source) &&
       (!needle || (item.name + ' ' + item.sourceVideoId).toLocaleLowerCase().includes(needle));
@@ -49,7 +51,7 @@ export function physicalFiles<T extends SliceItem & {id: string; path?: string}>
 }
 
 export function physicalState(records: {state:string}[]) {
-  return ['attention','analyzing','waiting_connection','pending','platform_processing'].find(
+  return ['attention','review','analyzing','waiting_connection','pending','platform_processing'].find(
     status=>records.some(record=>record.state === status)) ||
     (records.every(record=>record.state === 'no_target') ? 'no_target' : 'complete');
 }
