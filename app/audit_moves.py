@@ -103,7 +103,8 @@ def inspect_plan(report, uploaded, magnet_missing, bed_missing):
                 item.update(state="unchanged", destination=str(source), message="已在正确分类文件夹，无需移动。")
                 items.append(item)
                 continue
-            target_relative = source.relative_to(current_root) if current_root else relative
+            target_relative = (source.relative_to(current_root) if current_root else
+                               source.relative_to(root) if source.is_relative_to(root) else relative)
             destination = destinations[kind] / target_relative
             checked_path(str(destination))
             item["destination"] = str(destination)
@@ -312,9 +313,8 @@ class AuditMoveManager:
         report = self.audit.saved.get("report")
         if report:
             for file in report["files"]:
-                if (file["relativePath"] == item["relativePath"] and
-                        (str(Path(report["directory"]) / file["relativePath"]) == item["source"]
-                         or file.get("localMove", {}).get("path") == item["source"])):
+                if (str(Path(report["directory"]) / file["relativePath"]) == item["source"]
+                        or file.get("localMove", {}).get("path") == item["source"]):
                     file["localMove"] = {"path": item["destination"], "category": item["category"], "at": now_iso(),
                                          "fileVersion": item["destinationVersion"]}
             self.audit.save()

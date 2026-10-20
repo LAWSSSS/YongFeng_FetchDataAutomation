@@ -537,3 +537,23 @@ async def test_rate_limited_archive_keeps_single_run_enabled_until_move_can_star
     assert manager.store.settings['enabled']
     assert app.state.files.state()['counts']['waiting']==1
     await close_app(app)
+
+
+@pytest.mark.asyncio
+async def test_archive_updates_nested_audit_paths_and_later_classification_keeps_archive_folder(environment,tmp_path):
+    from app.audit_moves import inspect_plan
+    from tests.test_audit_moves import report_for
+    app,manager=environment
+    nested=tmp_path/'day';nested.mkdir()
+    pair(manager,nested,('complete','complete'))
+    report_for(app,tmp_path,recursive=True)
+    await app.state.files.tick()
+    destination=tmp_path/'切片完成'/'day'/'bed.mp4'
+    report=app.state.upload_audit.saved['report']
+    record=next(row for row in report['files'] if row['name']=='bed.mp4')
+    assert record['localMove']['path']==str(destination)
+    preview=inspect_plan(report,str(tmp_path/'已上传'),str(tmp_path/'磁盘吊未上传'),str(tmp_path/'车斗未上传'))
+    row=next(row for row in preview['items'] if row['relativePath']=='day/bed.mp4')
+    assert row['state']=='planned'
+    assert row['destination']==str(tmp_path/'已上传'/'切片完成'/'day'/'bed.mp4')
+    await close_app(app)
