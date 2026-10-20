@@ -9,6 +9,15 @@ class FileLeases:
         self.readers = Counter()
         self.writers = set()
         self.on_move = lambda source, destination, version: None
+        self.move_listeners = []
+
+    def subscribe_moves(self, callback):
+        self.move_listeners.append(callback)
+
+    def notify_move(self, source, destination, version):
+        self.on_move(source, destination, version)
+        for callback in self.move_listeners:
+            callback(source, destination, version)
 
     @staticmethod
     def key(value):

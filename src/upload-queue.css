@@ -16,6 +16,12 @@
 .upload-explanation,.upload-warning,.upload-empty{font-size:13px;line-height:1.7;margin:8px 0;color:#536759;overflow-wrap:anywhere}.upload-warning{color:#97442f}
 .upload-empty{padding:20px 0}.upload-files button{font-size:13px;min-height:38px;margin:6px 0}
 .upload-location{font-size:12px;color:#536759;margin-top:10px}.upload-location summary{cursor:pointer;width:fit-content;padding-block:4px}.upload-location p{overflow-wrap:anywhere;line-height:1.7}
+.upload-removed{margin-top:18px;padding-top:14px;border-top:1px solid #dce4d9;color:#536759;font-size:13px}
+.upload-removed summary{cursor:pointer;width:fit-content;padding-block:6px}
+.upload-removed ul{list-style:none;margin:8px 0 0;padding:0}
+.upload-removed li{padding:12px 0;border-top:1px solid #e0e5dc}
+.upload-removed li strong,.upload-removed li p{overflow-wrap:anywhere}
+.upload-removed li p{font-size:12px;line-height:1.6;margin:6px 0;color:#536759}
 .upload-platform-link{display:inline-block;color:#315c45;font-size:13px;text-underline-offset:3px;padding-block:10px}
 .upload-platform-actions{display:flex;flex-wrap:wrap;gap:8px 22px}.upload-completion{font-size:14px;line-height:1.8;color:#315c45;background:#f0f5ee;border-left:3px solid #57765d;padding:12px 16px;margin:18px 0 0}
 @media(max-width:900px){.upload-targets{grid-template-columns:minmax(0,1fr);gap:8px}.upload-target+.upload-target{border-top:1px solid #dce4d9;padding-top:24px}}

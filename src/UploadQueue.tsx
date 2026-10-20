@@ -1,10 +1,12 @@
 import {useCallback, useEffect, useState} from 'react';
+import {usePolling} from './usePolling';
 import {effectiveUploadFilter,platformDatasetUrl,queueComplete} from './upload-queue';
 import './upload-queue.css';
 
 type Item = {id:string;name:string;path:string;size:number;state:string;phase:string;bytes:number;speed:number;
-  retries:number;message:string;errorCode:string;jobId:string;nextAttempt:number};
+  retries:number;message:string;errorCode:string;jobId:string;nextAttempt:number;removable:boolean};
 type Target = {id:string;name:string;items:Item[];counts:Record<string,number>;activeUploads:number;activeImport:string;
+  removedItems:{id:string;name:string;path:string;removedAt:string;message:string}[];
   blocked:boolean;message:string;batches:{id:string;state:string;jobId?:string;message:string}[]};
 type State = {enabled:boolean;connected:boolean;directory:string;validationMode:boolean;parallelFilesPerTarget:number;
   scan:null|{id:string;state:string;message:string;added:number;review:number};targets:Target[]};
@@ -30,7 +32,8 @@ async function api(path='', body?:object):Promise<State> {
   return data;
 }
 
-function TargetQueue({target,busy,onRetry}:{target:Target;busy:boolean;onRetry:(id:string)=>void}) {
+function TargetQueue({target,busy,onRetry,onRemove,onRestore}:{target:Target;busy:boolean;onRetry:(id:string)=>void;
+  onRemove:(id:string)=>void;onRestore:(id:string)=>void}) {
   const [filter,setFilter]=useState('auto');
   const [expanded,setExpanded]=useState(false);
   const counts=target.counts;
@@ -59,9 +62,17 @@ function TargetQueue({target,busy,onRetry}:{target:Target;busy:boolean;onRetry:(
         <p className={item.state==='attention' ? 'upload-warning' : 'upload-explanation'}>{item.state==='queued' ? '已进入队列，等待本目标的上传批次。' : item.message}</p>
         {['attention','waiting_disk','waiting_connection','waiting_auth','retry_wait'].includes(item.state) &&
           <button className="secondary" disabled={busy} onClick={()=>onRetry(item.id)}>{item.errorCode==='import_uncertain' ? '重新对账' : '重试此视频'}</button>}
+        {item.removable && <button className="secondary" disabled={busy} onClick={()=>{
+          if (window.confirm(`将“${item.name}”从待上传队列移除？这只移除程序里的队列记录，不会删除本地视频或平台已有数据；后续扫描会继续忽略这个文件版本。`)) onRemove(item.id);
+        }}>移除重复项</button>}
         <details className="upload-location"><summary>本地文件位置</summary><p>{item.path}</p></details>
       </li>)}</ul>}
     {rows.length>8 && <button className="link" onClick={()=>setExpanded(value=>!value)}>{expanded ? '收起清单' : `展开全部 ${rows.length} 条`}</button>}
+    {!!target.removedItems?.length && <details className="upload-removed">
+      <summary>已移除的队列记录 · {target.removedItems.length} 条（可恢复）</summary>
+      <ul>{target.removedItems.map(item=><li key={item.id}><strong>{item.name}</strong><p>{item.path}</p>
+        <button className="secondary" disabled={busy} onClick={()=>onRestore(item.id)}>恢复到队列</button></li>)}</ul>
+    </details>}
   </div>;
 }
 
@@ -74,9 +85,9 @@ export default function UploadQueue({onSessionChange}:{onSessionChange:()=>Promi
   useEffect(()=>{
     let active=true;
     void api().then(value=>{if(active){setState(value);setDirectory(value.directory);}}).catch(e=>{if(active)setError((e as Error).message);});
-    const timer=window.setInterval(()=>{void api().then(value=>{if(active)setState(value);}).catch(e=>{if(active)setError((e as Error).message);});},4000);
-    return()=>{active=false;window.clearInterval(timer);};
+    return()=>{active=false;};
   },[]);
+  usePolling(refresh, state?.enabled ? 4000 : 15000, {immediate:false,onError:e=>setError((e as Error).message)});
   useEffect(()=>{if(state)void onSessionChange().catch(()=>{});},[state?.connected,onSessionChange]);
   async function perform(path:string,body:object={}) {
     setBusy(true);setError('');
@@ -115,6 +126,7 @@ export default function UploadQueue({onSessionChange}:{onSessionChange:()=>Promi
     {complete && <p className="upload-completion" role="status">{completedCount} 项目标任务已导入，当前没有等待上传的视频。下方已显示完成记录，可点击“查看平台视频”进入“数据内容”；新增视频后再扫描即可。</p>}
     {error && <p className="error" role="alert">{error}</p>}
     {state && <div className="upload-targets">{state.targets.map(target=><TargetQueue key={target.id} target={target} busy={busy}
-      onRetry={id=>void perform(`/${id}/retry`)} />)}</div>}
+      onRetry={id=>void perform(`/${id}/retry`)} onRemove={id=>void perform(`/${id}/remove`)}
+      onRestore={id=>void perform(`/${id}/restore`)} />)}</div>}
   </section>;
 }

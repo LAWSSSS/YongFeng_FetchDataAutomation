@@ -21,6 +21,7 @@ Thumbs.db
 # 依赖与虚拟环境
 node_modules/
 .venv/
+.venv-slicing/
 venv/
 env/
 
@@ -51,3 +52,17 @@ temp/
 /outputs/*
 !/outputs/.gitkeep
 /out/
+
+# 用户视频、模型与运行数据库（任何目录）
+*.mp4
+*.mov
+*.mkv
+*.avi
+*.m4v
+*.onnx
+*.pt
+*.pth
+*.npz
+*.sqlite3
+*.sqlite3-*
+*.db

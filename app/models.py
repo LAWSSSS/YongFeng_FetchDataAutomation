@@ -121,3 +121,53 @@ class AuditMoveConfirmInput(BaseModel):
 class UploadScanInput(BaseModel):
     directory: str = Field(default="/Volumes/out/视频", min_length=1, max_length=2000)
     requestId: str = Field(pattern=r"^[A-Za-z0-9_-]{1,100}$")
+
+
+class SlicingSettingsInput(BaseModel):
+    expectedRevision: int = Field(ge=0, strict=True)
+    requestId: str = Field(pattern=r"^[A-Za-z0-9_-]{1,100}$")
+    directories: list[str] = Field(min_length=1, max_length=20)
+    magnetDeployDirectory: str = Field(min_length=1, max_length=2000)
+    magnetModelPath: str = Field(min_length=1, max_length=2000)
+    bedDeployDirectory: str = Field(min_length=1, max_length=2000)
+    bedModelPath: str = Field(min_length=1, max_length=2000)
+    bedGeometryPath: str = Field(min_length=1, max_length=2000)
+    frameToolPath: str = Field(min_length=1, max_length=2000)
+    workerPythonPath: str = Field(min_length=1, max_length=2000)
+    sharedSampling: bool = True
+    sampleIntervalSeconds: int = Field(default=30, ge=1, le=3600)
+    magnetIntervalSeconds: int = Field(default=30, ge=1, le=3600)
+    bedIntervalSeconds: int = Field(default=30, ge=1, le=3600)
+    magnetConfidence: float = Field(default=0.25, ge=0, le=1, allow_inf_nan=False)
+    targetImages: int = Field(default=150, ge=100, le=200)
+    targetDatasetIds: dict[str, str | None] = Field(default_factory=lambda: {"27912": None, "27944": None})
+    autoArchive: bool = True
+    archiveCompletedDirectory: str = Field(default="切片完成", min_length=1, max_length=100)
+    archiveEmptyDirectory: str = Field(default="未检出目标", min_length=1, max_length=100)
+
+
+class SlicingScanInput(BaseModel):
+    requestId: str = Field(pattern=r"^[A-Za-z0-9_-]{1,100}$")
+
+
+class SlicingStartInput(BaseModel):
+    requestId: str = Field(pattern=r"^[A-Za-z0-9_-]{1,100}$")
+    expectedRevision: int = Field(ge=0, strict=True)
+    mode: Literal["pilot", "all", "single"] = "pilot"
+    itemId: str | None = Field(default=None, min_length=1, max_length=100)
+
+
+class SlicingItemActionInput(BaseModel):
+    requestId: str = Field(pattern=r"^[A-Za-z0-9_-]{1,100}$")
+    expectedRevision: int = Field(ge=0, strict=True)
+
+
+class SlicingBindInput(SlicingItemActionInput):
+    path: str = Field(min_length=1, max_length=4000)
+
+
+class SlicingReviewInput(SlicingItemActionInput):
+    category: Literal["bed", "magnet"]
+    intervals: list[dict[str, float]] | None = Field(default=None, max_length=100)
+    confirmedNoTarget: bool = False
+    intervalSeconds: int | None = Field(default=None, ge=1, le=86400)

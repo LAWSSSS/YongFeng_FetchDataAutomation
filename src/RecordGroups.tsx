@@ -76,23 +76,26 @@ export function VideoBatches<T extends BatchVideo>({videos, jobs, totalByJob, se
   onDownloadBatch: (records: T[]) => void; children: (record: T) => ReactNode;
 }) {
   const groups = useMemo(() => groupVideos(videos, jobs), [videos, jobs]);
+  const [visited, setVisited] = useState<Set<string>>(new Set());
   return <div className="batch-list" aria-label="按批次归类的采集记录">{groups.map(group => {
     const downloadable = group.records.filter(canDownload);
     const selected = group.records.filter(record => selectedIds.has(record.id)).length;
     const total = totalByJob[group.id] || group.records.length;
-    return <details className="batch-group" key={group.id}>
+    return <details className="batch-group" key={group.id} onToggle={event => {
+      if (event.currentTarget.open) setVisited(before => before.has(group.id) ? before : new Set([...before,group.id]));
+    }}>
       <summary><CaretRight className="batch-chevron" size={18} aria-hidden="true" />
         <span className="batch-title"><strong>{batchDate(group.job?.createdAt)}</strong><small>批次 {group.id.slice(0, 8)} · {group.records.length === total ? `${total} 条记录` : `筛选 ${group.records.length} / ${total} 条`}{selected ? ` · 已选 ${selected} 条` : ''}</small></span>
         <span className="batch-counts">{(Object.entries(group.counts) as [VideoCategory, number][]).map(([key, count]) =>
           <span key={key} className={`batch-count ${key}`}>{categoryLabels[key]} {count}</span>)}<span className="batch-expand">展开查看</span></span>
       </summary>
-      <div className="batch-body"><div className="batch-toolbar"><span>以下操作仅作用于本批次当前筛选到的记录</span>
+      {visited.has(group.id) && <div className="batch-body"><div className="batch-toolbar"><span>以下操作仅作用于本批次当前筛选到的记录</span>
         <div className="actions"><button className="secondary" disabled={disabled || !downloadable.length}
           onClick={() => onSelectBatch(downloadable, true)}>全选本批可下载（{downloadable.length}）</button>
           <button className="link" disabled={disabled || !selected} onClick={() => onSelectBatch(group.records, false)}>取消本批选择</button>
           <button disabled={disabled || !downloadEnabled || !downloadable.length}
             onClick={() => onDownloadBatch(downloadable)}>下载本批可下载当前版</button></div>
-      </div><div className="batch-video-grid">{group.records.map(record => <div className="batch-record" key={record.id}>{children(record)}</div>)}</div></div>
+      </div><div className="batch-video-grid">{group.records.map(record => <div className="batch-record" key={record.id}>{children(record)}</div>)}</div></div>}
     </details>;
   })}</div>;
 }

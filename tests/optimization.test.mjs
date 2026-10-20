@@ -1,0 +1,74 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {createPoller} from '../src/usePolling.ts';
+import {slicePage,sliceTitle,slicingControls} from '../src/slicing-view.ts';
+
+test('slicing controls allow another video after a failed single run without a dead resume button',()=>{
+  const state={enabled:false,busy:false,run:{state:'attention',singleMode:true,singleItemId:'failed'},
+    items:[{id:'failed',state:'attention'},{id:'other',state:'pending'}]};
+  assert.equal(slicingControls(state).canStart,true);
+  assert.equal(slicingControls(state).canResume,false);
+  assert.equal(slicingControls({...state,busy:true}).canStart,false);
+  assert.equal(slicingControls({...state,run:{...state.run,state:'scanning'}}).canStart,false);
+  assert.equal(slicingControls({...state,items:[{id:'failed',state:'pending'}]}).canResume,true);
+});
+
+test('video cards show plate and date without losing VIRTUAL identity or restored version',()=>{
+  assert.deepEqual(sliceTitle('VIRTUAL_016_20261005050441_38bcd1239ac8_恢复.mp4'),{
+    title:'VIRTUAL_016',when:'2026-10-05 05:04:41',restored:true});
+  assert.equal(sliceTitle('鲁Q550GY_20260930122000_bab10f7a5061.mp4').title,'鲁Q550GY');
+  assert.equal(sliceTitle('my-source.mp4').title,'my-source');
+});
+
+function timers() {
+  const scheduled = new Map();let next=0;
+  return {scheduled,setTimer(callback,delay){const id=++next;scheduled.set(id,{callback,delay});return id;},
+    clearTimer(id){scheduled.delete(id);}};
+}
+
+test('slow polling never overlaps and stops after the page is disposed',async()=>{
+  const timer=timers();let calls=0,release;
+  const poller=createPoller(async()=>{calls++;await new Promise(resolve=>{release=resolve;});},{delay:()=>4000,...timer});
+  const first=poller.refresh();await poller.refresh();
+  assert.equal(calls,1);assert.equal(timer.scheduled.size,0);
+  release();await first;
+  assert.equal([...timer.scheduled.values()][0].delay,0);
+  poller.stop();assert.equal(timer.scheduled.size,0);await poller.refresh();assert.equal(calls,1);
+});
+
+test('hidden pages do not poll and returning to the page resumes immediately',async()=>{
+  const timer=timers();let visible=false,calls=0;
+  const poller=createPoller(async()=>{calls++;},{delay:()=>15000,visible:()=>visible,...timer});
+  await poller.refresh();assert.equal(calls,0);
+  visible=true;await poller.refresh();assert.equal(calls,1);
+  const task=[...timer.scheduled.values()][0];visible=false;await task.callback();
+  assert.equal(calls,1);assert.equal(timer.scheduled.size,0);
+  visible=true;await poller.refresh();assert.equal(calls,2);poller.stop();
+});
+
+test('slicing filters compose before pagination and shrinking results clamp the page',()=>{
+  const rows=Array.from({length:117},(_,index)=>({name:'视频 '+index,sourceVideoId:String(index),
+    sourceDatasetId:index%2 ? '27912':'27944',state:index<100 ? 'pending':'complete',categories:{bed:{state:'pending'}}}));
+  const options={status:'all',source:'all',search:'',page:2,pageSize:12};
+  assert.equal(slicePage(rows,options).rows[0].sourceVideoId,'12');
+  assert.equal(slicePage(rows,options).pages,10);
+  const view=slicePage(rows,{...options,source:'27912',status:'complete',search:'视频 11',page:999});
+  assert.equal(view.page,1);assert.deepEqual(view.rows.map(item=>item.sourceVideoId),['111','113','115']);
+  assert.equal(slicePage(rows,{...options,search:'not present'}).page,1);
+});
+
+test('physical cards merge two categories by bound file, never merge unbound names', async()=>{
+  const {physicalFiles}=await import('../src/slicing-view.ts');
+  const record=(id,path,sourceDatasetId)=>({id,path,sourceDatasetId,name:'same.mp4',sourceVideoId:id,state:'pending',categories:{}});
+  const cards=physicalFiles([record('a','/video/a.mp4','27912'),record('b','/video/a.mp4','27944'),record('c','','27912'),record('d','','27944')]);
+  assert.equal(cards.length,3);
+  assert.deepEqual(cards[0].records.map(record=>record.id),['a','b']);
+});
+
+test('one completed category does not label the whole file complete',async()=>{
+  const {physicalState}=await import('../src/slicing-view.ts');
+  assert.equal(physicalState([{state:'complete'},{state:'platform_processing'}]),'platform_processing');
+  assert.equal(physicalState([{state:'complete'},{state:'attention'}]),'attention');
+  assert.equal(physicalState([{state:'complete'},{state:'no_target'}]),'complete');
+  assert.equal(physicalState([{state:'no_target'},{state:'no_target'}]),'no_target');
+});

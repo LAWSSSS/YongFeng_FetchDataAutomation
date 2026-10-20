@@ -1,0 +1,94 @@
+.hero.compact {display:block;padding:0;min-height:0;margin-bottom:20px}
+.hero.compact h1 {font-size:28px;margin:0 0 8px}
+.hero.compact .rule-card {display:none}
+.hero.compact p {margin:0}
+.hero.compact>div:first-child {padding:0}
+.slicing-intro .section-title {margin-bottom:12px}
+.slicing-settings {padding:15px 22px}
+.slice-controls {flex-wrap:wrap;align-items:center}
+.slice-search {display:flex;gap:8px;max-width:430px;flex:1;min-width:260px}
+.slice-search select {max-width:120px}
+.slice-search input {width:100%;min-width:0}
+.slice-video-grid {align-items:start}
+.slice-video-card {padding:16px;content-visibility:auto;contain-intrinsic-size:auto 250px}
+.slice-video-card .slice-detail {color:#536358}
+.slice-video-card>.slice-detail {margin:8px 0}
+.slice-categories {grid-template-columns:1fr;margin-top:8px}
+.slice-category {padding:12px 0}
+.slice-category + .slice-category {border-left:0;border-top:1px solid #e5eae3;padding-left:0}
+.slice-file {margin-top:10px}
+.slice-file summary,.slice-observations summary {cursor:pointer;color:#52675a;font-size:12px;line-height:1.6}
+.slice-category a {color:#315c45;text-underline-offset:3px}
+.slice-category progress {display:block;width:100%;height:7px;margin:10px 0;accent-color:#315c45}
+.slice-pagination {display:flex;align-items:center;justify-content:space-between;gap:14px;margin-top:20px;color:#536358;font-size:13px}
+.slice-pagination>div {display:flex;align-items:center;gap:12px}
+.slice-pagination button {font-size:13px;padding:8px 12px}
+.slice-video-card .actions:empty {display:none}
+.slicing-intro .section-title .slice-detail {margin:6px 0 0;font-size:14px}
+.slice-connection {display:inline-flex;align-items:center;gap:7px;color:#6a5741!important;white-space:nowrap}
+.slice-connection::before {content:'';width:7px;height:7px;background:#a98345;border-radius:50%}
+.slice-connection.connected {color:#315c45!important}
+.slice-connection.connected::before {background:#3f8158}
+.slice-main-actions {align-items:center}
+.slice-main-actions button {min-height:40px;font-size:14px}
+.slice-run-status {display:flex;flex-wrap:wrap;gap:6px 14px;margin-top:16px;padding:12px 14px;border:1px solid #cbdacc;background:#f3f7f2;color:#425c49;font-size:14px;line-height:1.6;overflow-wrap:anywhere}
+.slice-run-status strong {flex-shrink:0}
+.slice-run-status span {max-width:100%}
+.slice-run-status.attention {border-color:#b68a4d;background:#faf5eb;color:#785426}
+.slice-scan-details {margin-top:12px;font-size:13px;color:#536358}
+.slice-scan-details summary {cursor:pointer}
+.slice-records .section-title {margin-bottom:16px}
+.slice-records .slice-video-grid {grid-template-columns:repeat(2,minmax(0,1fr))}
+.slice-video-card {padding:18px 20px;contain-intrinsic-size:auto 270px}
+.slice-video-head h3 {display:flex;align-items:center;gap:8px;font-size:18px;line-height:1.4;word-break:break-word}
+.slice-record-time {margin:5px 0 0;color:#344d3c;font-size:14px;font-variant-numeric:tabular-nums}
+.slice-video-source {font-size:12px;color:#536358;margin-top:4px}
+.slice-restored {font-size:12px;font-weight:500;color:#496c56;white-space:nowrap}
+.slice-category .slice-detail,.slice-video-card .error {font-size:14px;line-height:1.65}
+.slice-category .error {padding:10px 12px;background:#fcf3e9;border-radius:6px;color:#8c4d25}
+.slice-category .slice-category-head {margin-bottom:8px}
+.slice-analysis p {font-size:13px;color:#41624d;margin:12px 0 5px;font-variant-numeric:tabular-nums}
+.slice-video-card .actions button {min-height:38px;font-size:13px}
+.slice-video-card .slice-file {border-top:1px solid #e5eae3;padding-top:10px;margin-top:14px}
+.slice-file summary,.slice-observations summary {font-size:13px}
+.slice-review summary {min-height:28px;font-size:13px}
+.slice-review-body label {font-size:13px}
+.slice-review-body input {font-size:14px}
+.slice-settings-grid input,.slice-settings-grid textarea {font-size:14px}
+.slice-filters button {min-height:36px;font-size:13px}
+.slice-search input,.slice-search select {font-size:14px;min-height:40px}
+.slice-pagination {font-variant-numeric:tabular-nums}
+.slice-records .empty {padding:32px 16px}
+.page-recovery p {line-height:1.7;color:#536358;max-width:65ch}
+@media(max-width:1000px) {
+  .slice-records .slice-video-grid {grid-template-columns:1fr}
+}
+@media(max-width:700px) {
+  .hero.compact {padding-top:18px}
+  .hero.compact h1 {font-size:24px}
+  .slice-search {max-width:none;min-width:0;width:100%}
+  .slice-search select {font-size:16px;max-width:125px}
+  .slice-pagination {align-items:flex-start;flex-direction:column}
+  .slice-pagination>div {width:100%;justify-content:space-between}
+  .slice-main-actions button {flex:1}
+  .slice-main-actions .link {flex:0 0 auto}
+  .slice-run-status {font-size:14px}
+  .slice-search input,.slice-review-body input,.slice-settings-grid input,.slice-settings-grid textarea {font-size:16px}
+  .slice-video-card {padding:16px}
+  .slicing-intro .section-title {gap:10px}
+  .slicing-intro .section-title>span {max-width:none}
+  .slice-records .section-title {align-items:flex-start;flex-direction:column;gap:6px}
+}
+
+.slice-flow {font-size:14px;line-height:1.7;color:#536358;margin:16px 0 10px}
+.slice-overall {display:flex;flex-wrap:wrap;gap:8px 24px;font-size:14px;color:#315c45;font-variant-numeric:tabular-nums}
+.slice-categories>div+div {border-top:1px solid #e5eae3;margin-top:12px;padding-top:12px}
+.slice-archive {font-size:13px;line-height:1.7;color:#315c45;overflow-wrap:anywhere;margin:14px 0 0}
+.slice-main-actions button:first-child {min-width:160px}
+.slice-video-card:focus-within {outline:2px solid #769c82;outline-offset:3px}
+.slicing-intro ::selection,.slice-records ::selection {background:#d2e3d4;color:#203e2c}
+@media(max-width:700px) {.slice-main-actions button:first-child {flex-basis:100%}.slice-overall {gap:8px 16px}}
+
+/* Results are sections inside each physical-file card, not nested cards. */
+.slice-categories .slice-category {background:transparent;border:0;border-radius:0;padding:10px 0}
+.slice-categories .slice-category.needs-review {background:transparent}

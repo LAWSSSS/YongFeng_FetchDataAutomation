@@ -16,6 +16,7 @@ from uuid import uuid4
 import httpx
 
 from .domain import now_iso, parse_time
+from . import secure_store
 
 ATHENA_ORIGIN = "http://pre-athena-mv.cisdigital.cn"
 # DatasetJobType.IMPORT in Athena; VIDEO_CUT / VIDEO_AUTO_CUT are 21 / 22.
@@ -159,11 +160,14 @@ def scan_directory(directory, recursive=False):
 
 class AthenaClient:
     """Only authentication and allowlisted GET requests; no upload/write API."""
-    def __init__(self, transport=None):
+    def __init__(self, transport=None, persist_connection=None):
         self.client = httpx.AsyncClient(base_url=f"{ATHENA_ORIGIN}/api/", trust_env=False,
             follow_redirects=False, timeout=httpx.Timeout(60, connect=12), transport=transport,
             headers={"Accept": "application/json", "aics-fronted": "true"})
         self.access, self.refresh, self.user = "", "", ""
+        self.persist_connection = transport is None if persist_connection is None else persist_connection
+        self.saved_connection = False
+        self.connection_warning = ""
         self.auth_lock = asyncio.Lock()
         self.log_slots = asyncio.Semaphore(4)
 
@@ -206,14 +210,91 @@ class AthenaClient:
                 if not isinstance(data, dict) or not isinstance(data.get("access"), str) or not data["access"]:
                     raise AuditError("视觉AI平台没有返回有效会话，请检查账号和密码。", "auth", 401)
                 self.access, self.refresh, self.user = data["access"], data.get("refresh", ""), account.strip()
+                await self._save_connection()
             except Exception:
                 self.clear()
                 raise
 
+    async def _save_connection(self):
+        if not self.persist_connection:
+            return
+        if not self.refresh:
+            self.saved_connection = False
+            self.connection_warning = "平台没有提供可续期凭证；当前连接有效，但关闭程序后需要重新连接。"
+            return
+        try:
+            await asyncio.to_thread(secure_store.save_connection, self.refresh, self.user)
+            self.saved_connection = True
+            self.connection_warning = ""
+        except Exception:
+            self.saved_connection = False
+            self.connection_warning = "连接有效，但系统钥匙串未能保存续期凭证；检查本机钥匙串访问后重新连接。"
+
+    async def restore_saved_connection(self):
+        if not self.persist_connection:
+            return False
+        try:
+            saved = await asyncio.to_thread(secure_store.load_connection)
+        except Exception:
+            self.connection_warning = "无法读取本机钥匙串中的连接；请重新连接平台。"
+            return False
+        if not saved:
+            return False
+        old_refresh = saved["refresh"]
+        self.refresh, self.user = old_refresh, saved.get("user", "")
+        self.saved_connection = True
+        try:
+            data = await self.auth_request("auth/token/refresh/", {"refresh": old_refresh})
+            access = data.get("access") if isinstance(data, dict) else None
+            if not isinstance(access, str) or not access:
+                raise AuditError("保存的视觉AI会话已失效，请重新连接。", "auth", 401)
+            self.access = access
+            self.refresh = data.get("refresh") or old_refresh
+            if self.refresh != old_refresh:
+                await self._save_connection()
+            else:
+                self.saved_connection = True
+                self.connection_warning = ""
+            return True
+        except AuditError as error:
+            self.clear()
+            if error.status == 401:
+                try:
+                    await asyncio.to_thread(secure_store.delete_connection)
+                except Exception:
+                    pass
+                self.saved_connection = False
+                self.connection_warning = "保存的视觉AI会话已过期，请重新连接一次。"
+            else:
+                self.connection_warning = "保存的视觉AI会话暂时无法恢复；检查网络后可重新连接。"
+            return False
+
+    async def forget_saved_connection(self):
+        if self.persist_connection:
+            try:
+                await asyncio.to_thread(secure_store.delete_connection)
+            except Exception:
+                self.connection_warning = "已断开本次会话，但系统钥匙串中的保存项未能清除。"
+                raise AuditError(self.connection_warning, "secure_store") from None
+        self.saved_connection = False
+        self.connection_warning = ""
+
     async def get(self, path, params=None):
-        # Restrict all data access to these two datasets and their bound job/log queries.
+        # Upload-audit stays limited to its two datasets and IMPORT-only routes.
+        # The separate slicing module uses its own guarded adapter for video cuts.
         if not re.fullmatch(r"devel/(?:datasets/(?:27912|27944)/|dataset-jobs/(?:\d+/logs/)?)", path):
             raise ValueError("不支持这个核对地址。")
+        return await self._get_authenticated(path, params)
+
+    async def get_slicing(self, path, params=None):
+        # A distinct, exact allowlist prevents the slicing feature from
+        # widening the existing import-audit route boundary.
+        pattern = r"devel/(?:datasets/\d+/(?:videos|images)?/?|datasets/?|dataset-groups/\d+/details/?|dataset-jobs/(?:\d+/logs/?|\d+/?|)?)"
+        if not re.fullmatch(pattern, path):
+            raise ValueError("不支持这个切片地址。")
+        return await self._get_authenticated(path, params)
+
+    async def _get_authenticated(self, path, params=None):
         if not self.connected:
             raise AuditError("请先连接视觉AI平台。", "auth", 401)
         for attempt in range(3):
@@ -236,9 +317,17 @@ class AthenaClient:
                             if not isinstance(data, dict) or not data.get("access"):
                                 raise AuditError("视觉AI平台登录已失效，请重新连接。", "auth", 401)
                             self.access = data["access"]
-                            self.refresh = data.get("refresh") or self.refresh
-                        except AuditError:
+                            next_refresh = data.get("refresh") or self.refresh
+                            if next_refresh != self.refresh:
+                                self.refresh = next_refresh
+                                await self._save_connection()
+                        except AuditError as error:
                             self.clear()
+                            if error.status == 401:
+                                try:
+                                    await self.forget_saved_connection()
+                                except AuditError:
+                                    pass
                             raise
                 continue
             if response.status_code in (429, 500, 502, 503, 504) and attempt < 2:
@@ -460,6 +549,8 @@ class UploadAuditManager:
 
     def state(self, default_directory=""):
         return {"connected": self.client.connected, "user": self.client.user,
+                "savedConnection": self.client.saved_connection,
+                "connectionWarning": self.client.connection_warning,
                 "directory": self.saved.get("directory") or default_directory, "recursive": self.saved.get("recursive", False),
                 "datasets": [{**d, "url": dataset_url(d["id"])} for d in DATASETS],
                 "run": self.run, "report": self.saved.get("report")}

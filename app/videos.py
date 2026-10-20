@@ -23,6 +23,7 @@ from .jobs import JobManager
 from .media import (DownloadFailure, download_url, file_digest,
                     prepare_directory, valid_video_header, video_filename)
 from .remote import RemoteClient, RemoteError
+from .media_validation import MediaValidationError, verify_video_tail
 from .source import page_records
 from .video_filters import filter_records, record_status
 
@@ -982,7 +983,10 @@ class VideoManager:
             duration = float(output.strip())
             if process.returncode or not math.isfinite(duration) or duration <= 0:
                 raise ValueError()
+            await asyncio.to_thread(verify_video_tail, path, shutil.which("ffmpeg") or "ffmpeg", duration)
             return duration
+        except MediaValidationError:
+            raise DownloadFailure("视频末段缺失或无法解码，尚未替换旧版。请使用完整视频重新采集或下载。", "invalid_video") from None
         except (OSError, ValueError):
             raise DownloadFailure("文件无法作为完整视频播放，旧版已保留。", "invalid_video") from None
 

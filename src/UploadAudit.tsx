@@ -4,6 +4,7 @@ import './upload-audit.css';
 import UploadMoves from './UploadMoves';
 import UploadQueue from './UploadQueue';
 import { auditBucket } from './upload-audit';
+import { usePolling } from './usePolling';
 
 type FileStatus = 'uploaded' | 'missing' | 'in_progress' | 'review';
 type Evidence = {status: FileStatus; message: string; jobId?: string; at?: string};
@@ -16,6 +17,7 @@ type AuditReport = {id: string; createdAt: string; directory: string; recursive:
   ignoredCount: number; datasets: Dataset[]; files: AuditFile[]; policyVersion?: number;
   scope?: {basis: string; since: string; unknownTimes: number}};
 type AuditState = {connected: boolean; user: string; directory: string; recursive?: boolean; datasets: Dataset[];
+  savedConnection?: boolean; connectionWarning?: string;
   run: {id: string; status: string; message: string; totalLogs?: number; completedLogs?: number} | null;
   report: AuditReport | null};
 const names: Record<FileStatus,string> = {uploaded:'已找到成功记录',missing:'未见上传记录',in_progress:'导入中',review:'待核对'};
@@ -67,15 +69,8 @@ export default function UploadAudit({defaultDirectory}: {defaultDirectory: strin
     return () => {active = false;};
   }, []);
   useEffect(() => {setDirectory(value => value || defaultDirectory);}, [defaultDirectory]);
-  useEffect(() => {
-    if (!running) return;
-    let active = true;
-    const timer = window.setInterval(() => {
-      void request('').then(data => {if (active) {setState(data);setError('');}})
-        .catch(failure => {if (active) setError((failure as Error).message);});
-    }, 1500);
-    return () => {active = false;window.clearInterval(timer);};
-  }, [running]);
+  usePolling(async () => {await refreshReport();setError('');}, running ? 2000 : null,
+    {immediate:false,onError:failure=>setError((failure as Error).message)});
   useEffect(() => {setPage(1);}, [search,filter,state.report?.id]);
 
   async function perform(path: string, body: object) {
@@ -123,13 +118,14 @@ export default function UploadAudit({defaultDirectory}: {defaultDirectory: strin
   }
 
   return <div className="upload-audit">
-    <section className="panel"><div className="section-title"><h2>视觉AI平台连接</h2><span className="audit-connection"><span className={state.connected ? 'dot connected' : 'dot'} />{state.connected ? `已连接 · ${state.user}` : '尚未连接'}</span></div>
+    <section className="panel"><div className="section-title"><h2>视觉AI平台连接</h2><span className="audit-connection"><span className={state.connected ? 'dot connected' : 'dot'} />{state.connected ? `已连接 · ${state.user}${state.savedConnection ? ' · 已保存' : ''}` : state.savedConnection ? '连接已保存，等待恢复' : '尚未连接'}</span></div>
       {!state.connected ? <form className="audit-login" onSubmit={login}>
         <label>视觉AI平台账号<input autoComplete="username" value={account} onChange={e => setAccount(e.target.value)} required /></label>
         <label>密码<input type="password" autoComplete="current-password" value={password} onChange={e => setPassword(e.target.value)} required /></label>
         <button disabled={busy || running}>{busy ? '连接中…' : '连接视觉AI平台'}</button>
-      </form> : <button className="link" disabled={busy || running} onClick={() => void perform('/logout',{})}>断开本次会话</button>}
-      <p className="subtle">连接 pre-athena-mv.cisdigital.cn；与采集平台及 Edge 的登录会话独立。账号密码仅用于本次连接；自动上传仅在点击“扫描并补传”后添加视频。</p>
+      </form> : <button className="link" disabled={busy || running} onClick={() => void perform('/logout',{})}>断开并清除保存连接</button>}
+      <p className="subtle">连接 pre-athena-mv.cisdigital.cn；与采集平台及 Edge 的登录会话独立。登录后仅将平台刷新凭证保存在本机系统钥匙串，密码不会保存；自动上传仅在点击“扫描并补传”后添加视频。</p>
+      {state.connectionWarning && <p className="error" role="status">{state.connectionWarning}</p>}
     </section>
 
     <UploadQueue onSessionChange={refreshReport} />

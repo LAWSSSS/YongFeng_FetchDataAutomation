@@ -496,6 +496,38 @@ async def test_registered_record_delete_is_deferred_before_cloud_or_file_mutatio
 
 
 @pytest.mark.asyncio
+async def test_duplicate_queue_entry_can_be_removed_and_restored_without_touching_video(harness,tmp_path):
+    _,manager,_,_,_=harness
+    duplicate=add(manager,tmp_path/'duplicates',prefix='copy')[0]
+    duplicate.update(state='attention',phase='review',errorCode='scan_review',message='同名文件已有任务。')
+    manager.store.save('items',duplicate)
+    active=add(manager,tmp_path/'duplicates',prefix='active')[0]
+    active.update(state='uploading',phase='uploading',bytes=4,uploadId='bound-multipart',batchId='batch-bound')
+    manager.store.save('items',active)
+    original=Path(duplicate['path'])
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=harness[0]),base_url='http://localhost') as http:
+        removed=await http.post(f'/api/uploads/{duplicate["id"]}/remove',json={})
+        assert removed.status_code==200
+        target=next(row for row in removed.json()['targets'] if row['id']==duplicate['dataset'])
+        assert all(row['id']!=duplicate['id'] for row in target['items'])
+        assert any(row['id']==duplicate['id'] for row in target['removedItems'])
+        assert manager.store.get('items',duplicate['id'])['state']=='dismissed'
+        assert original.is_file()
+
+        restored=await http.post(f'/api/uploads/{duplicate["id"]}/restore',json={})
+        assert restored.status_code==200
+        target=next(row for row in restored.json()['targets'] if row['id']==duplicate['dataset'])
+        visible=next(row for row in target['items'] if row['id']==duplicate['id'])
+        assert visible['state']=='attention' and visible['removable']
+        assert original.is_file()
+
+    with pytest.raises(Exception,match='不能从队列移除'):
+        await manager.remove(active['id'])
+    assert manager.store.get('items',active['id'])['state']=='uploading'
+
+
+@pytest.mark.asyncio
 async def test_new_scan_lists_unknown_log_evidence_as_review_without_uploading(harness,tmp_path):
     _,manager,platform,worker,_=harness
     folder=tmp_path/'videos';folder.mkdir();(folder/'unresolved.mp4').write_bytes(b'video')

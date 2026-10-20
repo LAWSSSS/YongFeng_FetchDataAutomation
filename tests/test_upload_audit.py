@@ -190,6 +190,51 @@ async def test_stalled_log_cursor_is_incomplete_not_missing(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_saved_platform_session_uses_refresh_token_only_and_restores(monkeypatch):
+    from app import secure_store
+
+    saved = {}
+    monkeypatch.setattr(secure_store, "save_connection",
+                        lambda refresh, user: saved.update(refresh=refresh, user=user))
+    monkeypatch.setattr(secure_store, "load_connection", lambda: dict(saved) if saved else None)
+    monkeypatch.setattr(secure_store, "delete_connection", lambda: saved.clear())
+    requests = []
+
+    def handle(request):
+        requests.append(request)
+        if request.url.path == "/api/auth/login/":
+            assert json.loads(request.content) == {"username": "tester", "password": "test-only-password"}
+            return httpx.Response(200, json={"code": "0", "data": {"access": "access-one", "refresh": "refresh-one"}})
+        if request.url.path == "/api/auth/token/refresh/":
+            assert json.loads(request.content) == {"refresh": "refresh-one"}
+            return httpx.Response(200, json={"code": "0", "data": {"access": "access-two", "refresh": "refresh-two"}})
+        raise AssertionError(request.url.path)
+
+    client = AthenaClient(httpx.MockTransport(handle), persist_connection=True)
+    await client.login("tester", "test-only-password")
+    assert client.saved_connection
+    assert saved == {"refresh": "refresh-one", "user": "tester"}
+    state = UploadAuditManager.__new__(UploadAuditManager)
+    state.client, state.saved, state.run = client, {}, None
+    response_state = UploadAuditManager.state(state)
+    assert response_state["savedConnection"] is True
+    assert "refresh-one" not in json.dumps(response_state)
+    assert "access-one" not in json.dumps(response_state)
+    await client.close()
+
+    restored = AthenaClient(httpx.MockTransport(handle), persist_connection=True)
+    assert await restored.restore_saved_connection()
+    assert restored.connected and restored.user == "tester" and restored.saved_connection
+    assert saved == {"refresh": "refresh-two", "user": "tester"}
+    assert [request.url.path for request in requests] == [
+        "/api/auth/login/", "/api/auth/token/refresh/",
+    ]
+    await restored.forget_saved_connection()
+    assert saved == {}
+    await restored.close()
+
+
+@pytest.mark.asyncio
 async def test_missing_pagination_headers_does_not_claim_complete_history():
     def handle(request):
         return Platform.answer([{"id": 1, "type": 1, "status": 3}])

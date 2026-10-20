@@ -1,0 +1,119 @@
+"""Physical-file analysis: one decoder, independent model outcomes."""
+import asyncio
+import copy
+from contextlib import ExitStack
+
+from .slicing_core import build_category_result, sample_points
+
+
+class SharedSlicingAnalysis:
+    def _save_analysis_item(self, work):
+        peers = work.get('_analysisPeers')
+        if not peers:
+            self.store.save('items', work)
+            return
+        for category, identity in peers.items():
+            item = self.store.get('items', identity)
+            for field in ('metadata', 'progress', 'analysisStage', 'analysisTotal', 'analysisDone', 'analysisPosition'):
+                if field in work:
+                    item[field] = work[field]
+            item['categories'][category] = copy.deepcopy(work['categories'][category])
+            item['revision'] = int(item.get('revision', 0)) + 1
+            self.store.save('items', item)
+
+    async def _process_shared(self, first, candidates):
+        from .slicing import applicable_category, source_version, ERROR_TEXT, ffprobe_file
+        peers = {applicable_category(first['sourceDatasetId']): first}
+        for candidate in candidates:
+            category = applicable_category(candidate['sourceDatasetId'])
+            if (category not in peers and candidate.get('path') == first['path']
+                    and candidate.get('fileVersion') == first['fileVersion']
+                    and candidate.get('state') == 'pending'):
+                peers[category] = candidate
+        if len(peers) == 1:
+            return await self.process_with_recovery(first)
+        work = copy.deepcopy(first)
+        work['_analysisPeers'] = {name: item['id'] for name, item in peers.items()}
+        work['categories'] = {name: copy.deepcopy(item['categories'][name]) for name, item in peers.items()}
+        for item in peers.values():
+            item.update(state='analyzing', message='共用抽帧识别中。')
+            self.store.save('items', item)
+        affected = tuple(peers)
+        guard = ExitStack()
+        try:
+            guard.enter_context(self._read_lease(work["path"]))
+            if source_version(work['path']) != work['fileVersion']:
+                raise ValueError('source_changed')
+            metadata = work.get('metadata') or await asyncio.to_thread(ffprobe_file, work['path'], self.store.settings['frameToolPath'])
+            work['metadata'] = metadata
+            for phase in ('initial', 'refine'):
+                keys, missing = {}, {}
+                active = tuple(name for name in peers if work['categories'][name].get('state') != 'attention') if phase == 'initial' else ('magnet',)
+                affected = active
+                interval = self.store.settings['sampleIntervalSeconds'] if phase == 'initial' else 10
+                points = sample_points(metadata['duration'], interval, metadata.get('frameRate', 25))
+                fingerprints = {}
+                for name in active:
+                    try:
+                        fingerprints[name] = self._model_fingerprint(name)
+                    except (OSError, ValueError) as error:
+                        code = str(error) if str(error) in ERROR_TEXT else 'model_load_failed'
+                        work['categories'][name].update(state='attention', errorCode=code, message=ERROR_TEXT[code])
+                active = tuple(fingerprints)
+                for name in active:
+                    keys[name] = {point: self._observation_key(work, name, point, fingerprints[name]) for point in points}
+                    missing[name] = [point for point in points if not self._get_observation(keys[name][point])]
+                if any(missing.values()):
+                    await self._run_worker(work, metadata, missing, keys, phase)
+                for name in active:
+                    observations = self._category_observations(work, name, points, keys[name], fingerprints[name])
+                    category = work['categories'][name]
+                    result = build_category_result(observations, interval=interval, duration=metadata['duration'],
+                        positive_labels={'target'}, target=self.store.settings['targetImages'])
+                    category.update(intervals=result['intervals'], intervalSeconds=result['intervalSeconds'],
+                        estimatedImages=result['estimatedImages'], observations=len(observations),
+                        samplingIntervalSeconds=interval, modelFingerprint=fingerprints[name],
+                        targetDatasetId=self.store.settings['targetDatasetIds'][peers[name]['sourceDatasetId']])
+                    uncertain = next((row for row in observations if row.get('code') or row['label'] == 'uncertain'), None)
+                    if category.get('state') == 'attention':
+                        continue
+                    if len(observations) != len(points):
+                        code = 'observations_incomplete'
+                    elif uncertain:
+                        code = uncertain.get('code') or 'bed_alignment_uncertain'
+                    elif result['tooMany']:
+                        code = 'slice_limit'
+                    else:
+                        code = ''
+                    if code:
+                        category.update(state='attention', errorCode=code, message=ERROR_TEXT.get(code, ERROR_TEXT['inference_failed']))
+                    else:
+                        category.update(state='ready' if result['intervals'] else 'no_target', errorCode='',
+                                        message='等待平台空位。' if result['intervals'] else '未检出目标')
+                self._save_analysis_item(work)
+                magnet = work['categories'].get('magnet', {})
+                if phase == 'refine' or 'magnet' not in fingerprints or magnet.get('state') == 'attention' or 100 <= (magnet.get('estimatedImages') or 0) <= 200:
+                    break
+        except asyncio.CancelledError:
+            for identity in work['_analysisPeers'].values():
+                item = self.store.get('items', identity)
+                item.update(state='pending', message='已暂停，观察保留。')
+                self.store.save('items', item)
+            raise
+        except Exception as error:
+            code = str(error) if str(error) in ERROR_TEXT else 'worker_failed'
+            for name in affected:
+                category = work['categories'][name]
+                if category.get('state') != 'attention':
+                    category.update(state='attention', errorCode=code, message=ERROR_TEXT.get(code, '本条未完成，原视频保留。'))
+            self._save_analysis_item(work)
+        finally:
+            guard.close()
+        for name, identity in work['_analysisPeers'].items():
+            item = self.store.get('items', identity)
+            category = item['categories'][name]
+            state = category.get('state')
+            item.update(state='platform_processing' if state in {'ready', 'waiting_slot'} else state,
+                        errorCode=category.get('errorCode', ''), message=category.get('message', ''))
+            self._recover_analysis_outcome(item)
+            self.store.save('items', item)

@@ -1,0 +1,243 @@
+import asyncio
+import json
+import shutil
+import subprocess
+
+import httpx
+import pytest
+
+from app.main import create_app
+from app.slicing import source_version
+from app.slicing_remote import SlicingRemote
+from app.slicing_worker import extract_requested_frames, probe
+from app.upload_audit import AthenaClient, AuditError
+from tests.test_slicing import FakeSlicingRemote
+
+
+async def close_app(app):
+    for name in ("slicing", "uploads", "videos", "jobs", "upload_audit"):
+        await getattr(app.state, name).shutdown()
+    app.state.store.close()
+
+
+@pytest.mark.asyncio
+async def test_image_query_reads_only_the_operation_prefix_and_keeps_no_media_links():
+    calls, progress = [], []
+    prefix = "鲁Q09613D_249308_C"
+
+    def handler(request):
+        calls.append(request)
+        assert request.url.params["search"] == prefix
+        assert request.url.params["page_size"] == "100"
+        assert "pageSize" not in request.url.params
+        page = int(request.url.params["page"])
+        start, end = (0, 100) if page == 1 else (100, 146)
+        rows = [{"id": index + 1, "name": f"{prefix}_{index}.jpg", "taskId": 810,
+                 "url": "not-for-state", "extra": "unused"} for index in range(start, end)]
+        return httpx.Response(200, json={"data": rows},
+            headers={"x-total": "146", "x-next-page": "2" if page == 1 else "0"})
+
+    auth = AthenaClient(transport=httpx.MockTransport(handler)); auth.access = "test-token"
+    rows = await SlicingRemote(auth).image_rows("900", prefix=prefix, progress=progress.append)
+    assert len(rows) == 146 and len(calls) == 2
+    assert all("url" not in row and "extra" not in row for row in rows)
+    assert progress[-1] == {"read": 146, "total": 146, "pages": 2, "scope": "prefix"}
+    await auth.client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_ignored_image_filter_is_not_mistaken_for_an_empty_safe_snapshot():
+    auth = AthenaClient(transport=httpx.MockTransport(lambda request:
+        httpx.Response(200, json={"data": [{"id": 1, "name": "other-video.jpg"}]})))
+    auth.access = "test-token"
+    with pytest.raises(AuditError) as failure:
+        await SlicingRemote(auth).image_rows("900", prefix="expected_C")
+    assert failure.value.code == "image_filter"
+    await auth.client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_public_state_excludes_large_snapshots_without_changing_durable_evidence(tmp_path):
+    app = create_app(data_dir=tmp_path)
+    manager = app.state.slicing
+    snapshots = [str(index) for index in range(21022)]
+    item = {"id": "large", "name": "source.mp4", "state": "complete", "categories": {
+        "bed": {"state": "complete", "actualImages": 146, "preSubmitImageIds": snapshots,
+                "preSubmitTaskIds": ["810"], "outputImageIds": ["9001"]}}}
+    manager.store.save("items", item)
+    public = manager.state()["items"][0]
+    assert public["categories"]["bed"] == {"state": "complete", "actualImages": 146}
+    assert manager.store.get("items", "large")["categories"]["bed"]["preSubmitImageIds"] == snapshots
+    assert len(json.dumps(public)) < len(json.dumps(item)) / 100
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1") as client:
+        first = await client.get("/api/slicing")
+        same = await client.get("/api/slicing", headers={"If-None-Match": first.headers["etag"]})
+        assert same.status_code == 304 and not same.content
+        item["state"] = "attention"; manager.store.save("items", item)
+        changed = await client.get("/api/slicing", headers={"If-None-Match": first.headers["etag"]})
+        assert changed.status_code == 200 and changed.headers["etag"] != first.headers["etag"]
+    await close_app(app)
+
+
+@pytest.mark.asyncio
+async def test_bound_task_polling_and_output_check_do_not_reload_task_or_image_history(tmp_path):
+    app = create_app(data_dir=tmp_path); manager = app.state.slicing
+    manager.auth.access = "test-token"; remote = FakeSlicingRemote(); manager.remote = remote
+    manager.store.settings["targetDatasetIds"] = {"27912": "900", "27944": "901"}
+    path = tmp_path / "source.mp4"; path.write_bytes(b"immutable source")
+    item = {"id": "fast", "sourceDatasetId": "27912", "sourceVideoId": "55", "name": path.name,
+        "path": str(path), "fileVersion": source_version(path), "state": "platform_processing", "revision": 0,
+        "categories": {"bed": {"state": "ready", "intervals": [{"start": 0, "end": 2190}],
+            "intervalSeconds": 15, "modelFingerprint": "bed-v1"}, "magnet": {"state": "not_applicable"}}}
+    remote.video_rows["27912"] = [{"id": 55, "name": path.name, "cutStatus": 0}]
+    image_queries, direct_reads = [], []
+
+    async def images(dataset, *, prefix=None, progress=None):
+        assert prefix == "source_55_C"
+        image_queries.append(prefix)
+        if len(image_queries) == 1:
+            return []
+        if progress: progress({"read": 146, "total": 146, "pages": 2, "scope": "prefix"})
+        return [{"id": index + 1000, "name": f"{prefix}_{index}.jpg"} for index in range(146)]
+
+    async def direct(identity):
+        direct_reads.append(identity)
+        return {**remote.job_rows["27912"]["21"][0], "status": 3}
+
+    async def no_history(*args):
+        pytest.fail("a bound task must use its exact ID rather than enumerate task history")
+
+    remote.image_rows = images; remote.job = direct
+    manager.store.save("items", item)
+    await manager._submit_ready(item)
+    remote.jobs = no_history
+    await manager._reconcile_waiting()
+    result = manager.store.get("items", "fast")
+    assert result["state"] == "complete"
+    assert result["categories"]["bed"]["actualImages"] == 146
+    assert remote.created == 1 and direct_reads == ["810"] and len(image_queries) == 2
+    await close_app(app)
+
+
+@pytest.mark.asyncio
+async def test_platform_checks_continue_during_analysis_and_only_one_local_worker_runs(tmp_path, monkeypatch):
+    app = create_app(data_dir=tmp_path); manager = app.state.slicing
+    manager.auth.access = "test-token"
+    manager.run = {"id": "concurrent", "state": "running"}
+    manager.store.save("runs", manager.run)
+    for identity in ("first", "second"):
+        manager.store.save("items", {"id": identity, "state": "pending", "path": "/fixture.mp4",
+            "sourceDatasetId": "27912", "categories": {"bed": {"state": "pending"}}})
+    release = asyncio.Event(); calls = []; polls = []
+
+    async def analyze(item):
+        calls.append(item["id"])
+        await release.wait()
+
+    async def poll(**kwargs): polls.append(True)
+
+    monkeypatch.setattr(manager, "_process_item", analyze)
+    monkeypatch.setattr(manager, "_reconcile_waiting", poll)
+    await asyncio.wait_for(manager._tick(), 1)
+    await asyncio.sleep(0)
+    await asyncio.wait_for(manager._tick(), 1)
+    assert calls == ["first"] and len(polls) == 2
+    release.set(); await manager.analysis_task
+    await close_app(app)
+
+
+@pytest.mark.asyncio
+async def test_scan_reuses_completed_logs_but_refreshes_active_logs(tmp_path, monkeypatch):
+    app = create_app(data_dir=tmp_path); manager = app.state.slicing
+    manager.auth.access = "test-token"; remote = FakeSlicingRemote(); manager.remote = remote
+    remote.video_rows["27912"] = [{"id": 31, "name": "first.mp4", "cutStatus": 0},
+                                 {"id": 32, "name": "second.mp4", "cutStatus": 0}]
+    remote.job_rows["27912"]["21"] = [{"id": 101, "type": 21, "status": 3,
+        "config": {"source": {"datasets": [{"videos": {"ids": [31]}}]}}},
+        {"id": 102, "type": 21, "status": 2,
+        "config": {"source": {"datasets": [{"videos": {"ids": [32]}}]}}}]
+    reads = []
+    async def logs(dataset, identity): reads.append(identity); return []
+    remote.logs = logs
+    monkeypatch.setattr("app.slicing.scan_local_files", lambda directories: ([], directories, []))
+    manager.scan("first-scan"); await manager.scan_task
+    manager.scan("second-scan"); await manager.scan_task
+    assert reads.count("101") == 1 and reads.count("102") == 2
+    assert any(entry.get("cacheHit") for entry in manager.state()["run"]["taskLogIndex"])
+    await close_app(app)
+
+
+@pytest.mark.asyncio
+async def test_job_summary_keeps_submission_counts_without_sending_source_payloads(tmp_path):
+    app = create_app(data_dir=tmp_path)
+    app.state.store.save({"id": "j", "status": "complete", "createdAt": "2026-10-19T00:00:00Z",
+        "events": [], "originalRecords": "x" * 100000,
+        "items": [{"status": "submitted", "videoName": "source", "privateSnapshot": "x" * 10000}]})
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1") as client:
+        full = await client.get("/api/jobs"); summary = await client.get("/api/jobs?summary=true")
+    assert summary.json()[0]["items"] == [{"status": "submitted", "videoName": "source"}]
+    assert len(summary.content) < len(full.content) / 100
+    assert app.state.store.get("j")["originalRecords"] == "x" * 100000
+    await close_app(app)
+
+
+@pytest.mark.asyncio
+async def test_video_view_omits_internal_snapshots_while_preserving_correction_fields(tmp_path, monkeypatch):
+    app = create_app(data_dir=tmp_path)
+    record = {"id": "video", "revision": 4, "activeRevision": 2, "acceptedRevision": 1,
+        "requests": {"old": "proof"}, "versions": [{"revision": 2, "state": "ready",
+        "startTime": "2026-10-19 10:00:00", "durationSeconds": 600, "taskId": "bound",
+        "beforeIds": [str(index) for index in range(10000)]}]}
+    monkeypatch.setattr(app.state.videos, "state", lambda query: {"videos": [record], "counts": {"ready": 1}})
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1") as client:
+        response = (await client.get("/api/videos?compact=true")).json()
+    public = response["videos"][0]
+    assert public["revision"] == 4 and public["activeRevision"] == 2 and public["acceptedRevision"] == 1
+    assert public["versions"][0]["taskId"] == "bound" and "beforeIds" not in public["versions"][0]
+    assert len(record["versions"][0]["beforeIds"]) == 10000 and "requests" in record
+    await close_app(app)
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="ffmpeg is required")
+def test_sparse_seeking_preserves_the_actual_first_frame_and_shared_sample_positions(tmp_path):
+    ffmpeg = shutil.which("ffmpeg"); video = tmp_path / "colors.mp4"
+    subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+        "color=c=red:s=64x64:r=5:d=5[a];color=c=blue:s=64x64:r=5:d=5[b];[a][b]concat=n=2:v=1:a=0",
+        "-c:v", "mpeg4", "-y", str(video)], check=True, timeout=20)
+    metadata = probe(str(video), shutil.which("ffprobe"))
+    frames = list(extract_requested_frames(str(video), ffmpeg, metadata,
+        {"bed": [0, 5, 9.8], "magnet": [0, 9.8]}))
+    assert [position for position, _ in frames] == [0, 5, 9.8]
+    pixels = []
+    for _, image in frames:
+        decoded = subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-i", "pipe:0",
+            "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"], input=image, capture_output=True, check=True, timeout=10)
+        pixels.append(tuple(decoded.stdout[:3]))
+    assert pixels[0][0] > 200 and pixels[0][2] < 20
+    assert all(pixel[2] > 200 and pixel[0] < 20 for pixel in pixels[1:])
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="ffmpeg is required")
+def test_dense_sampling_keeps_frame_zero_instead_of_the_middle_of_the_first_second(tmp_path):
+    ffmpeg = shutil.which("ffmpeg"); video = tmp_path / "dense.mp4"
+    subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+        "color=c=red:s=64x64:r=5:d=0.2[a];color=c=blue:s=64x64:r=5:d=2.8[b];[a][b]concat=n=2:v=1:a=0",
+        "-c:v", "mpeg4", "-y", str(video)], check=True, timeout=20)
+    metadata = probe(str(video), shutil.which("ffprobe"))
+    frames = list(extract_requested_frames(str(video), ffmpeg, metadata, {"bed": [0, 1, 2]}))
+    decoded = subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-i", "pipe:0",
+        "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"], input=frames[0][1], capture_output=True, check=True, timeout=10)
+    assert decoded.stdout[0] > 200 and decoded.stdout[2] < 20
+
+
+def test_partial_dense_cache_retries_seek_to_the_missing_positions(tmp_path, monkeypatch):
+    import app.slicing_worker as worker
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg: pytest.skip("ffmpeg is required")
+    video = tmp_path / "partial.mp4"; video.write_bytes(b"fixture"); seeks = []
+    def frames(command):
+        seeks.append(float(command[command.index("-ss")+1])); yield b"\xff\xd8fixture\xff\xd9"
+    monkeypatch.setattr(worker, "jpeg_frames", frames)
+    output = list(worker.extract_requested_frames(str(video), ffmpeg,
+        {"duration": 120, "frameRate": 25}, {"bed": [30, 31]}))
+    assert seeks == [30, 31] and [position for position, _ in output] == [30, 31]

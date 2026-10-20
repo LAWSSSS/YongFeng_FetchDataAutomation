@@ -1,5 +1,7 @@
 """Independent local website for manual review and batch video collection."""
 import asyncio
+import hashlib
+import mimetypes
 import os
 import re
 from contextlib import asynccontextmanager
@@ -9,7 +11,7 @@ from uuid import uuid4
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -23,22 +25,37 @@ from .models import (BulkVideoInput, CollectionRule, CorrectionInput, DirectoryI
                      LoginInput, PreviewInput, RecordRemoveInput, SearchInput, SubmitInput, VersionActionInput,
                      UploadAuditInput, UploadAuditLoginInput, AuditMovePreviewInput, AuditMoveConfirmInput)
 from .models import AdmissionSettingsInput, UploadScanInput
+from .models import (SlicingSettingsInput, SlicingScanInput, SlicingStartInput,
+                     SlicingItemActionInput, SlicingBindInput, SlicingReviewInput)
 from .remote import RemoteClient, RemoteError
 from .source import scan_source
 from .store import JobStore
 from .videos import EXTERNAL_VIDEO_DIR, Conflict, VideoManager
 from .upload_audit import AuditError, AthenaClient, UploadAuditManager
 from .audit_moves import AuditMoveManager
+from .file_index import FileIndex
 from .file_leases import FileLeases
 from .uploads import UploadManager
+from .slicing import SlicingManager, source_version
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def state_response(payload, request):
+    response = JSONResponse(payload)
+    etag = '"' + hashlib.sha256(response.body).hexdigest()[:24] + '"'
+    headers = {"ETag": etag, "Cache-Control": "private, no-cache"}
+    candidates = {value.strip().removeprefix("W/") for value in request.headers.get("if-none-match", "").split(",")}
+    if etag in candidates:
+        return Response(status_code=304, headers=headers)
+    response.headers.update(headers)
+    return response
 
 
 def create_app(source: RemoteClient | None = None, target: RemoteClient | None = None,
                data_dir: Path | None = None, video_directory: Path | None = None,
                staging_directory: Path | None = None, audit_client: AthenaClient | None = None,
-               upload_remote=None, upload_worker=None, upload_file_check=None) -> FastAPI:
+               upload_remote=None, upload_worker=None, upload_file_check=None, slicing_remote=None) -> FastAPI:
     source = source or RemoteClient("source")
     target = target or RemoteClient("target")
     production_data = data_dir is None
@@ -59,6 +76,10 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
     audit_moves.file_leases = leases
     uploads = UploadManager(store, upload_audit, leases, remote=upload_remote, worker=upload_worker,
                             file_check=upload_file_check)
+    slicing = SlicingManager(store, upload_audit.client, data_dir, leases, remote=slicing_remote)
+    files = FileIndex(store, videos, uploads, slicing, audit_moves, leases)
+    slicing.files = files
+    files.refresh()
     searches: dict[str, dict] = {}
     plans: dict[str, dict] = {}
     search_tasks: set[asyncio.Task] = set()
@@ -84,17 +105,20 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
             except Exception:
                 client.clear()
                 credential_errors[service] = "本机配置中的登录信息已失效，请重新登录并更新保存项。"
+        await upload_audit.client.restore_saved_connection()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         await restore_saved_credentials()
         await videos.start()
         await uploads.start()
+        await slicing.startup()
         yield
         for task in search_tasks:
             task.cancel()
         if search_tasks:
             await asyncio.gather(*search_tasks, return_exceptions=True)
+        await slicing.shutdown()
         await uploads.shutdown()
         await audit_moves.shutdown()
         await videos.shutdown()
@@ -113,6 +137,8 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
     application.state.audit_moves = audit_moves
     application.state.admission_settings = admission_settings
     application.state.uploads = uploads
+    application.state.slicing = slicing
+    application.state.files = files
     application.add_middleware(TrustedHostMiddleware, allowed_hosts=["localhost", "127.0.0.1", "[::1]"])
 
     @application.middleware("http")
@@ -177,18 +203,23 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
 
     @application.post("/api/upload-audit/login")
     async def upload_audit_login(payload: UploadAuditLoginInput):
-        if upload_audit.busy or uploads.busy:
-            raise ValueError("核对或上传正在进行，请先暂停上传再切换视觉AI账号。")
+        slicing_reconnecting = slicing.run and slicing.run.get("state") == "waiting_connection"
+        if upload_audit.busy or uploads.busy or (slicing.busy and not slicing_reconnecting):
+            raise ValueError("切片、核对或上传正在进行，请先暂停对应队列再切换视觉AI账号。")
         await upload_audit.client.login(payload.account, payload.password)
         uploads.wake.set()
+        await slicing.connection_restored()
         return upload_audit.state(videos.store.directory())
 
     @application.post("/api/upload-audit/logout")
     async def upload_audit_logout():
-        if upload_audit.busy or uploads.busy:
-            raise ValueError("核对或上传正在进行，请先暂停上传再断开。")
+        if upload_audit.busy or uploads.busy or slicing.busy:
+            raise ValueError("切片、核对或上传正在进行，请先暂停对应队列再断开。")
         uploads.grants.clear()
-        upload_audit.client.clear()
+        try:
+            await upload_audit.client.forget_saved_connection()
+        finally:
+            upload_audit.client.clear()
         return upload_audit.state(videos.store.directory())
 
     @application.post("/api/upload-audit/run", status_code=202)
@@ -227,6 +258,125 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
     @application.post("/api/uploads/{identity}/retry")
     async def retry_upload(identity: str):
         return uploads.retry(identity)
+
+    @application.post("/api/uploads/{identity}/remove")
+    async def remove_upload(identity: str):
+        return await uploads.remove(identity)
+
+    @application.post("/api/uploads/{identity}/restore")
+    async def restore_upload(identity: str):
+        return await uploads.restore(identity)
+
+    @application.get("/api/slicing")
+    async def slicing_state(request: Request):
+        return state_response(slicing.state(), request)
+
+    @application.post("/api/slicing/execute-all", status_code=202)
+    async def slicing_execute_all(payload: SlicingItemActionInput):
+        return await slicing.execute_all(payload.requestId, payload.expectedRevision)
+
+    @application.get("/api/files")
+    async def file_state():
+        files.refresh()
+        return files.state()
+
+    @application.post("/api/files/recheck")
+    async def file_recheck():
+        return await files.reconcile()
+
+    @application.post("/api/files/{identity}/archive-retry")
+    async def archive_retry(identity: str):
+        return await files.retry(identity)
+
+    @application.post("/api/slicing/settings")
+    async def slicing_settings(payload: SlicingSettingsInput):
+        return slicing.update_settings(payload.model_dump())
+
+    @application.post("/api/slicing/scan", status_code=202)
+    async def slicing_scan(payload: SlicingScanInput):
+        return slicing.scan(payload.requestId)
+
+    @application.post("/api/slicing/start", status_code=202)
+    async def slicing_start(payload: SlicingStartInput):
+        return await slicing.start(payload.requestId, payload.expectedRevision, payload.mode, payload.itemId)
+
+    @application.post("/api/slicing/pause")
+    async def slicing_pause():
+        return slicing.pause()
+
+    @application.post("/api/slicing/resume", status_code=202)
+    async def slicing_resume(payload: SlicingScanInput):
+        return slicing.resume(payload.requestId)
+
+    @application.post("/api/slicing/{identity}/retry", status_code=202)
+    async def slicing_retry(identity: str, payload: SlicingItemActionInput):
+        return slicing.retry(identity, payload.expectedRevision, payload.requestId)
+
+    @application.post("/api/slicing/{identity}/bind")
+    async def slicing_bind(identity: str, payload: SlicingBindInput):
+        return await slicing.bind(identity, payload.model_dump())
+
+    @application.post("/api/slicing/{identity}/review")
+    async def slicing_review(identity: str, payload: SlicingReviewInput):
+        return await slicing.review(identity, payload.model_dump())
+
+    @application.api_route("/api/slicing/{identity}/stream", methods=["GET", "HEAD"])
+    async def slicing_stream(identity: str, request: Request):
+        item = slicing.store.get("items", identity)
+        if not item or not item.get("path"):
+            raise HTTPException(404, "本地视频尚未绑定。")
+        path = Path(item["path"])
+        try:
+            current = source_version(path)
+        except (OSError, ValueError):
+            raise HTTPException(409, "本地视频暂不可用，请重新绑定后查看。") from None
+        if current != item.get("fileVersion"):
+            raise HTTPException(409, "本地视频版本已变化，请重新扫描或绑定。")
+        size = current["size"]
+        range_header = request.headers.get("range", "")
+        start, end, status = 0, size - 1, 200
+        if range_header:
+            match = re.fullmatch(r"bytes=(\d*)-(\d*)", range_header.strip())
+            if not match or (not match.group(1) and not match.group(2)):
+                return StreamingResponse(iter(()), status_code=416, headers={"Content-Range": f"bytes */{size}"})
+            if match.group(1):
+                start = int(match.group(1))
+                end = int(match.group(2)) if match.group(2) else size - 1
+            else:
+                suffix = int(match.group(2))
+                start, end = max(0, size - suffix), size - 1
+            if start >= size or end < start:
+                return StreamingResponse(iter(()), status_code=416, headers={"Content-Range": f"bytes */{size}"})
+            end = min(end, size - 1)
+            status = 206
+        length = max(0, end - start + 1)
+        headers = {"Accept-Ranges": "bytes", "Content-Length": str(length),
+                   "Content-Type": mimetypes.guess_type(path.name)[0] or "application/octet-stream",
+                   "Cache-Control": "no-store"}
+        if status == 206:
+            headers["Content-Range"] = f"bytes {start}-{end}/{size}"
+
+        async def body():
+            with slicing.leases.read(path):
+                with path.open("rb") as stream:
+                    stream.seek(start)
+                    remaining = length
+                    while remaining > 0:
+                        block = await asyncio.to_thread(stream.read, min(1024 * 1024, remaining))
+                        if not block:
+                            break
+                        remaining -= len(block)
+                        yield block
+
+        if request.method == "HEAD":
+            return StreamingResponse(iter(()), status_code=status, headers=headers)
+        return StreamingResponse(body(), status_code=status, headers=headers)
+
+    @application.get("/api/slicing/{identity}/frame")
+    async def slicing_frame(identity: str, time_seconds: float):
+        from fastapi.responses import Response
+        content = await slicing.frame(identity, time_seconds)
+        return Response(content, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
 
     @application.get("/api/upload-audit/moves")
     async def audit_move_state():
@@ -377,8 +527,14 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
         return job
 
     @application.get("/api/jobs")
-    async def job_list():
-        return store.list()
+    async def job_list(request: Request, summary: bool = False):
+        rows = store.list()
+        if not summary:
+            return state_response(rows, request)
+        result = [{key: row[key] for key in ("id", "status", "createdAt", "downloadAfterCollection", "deletedAt")
+                 if key in row} | {"items": [{"status": item.get("status"), "videoName": item.get("videoName", "")}
+                                           for item in row.get("items", [])]} for row in rows]
+        return state_response(result, request)
 
     @application.post("/api/jobs/{job_id}/refresh")
     async def refresh_job(job_id: str):
@@ -390,7 +546,14 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
 
     @application.get("/api/videos")
     async def video_state(request: Request):
-        return videos.state(dict(request.query_params))
+        result = videos.state(dict(request.query_params))
+        if request.query_params.get("summary") == "true":
+            result = {**result, "videos": []}
+        elif request.query_params.get("compact") == "true":
+            result = {**result, "videos": [{key: value for key, value in row.items() if key != "requests"} |
+                {"versions": [{key: value for key, value in version.items() if key != "beforeIds"}
+                              for version in row.get("versions", [])]} for row in result["videos"]]}
+        return state_response(result, request)
 
     @application.post("/api/videos/bulk-confirm", status_code=202)
     async def bulk_confirm(payload: BulkVideoInput):

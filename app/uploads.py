@@ -202,18 +202,25 @@ class UploadManager:
         validated = all(self.store.settings.get("validated", {}).get(d["id"]) for d in DATASETS)
         for dataset in DATASETS:
             selected = [i for i in items if i["dataset"] == dataset["id"]]
+            visible = [i for i in selected if i.get("state") != "dismissed"]
+            removed = [i for i in selected if i.get("state") == "dismissed"]
             public = []
-            for item in selected:
+            for item in visible:
                 # Object keys and multipart IDs are receipts, not browser data.
                 row = {k: item.get(k) for k in ("id", "name", "path", "size", "state", "phase", "bytes", "speed",
                     "retries", "message", "errorCode", "jobId", "nextAttempt", "createdAt", "updatedAt", "completedAt")}
                 row["bytes"] = max(row.get("bytes") or 0, self.runtime.get(item["id"], {}).get("bytes", 0))
                 row["speed"] = self.runtime.get(item["id"], {}).get("speed", 0)
                 row["retries"] = min(row.get("retries") or 0, 3)
+                row["removable"] = self.can_remove(item)
                 public.append(row)
             info = self.target_info(dataset["id"])
-            targets.append({**dataset, "items": public, "counts": dict(Counter(i["state"] for i in selected)),
-                "activeUploads": sum(i["id"] in self.running for i in selected),
+            targets.append({**dataset, "items": public, "removedItems": [
+                    {"id": i["id"], "name": i["name"], "path": i.get("path", ""),
+                     "removedAt": i.get("removedAt", ""), "message": i.get("message", "")}
+                    for i in removed],
+                "counts": dict(Counter(i["state"] for i in visible)),
+                "activeUploads": sum(i["id"] in self.running for i in visible),
                 "activeImport": info.get("activeImport", ""), "blocked": bool(info.get("blocked")),
                 "message": info.get("message", ""), "lastCheckedAt": info.get("lastCheckedAt", ""),
                 "batches": [{k: b.get(k) for k in ("id", "state", "jobId", "message", "createdAt")}
@@ -342,6 +349,49 @@ class UploadManager:
     def resume(self):
         self.store.settings["enabled"] = True
         self.store.save_settings()
+        self.wake.set()
+        return self.state()
+
+    def can_remove(self, item):
+        """Only an unstarted queue entry can be manually hidden from work."""
+        return bool(item and item.get("state") in {"attention", "queued"}
+            and item.get("phase") in {"review", "queued"}
+            and item.get("id") not in self.running
+            and not item.get("bytes") and not self.runtime.get(item.get("id"), {}).get("bytes")
+            and not item.get("parts") and not item.get("uploadId") and not item.get("object")
+            and not item.get("jobId") and not item.get("batchId")
+            and not item.get("createAttempted") and not item.get("completionAttempted")
+            and not item.get("cleanupNeeded"))
+
+    async def remove(self, identity):
+        # Wait for an in-flight scan or scheduler tick, then re-check the exact
+        # record before changing its queue state. The source file and platform
+        # assets are deliberately outside this operation's scope.
+        async with self.scan_lock:
+            async with self.tick_lock:
+                item = self.store.get("items", identity)
+                if not item:
+                    raise ValueError("上传记录不存在。")
+                if not self.can_remove(item):
+                    raise Conflict("此视频已开始上传、绑定平台对象或已有导入进度，不能从队列移除。")
+                item["removedFrom"] = {key: item.get(key) for key in ("state", "phase", "message", "errorCode")}
+                item.update(state="dismissed", phase="dismissed", removedAt=now_iso(),
+                    message="已人工从待上传队列移除；本地原视频和平台已有数据均未更改。")
+                self.store.save("items", item)
+        self.wake.set()
+        return self.state()
+
+    async def restore(self, identity):
+        async with self.scan_lock:
+            async with self.tick_lock:
+                item = self.store.get("items", identity)
+                if not item or item.get("state") != "dismissed":
+                    raise ValueError("已移除记录不存在或已恢复。")
+                previous = item.pop("removedFrom", {})
+                item.pop("removedAt", None)
+                item.update(state=previous.get("state", "attention"), phase=previous.get("phase", "review"),
+                    message=previous.get("message", "已恢复到上传队列。"), errorCode=previous.get("errorCode", ""))
+                self.store.save("items", item)
         self.wake.set()
         return self.state()
 

@@ -303,7 +303,7 @@ class AuditMoveManager:
 
     def update_bindings(self, item):
         if getattr(self, "file_leases", None):
-            self.file_leases.on_move(item["source"], item["destination"], item["destinationVersion"])
+            self.file_leases.notify_move(item["source"], item["destination"], item["destinationVersion"])
         for row in self.bindings(item["source"]):
             for version in row["versions"]:
                 if version.get("filePath") == item["source"]:
