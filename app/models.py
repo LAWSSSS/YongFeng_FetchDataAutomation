@@ -140,8 +140,10 @@ class SlicingSettingsInput(BaseModel):
     bedIntervalSeconds: int = Field(default=30, ge=1, le=3600)
     magnetConfidence: float = Field(default=0.25, ge=0, le=1, allow_inf_nan=False)
     targetImages: int = Field(default=150, ge=100, le=200)
+    bedTargetImages: int = Field(default=180, ge=100, le=200)
     targetDatasetIds: dict[str, str | None] = Field(default_factory=lambda: {"27912": None, "27944": None})
     autoArchive: bool = True
+    reviewBeforeUpload: bool = True
     archiveCompletedDirectory: str = Field(default="切片完成", min_length=1, max_length=100)
     archiveEmptyDirectory: str = Field(default="未检出目标", min_length=1, max_length=100)
 

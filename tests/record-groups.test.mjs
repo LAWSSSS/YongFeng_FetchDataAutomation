@@ -1,9 +1,23 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { batchDate, canDownload, groupVideos, splitInspections } from '../src/record-groups.ts';
+import { batchDate, canDownload, groupVideos, splitInspections, syncVideoSelection } from '../src/record-groups.ts';
 
 const video = (id, jobId, state, extra = {}) => ({id, jobId, activeRevision: 0, revision: 0,
   versions: [{revision: 0, state}], ...extra});
+
+test('bulk selection keeps the same version and drops a version that has changed', () => {
+  const selection = new Map([['keep', {id:'keep', version:1, expectedRevision:2}],
+    ['stale', {id:'stale', version:1, expectedRevision:2}],
+    ['hidden', {id:'hidden', version:0, expectedRevision:1}]]);
+  const next = syncVideoSelection(selection, [
+    {id:'keep', revision:5, activeRevision:1},
+    {id:'stale', revision:4, activeRevision:2},
+  ]);
+  assert.equal(next.get('keep').expectedRevision, 5);
+  assert.equal(next.get('keep').version, 1);
+  assert.equal(next.has('stale'), false);
+  assert.equal(next.get('hidden').expectedRevision, 1);
+});
 
 test('approved and unapproved results are separate; rejection reasons and stable IDs remain', () => {
   const rows = [{id:'valid-plate',issue:''}, {id:'no-photo',issue:'无真实车牌且没有有效照片'},

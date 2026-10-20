@@ -580,19 +580,21 @@ class UploadAuditManager:
             scope = {"basis": "local_birthtime", "since": ns_iso(since_ns), "unknownTimes": unknown_times}
             self.run.update(localCount=len(files), message="正在读取两个数据集的导入任务…")
             self.save()
-            targets = []
-            for dataset in DATASETS:
+
+            async def load_target(dataset):
                 info, _ = await self.client.get(f"devel/datasets/{dataset['id']}/", {"namespace": 1})
                 if not isinstance(info, dict) or str(info.get("id")) != dataset["id"]:
                     raise AuditError("返回的数据集身份与核对目标不一致。", "identity")
                 jobs = await self.client.jobs(dataset["id"])
                 imports = [job for job in jobs if is_import_job(job)]
                 selected = [job for job in imports if in_file_window(job_latest_ns(job), since_ns)]
-                targets.append({**dataset, "name": info.get("name") or dataset["name"], "url": dataset_url(dataset["id"]),
+                return {**dataset, "name": info.get("name") or dataset["name"], "url": dataset_url(dataset["id"]),
                     "jobCount": len(jobs), "importCount": len(imports), "readImportCount": len(selected),
                     "skippedBeforeCreation": len(imports) - len(selected),
                     "runningJobs": sum(str(j["status"]) in ("1", "2") for j in selected),
-                    "timeScoped": True, "complete": True, "issues": [], "evidence": {}, "jobs": selected})
+                    "timeScoped": True, "complete": True, "issues": [], "evidence": {}, "jobs": selected}
+
+            targets = list(await asyncio.gather(*(load_target(dataset) for dataset in DATASETS)))
             self.run["totalLogs"] = sum(len(t["jobs"]) for t in targets)
             self.run["skippedBeforeCreation"] = sum(t["skippedBeforeCreation"] for t in targets)
             self.run["scope"] = scope

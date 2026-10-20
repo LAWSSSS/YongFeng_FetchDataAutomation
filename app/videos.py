@@ -28,6 +28,8 @@ from .source import page_records
 from .video_filters import filter_records, record_status
 
 RETRY_DELAYS = (2, 5, 10, 20, 30, 60, 60, 60)
+IDLE_POLL_SECONDS = 30
+ACTIVE_POLL_SECONDS = 8
 TERMINAL = {"withdrawn", "cloud_deleted"}
 
 
@@ -339,9 +341,17 @@ class VideoManager:
                 except Exception:
                     self.check_error = "检查视频时出现异常，请稍后重试。"
             try:
-                await asyncio.wait_for(self.wake.wait(), timeout=30)
+                await asyncio.wait_for(self.wake.wait(), timeout=self._poll_timeout())
             except asyncio.TimeoutError:
                 pass
+
+    def _poll_timeout(self):
+        """Idle checks stay at 30s. An open platform capture is checked again in 8s."""
+        for row in self.store.list():
+            for version in row.get("versions") or []:
+                if version.get("state") == "waiting":
+                    return ACTIVE_POLL_SECONDS
+        return IDLE_POLL_SECONDS
 
     async def refresh_storage(self):
         try:

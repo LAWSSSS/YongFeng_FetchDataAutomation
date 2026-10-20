@@ -7,6 +7,7 @@ import httpx
 from .upload_audit import AuditError, DATASETS, name_key
 
 TARGET_IDS = {d["id"] for d in DATASETS}
+PACKAGE_IDS = {"27892", "27893"}
 
 
 def source_keys(job):
@@ -45,8 +46,8 @@ class UploadRemote:
         raise AuditError("视觉AI会话已失效，请重新连接。", "auth", 401)
 
     async def signature(self, dataset, binding=None):
-        if dataset not in TARGET_IDS:
-            raise ValueError("自动上传只支持固定的两个数据集。")
+        if dataset not in TARGET_IDS and dataset not in PACKAGE_IDS:
+            raise ValueError("自动上传只支持固定的视频或切片照片数据集。")
         params = {"bulk": 1}
         if binding:
             # Ask for the original namespace when renewing. A server that ignores
@@ -90,7 +91,10 @@ class UploadRemote:
         return await self.auth.jobs(dataset)
 
     async def submit(self, dataset, keys):
-        if dataset not in TARGET_IDS or not 1 <= len(keys) <= 4 or len(set(keys)) != len(keys):
+        if dataset in PACKAGE_IDS:
+            if len(keys) != 1 or len(set(keys)) != 1:
+                raise ValueError("切片照片每次只能导入一个压缩包。")
+        elif dataset not in TARGET_IDS or not 1 <= len(keys) <= 4 or len(set(keys)) != len(keys):
             raise ValueError("导入清单无效。")
         data, _ = await self.request("POST", "devel/dataset-jobs/", body={
             "dataset": int(dataset), "type": 1, "namespace": 1,
@@ -153,6 +157,22 @@ class UploadRemote:
 
     async def evidence(self, dataset, job):
         return await self.auth.job_evidence(dataset, job)
+
+    async def images(self, dataset):
+        if dataset not in PACKAGE_IDS:
+            raise ValueError("切片照片清单只读取固定的两个导入数据集。")
+        rows, page = [], 1
+        while page <= 5:
+            data, headers = await self.request("GET", f"devel/datasets/{dataset}/images/",
+                params={"namespace": 1, "page": page, "page_size": 100})
+            if not isinstance(data, list):
+                raise AuditError("切片照片清单格式异常。", "response")
+            rows.extend(row for row in data if isinstance(row, dict))
+            next_page = headers.get("x-next-page")
+            if not next_page or not str(next_page).strip() or str(next_page) in {"0", "-1"}:
+                break
+            page += 1
+        return rows
 
 
 def video_names(row):

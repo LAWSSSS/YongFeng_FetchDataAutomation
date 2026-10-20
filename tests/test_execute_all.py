@@ -273,9 +273,11 @@ async def test_full_backend_workflow_two_targets_unique_tasks_lost_response_and_
     monkeypatch.setattr(manager,'_run_worker',worker)
     receipt=[]
     async def create(source,video,target,intervals,seconds,prefix,request):
-        # Assert both locally and externally active tasks respect target slots.
-        assert not any(task['status']==1 for dataset in remote.job_rows.values() for task in dataset['21']
-                       if str(task['config']['target']['dataset']['id'])==str(target))
+        # Two different videos may be active. The same source video must not be submitted again.
+        active = [task for dataset in remote.job_rows.values() for task in dataset['21'] if task['status'] == 1]
+        assert len(active) < 2
+        claimed = {int(video_id) for task in active for video_id in task['config']['source']['datasets'][0]['videos']['ids']}
+        assert int(video) not in claimed
         remote.created+=1
         task={'id':str(9000+remote.created),'type':21,'status':1,
               'config':{'source':{'datasets':[{'videos':{'ids':[int(video)]}}]},'target':{'dataset':{'id':int(target)}},
@@ -294,6 +296,7 @@ async def test_full_backend_workflow_two_targets_unique_tasks_lost_response_and_
         return [{'id':f'{task["id"]}-{index}','name':prefix+f'_{index}.jpg','taskId':task['id']} for index in range(150)] if task['status']==3 else []
     remote.image_rows=images
     clock=[1000.0];manager.clock=lambda:clock[0]
+    manager.store.settings['localExport'] = False
     await manager.execute_all('end-to-end',0)
     assert await manager._workflow_scan()
     first_run=manager.run['id']

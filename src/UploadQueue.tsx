@@ -121,7 +121,7 @@ export default function UploadQueue({onSessionChange}:{onSessionChange:()=>Promi
     </form>
     {!state?.connected && <p className="upload-warning">请先在上方连接视觉AI平台。已有断点和导入凭证保留。</p>}
     {state?.validationMode ? <p className="upload-policy">单条验收：两个目标各核验成功一个真实视频后，自动开启每目标4个并行上传。</p> :
-      <p className="upload-policy">每目标最多4个并行上传、1个导入，可预上传下一批。每30秒检查进展；卡住时只恢复本条，原视频保留。</p>}
+      <p className="upload-policy">每目标最多4个并行上传、1个导入，可预上传下一批。有上传或导入时每8秒检查进展，空闲时每30秒；卡住时只恢复本条，原视频保留。</p>}
     {state?.scan && <p className="upload-scan" role="status">{state.scan.message}</p>}
     {complete && <p className="upload-completion" role="status">{completedCount} 项目标任务已导入，当前没有等待上传的视频。下方已显示完成记录，可点击“查看平台视频”进入“数据内容”；新增视频后再扫描即可。</p>}
     {error && <p className="error" role="alert">{error}</p>}

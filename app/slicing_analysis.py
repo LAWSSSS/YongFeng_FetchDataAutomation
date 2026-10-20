@@ -3,22 +3,66 @@ import asyncio
 import copy
 from contextlib import ExitStack
 
-from .slicing_core import build_category_result, sample_points
+from .slicing_core import build_category_result, category_image_target, sample_points
+
+
+def category_signature(category):
+    """Identity of a category outcome. Progress text and poll timestamps are excluded."""
+    if not isinstance(category, dict):
+        return ()
+    intervals = category.get("intervals")
+    if isinstance(intervals, list):
+        encoded = tuple((row.get("start"), row.get("end")) if isinstance(row, dict) else (row,) for row in intervals)
+    else:
+        encoded = ()
+    return (
+        category.get("state"), category.get("errorCode") or "",
+        str(category.get("taskId") or ""), str(category.get("operationId") or ""),
+        str(category.get("targetDatasetId") or ""), category.get("intervalSeconds"),
+        str(category.get("modelFingerprint") or ""), encoded,
+    )
+
+
+def outcome_changed(previous, current):
+    if not previous:
+        return True
+    if previous.get("state") != current.get("state"):
+        return True
+    if (previous.get("errorCode") or "") != (current.get("errorCode") or ""):
+        return True
+    if previous.get("path") != current.get("path") or previous.get("fileVersion") != current.get("fileVersion"):
+        return True
+    old, new = previous.get("categories") or {}, current.get("categories") or {}
+    if set(old) != set(new):
+        return True
+    return any(category_signature(old.get(name)) != category_signature(category) for name, category in new.items())
+
+
+def revision_after_outcome(stored, current, changed):
+    if not changed:
+        if stored:
+            current["revision"] = int(stored.get("revision", 0))
+        return
+    base = int(stored.get("revision", 0)) if stored else int(current.get("revision", 0))
+    current["revision"] = base + 1
 
 
 class SharedSlicingAnalysis:
     def _save_analysis_item(self, work):
         peers = work.get('_analysisPeers')
         if not peers:
+            stored = self.store.get('items', work['id']) if work.get('id') else None
+            revision_after_outcome(stored, work, outcome_changed(stored, work))
             self.store.save('items', work)
             return
         for category, identity in peers.items():
             item = self.store.get('items', identity)
+            before = copy.deepcopy(item)
             for field in ('metadata', 'progress', 'analysisStage', 'analysisTotal', 'analysisDone', 'analysisPosition'):
                 if field in work:
                     item[field] = work[field]
             item['categories'][category] = copy.deepcopy(work['categories'][category])
-            item['revision'] = int(item.get('revision', 0)) + 1
+            revision_after_outcome(before, item, outcome_changed(before, item))
             self.store.save('items', item)
 
     async def _process_shared(self, first, candidates):
@@ -69,7 +113,7 @@ class SharedSlicingAnalysis:
                     observations = self._category_observations(work, name, points, keys[name], fingerprints[name])
                     category = work['categories'][name]
                     result = build_category_result(observations, interval=interval, duration=metadata['duration'],
-                        positive_labels={'target'}, target=self.store.settings['targetImages'])
+                        positive_labels={'target'}, target=category_image_target(self.store.settings, name))
                     category.update(intervals=result['intervals'], intervalSeconds=result['intervalSeconds'],
                         estimatedImages=result['estimatedImages'], observations=len(observations),
                         samplingIntervalSeconds=interval, modelFingerprint=fingerprints[name],

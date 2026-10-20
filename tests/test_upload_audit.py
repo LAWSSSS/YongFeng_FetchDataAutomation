@@ -131,6 +131,51 @@ class Platform:
 
 
 @pytest.mark.asyncio
+async def test_both_dataset_job_lists_start_before_either_finishes(tmp_path):
+    current = 0
+    peak = 0
+
+    async def handle(request):
+        nonlocal current, peak
+        path = request.url.path
+        overlapped = "/datasets/" in path or path.endswith("/dataset-jobs/")
+        if overlapped:
+            current += 1
+            peak = max(peak, current)
+            await asyncio.sleep(0.05)
+        try:
+            if path.startswith("/api/devel/datasets/"):
+                return Platform.answer({"id": int(path.split("/")[-2]), "name": "dataset"})
+            if path.endswith("/dataset-jobs/"):
+                dataset = int(request.url.params["dataset"])
+                return Platform.answer([{"id": dataset, "type": 1, "status": 3, "dataset": dataset}],
+                                        {"x-total": "1", "x-next-page": ""})
+            if path.endswith("/logs/"):
+                return Platform.answer({"result": [{"values": [[str(time.time_ns()), "视频无后缀名称:one"]]}],
+                                         "has_more": False})
+            raise AssertionError(path)
+        finally:
+            if overlapped:
+                current -= 1
+
+    store = JobStore(tmp_path / "parallel.sqlite3")
+    client = AthenaClient(httpx.MockTransport(handle))
+    client.access = "test-access"
+    manager = UploadAuditManager(store, client)
+    folder = tmp_path / "videos"
+    folder.mkdir()
+    (folder / "one.mp4").write_bytes(b"video")
+    try:
+        manager.start(str(folder))
+        await manager.task
+        assert manager.state()["run"]["status"] == "complete"
+        assert peak >= 2
+    finally:
+        await manager.shutdown()
+        store.close()
+
+
+@pytest.mark.asyncio
 async def test_backend_reads_all_task_and_log_pages_and_reports_separately(tmp_path):
     platform = Platform()
     client = AthenaClient(httpx.MockTransport(platform.handle))
