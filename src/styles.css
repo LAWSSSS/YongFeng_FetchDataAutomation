@@ -28,3 +28,5 @@ button:focus-visible,summary:focus-visible,select:focus-visible{outline:2px soli
   .site-header nav {display:grid;grid-template-columns:repeat(2,minmax(0,1fr));overflow:visible;width:100%}
   .site-header nav button {font-size:13px;min-height:40px;padding:8px 4px}
 }
+.job-list>div{flex-wrap:wrap}
+.job-list>div .table-scroll{flex:1 0 100%;margin-top:8px}

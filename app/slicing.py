@@ -11,6 +11,7 @@ import shutil
 import signal
 import stat
 import subprocess
+import tempfile
 import sys
 import time
 import unicodedata
@@ -21,8 +22,9 @@ from uuid import uuid4
 from .slicing_workflow import SlicingWorkflow
 from .audit_moves import source_fingerprint
 from .slicing_analysis import SharedSlicingAnalysis, outcome_changed, revision_after_outcome
-from .slice_export import (package_identity, photo_names, read_jpeg, slice_timestamps, write_image_archive,
-                           PACKAGE_DATASETS)
+from .slice_export import (PACKAGE_DATASETS, interior_timestamps, magnet_refine_windows, package_directory,
+                           package_identity, photo_names, read_jpeg, select_recognized_frames, slice_timestamps,
+                           write_image_archive)
 from .slice_packages import SlicePackageManager
 from .upload_remote import UploadRemote
 from .domain import now_iso
@@ -302,6 +304,17 @@ async def target_dataset_verified(remote, identity, row, descriptor):
         raise
 
 
+_LOCAL_WORK_STATES = {"complete", "waiting", "submitting", "queued", "uploading", "uploaded", "importing", "review", "ready"}
+
+
+def _category_has_local_work(category):
+    if not isinstance(category, dict):
+        return False
+    if category.get("taskId") or category.get("packageId") or category.get("intervals") or category.get("modelFingerprint"):
+        return True
+    return category.get("state") in _LOCAL_WORK_STATES
+
+
 def applicable_category(source_dataset_id):
     descriptor = SOURCE.get(str(source_dataset_id))
     if not descriptor:
@@ -373,7 +386,7 @@ class SlicingStore:
                 "targetDatasetIds": {"27912": None, "27944": None}, "enabled": False,
                 "latestRunId": "", "settingsRequestIds": {}, "autoArchive": True,
                 "archiveCompletedDirectory": "切片完成", "archiveEmptyDirectory": "未检出目标",
-                "reviewBeforeUpload": True, "localExport": True}
+                "reviewBeforeUpload": False, "localExport": True, "sliceOutputDirectory": ""}
 
     def save_settings(self):
         self.db.execute("INSERT INTO simple_slicing_settings VALUES(1,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload",
@@ -523,6 +536,8 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
                 raise ValueError("图片目标数据集编号必须是数字。")
         updates["targetDatasetIds"] = {"27912": str(target_ids.get("27912") or "") or None,
                                         "27944": str(target_ids.get("27944") or "") or None}
+        output = (updates.get("sliceOutputDirectory") or "").strip()
+        updates["sliceOutputDirectory"] = str(self._checked_output_directory(output)) if output else ""
         self.store.settings.update(updates)
         self.store.settings["revision"] += 1
         request[data["requestId"]] = self.store.settings["revision"]
@@ -682,12 +697,18 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
                         prior = self.store.get("items", prior["id"])
                         active_category = applicable_category(source_id)
                         for category_name, category in prior.get("categories", {}).items():
-                            if category_name != active_category and not category.get("taskId") and category.get("state") not in {"complete", "waiting", "submitting"}:
+                            if category_name != active_category and not _category_has_local_work(category):
                                 category.update(state="not_applicable", errorCode="", message="此视频集不使用该类别模型。")
                             elif category_name == active_category and category.get("errorCode") == "frame_extract_failed":
-                                category.update(state="pending", errorCode="", message="抽帧修复后重新识别。")
+                                if category.get("intervals"):
+                                    category.update(state="ready", errorCode="", message="识别结果保留，重新导出照片并上传。")
+                                else:
+                                    category.update(state="pending", errorCode="", message="抽帧修复后重新识别。")
                         if prior.get("errorCode") == "frame_extract_failed" and prior.get("state") == "attention":
-                            prior.update(state="pending", errorCode="", message="抽帧修复后重新识别。")
+                            if any((prior.get("categories") or {}).get(name, {}).get("intervals") for name in ("bed", "magnet")):
+                                prior.update(state="platform_processing", errorCode="", message="识别结果保留，正在重新导出并上传。")
+                            else:
+                                prior.update(state="pending", errorCode="", message="抽帧修复后重新识别。")
                         if source_id in unresolved_log_datasets and prior.get("state") not in {"complete", "no_target"}:
                             prior.update(state="attention", errorCode="task_log_unavailable",
                                          message="平台有切片任务日志无法读取，不能排除重复提交；核对平台任务后再处理。")
@@ -700,7 +721,7 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
                             for category_name, category in prior.get("categories", {}).items():
                                 if category_name == active_category and category.get("errorCode") == "task_log_unavailable":
                                     category.update(state="pending", errorCode="", message="任务日志核对恢复；等待重新识别。")
-                                elif category_name != active_category and not category.get("taskId"):
+                                elif category_name != active_category and not _category_has_local_work(category):
                                     category.update(state="not_applicable", errorCode="", message="此视频集不使用该类别模型。")
                             if prior.get("path"):
                                 prior.update(state="pending", errorCode="", message="任务日志核对恢复；重新识别本条视频。")
@@ -1465,8 +1486,7 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
                 active_category = ""
             if active_category:
                 for category_name, category in item.get("categories", {}).items():
-                    if (category_name != active_category and not category.get("taskId")
-                            and category.get("state") not in {"complete", "waiting", "submitting"}):
+                    if category_name != active_category and not _category_has_local_work(category):
                         category.update(state="not_applicable", errorCode="", message="此视频集不使用该类别模型。")
             errors = {item.get("errorCode", "")} | {
                 category.get("errorCode", "") for category in item.get("categories", {}).values()
@@ -1493,9 +1513,15 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
             elif not moved:
                 continue
             for category_name, category in item.get("categories", {}).items():
-                if category_name == active_category and category.get("state") == "attention" and category.get("errorCode") in _RETRYABLE_LOCAL_ERRORS:
+                if category.get("state") != "attention" or category.get("errorCode") not in _RETRYABLE_LOCAL_ERRORS:
+                    continue
+                if category.get("intervals") and not category.get("packageId"):
+                    category.update(state="ready", errorCode="", message="识别结果保留，重新导出照片并上传。")
+                elif category_name == active_category:
                     category.update(state="pending", errorCode="", message="原视频已重新定位，将恢复抽帧识别。")
-            if item.get("errorCode") in _RETRYABLE_LOCAL_ERRORS:
+            if any(category.get("state") == "ready" for category in item.get("categories", {}).values()):
+                item.update(state="platform_processing", errorCode="", message="识别结果保留，正在重新导出并上传。")
+            elif item.get("errorCode") in _RETRYABLE_LOCAL_ERRORS:
                 item.update(state="pending", errorCode="", message="原视频已重新定位，可继续抽帧识别。")
             elif item.get("state") == "attention" and not any(
                     value.get("state") == "attention" for value in item.get("categories", {}).values()):
@@ -1892,6 +1918,100 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
                 extra.add(task_id or f"local:{stored.get('id')}")
         return len(active_ids) + len(extra)
 
+    def _checked_output_directory(self, value):
+        path = safe_path(value)
+        protected = (Path.home() / "Desktop" / "视频抽帧").resolve()
+        if path.resolve().is_relative_to(protected):
+            raise ValueError("桌面的“视频抽帧”源目录受保护，不能保存抽帧照片。")
+        return path
+
+    def slice_output_root(self):
+        configured = (self.store.settings.get("sliceOutputDirectory") or "").strip()
+        if not configured:
+            return self.data_dir / "slices"
+        return self._checked_output_directory(configured)
+
+    def _magnet_label(self, blob, labeler=None):
+        checker = labeler or getattr(self, "magnet_classifier", None)
+        if checker is None:
+            raise RuntimeError("magnet_model_missing")
+        label = checker(blob)
+        return label if label == "target" else "other"
+
+    def _open_magnet_labeler(self):
+        checker = getattr(self, "magnet_classifier", None)
+        if checker is not None:
+            return checker
+        python = str(Path(self.store.settings["workerPythonPath"]).expanduser())
+        if not Path(python).is_file():
+            raise RuntimeError("magnet_model_missing")
+        settings = {key: self.store.settings.get(key) for key in (
+            "magnetDeployDirectory", "magnetModelPath", "magnetConfidence")}
+        process = subprocess.Popen([python, "-B", "-m", "app.magnet_export"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, cwd=str(ROOT), text=True)
+        process.stdin.write(json.dumps({"settings": settings}) + "\n")
+        process.stdin.flush()
+        payload = json.loads(process.stdout.readline() or "{}")
+        if not payload.get("ready"):
+            process.kill()
+            raise RuntimeError(payload.get("code") or "magnet_model_missing")
+
+        def label(blob):
+            with tempfile.TemporaryDirectory() as folder:
+                path = Path(folder) / "frame.jpg"
+                path.write_bytes(blob)
+                process.stdin.write(json.dumps({"paths": [str(path)]}) + "\n")
+                process.stdin.flush()
+                labels = json.loads(process.stdout.readline() or "[]")
+            if not labels:
+                raise RuntimeError("inference_failed")
+            return labels[0]
+
+        def close():
+            try:
+                process.stdin.write(json.dumps({"stop": True}) + "\n")
+                process.stdin.flush()
+                process.wait(timeout=30)
+            except Exception:
+                process.kill()
+        label.close = close
+        return label
+
+    async def _recognized_magnet_frames(self, item, points):
+        labeler = await asyncio.to_thread(self._open_magnet_labeler)
+        try:
+            samples = []
+            frames = {}
+
+            async def consider(stamp):
+                blob = await asyncio.to_thread(self.slice_reader, item["path"], self.store.settings["frameToolPath"], stamp)
+                label = await asyncio.to_thread(self._magnet_label, blob, labeler)
+                samples.append((stamp, label))
+                if label == "target":
+                    frames[round(float(stamp), 3)] = blob
+
+            for stamp in points:
+                await consider(stamp)
+            target = category_image_target(self.store.settings, "magnet")
+            gap = max((points[index + 1] - points[index] for index in range(len(points) - 1)), default=30)
+            for step in (5, 2, 1):
+                if len(select_recognized_frames(samples, target=target, maximum=200)) >= 100:
+                    break
+                if step >= gap:
+                    continue
+                for start, end in magnet_refine_windows(samples, gap):
+                    for stamp in interior_timestamps(start, end, step):
+                        if any(abs(stamp - seen) < 1e-6 for seen, _ in samples):
+                            continue
+                        await consider(stamp)
+                gap = step
+            chosen = select_recognized_frames(samples, target=target, maximum=200)
+            return [(stamp, frames[stamp]) for stamp in chosen if stamp in frames]
+        finally:
+            closer = getattr(labeler, "close", None)
+            if closer:
+                await asyncio.to_thread(closer)
+
     async def _export_ready(self, item):
         names = [name for name, category in (item.get("categories") or {}).items()
                  if isinstance(category, dict) and category.get("state") in {"ready", "waiting_slot"}
@@ -1921,20 +2041,35 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
             return
         try:
             points = slice_timestamps(intervals, seconds)
-            names = photo_names(item.get("name"), len(points))
-            frames = []
-            for stamp in points:
-                frames.append(await asyncio.to_thread(
-                    self.slice_reader, item["path"], self.store.settings["frameToolPath"], stamp))
-            folder = self.data_dir / "slices" / category_name / str(item["sourceVideoId"])
+            if category_name == "magnet":
+                recognized = await self._recognized_magnet_frames(item, points)
+                if not recognized:
+                    category.update(state="no_target", message="未检出磁盘吊，没有可保存的照片。")
+                    self._save_category_progress(item)
+                    return
+                names = photo_names(item.get("name"), len(recognized))
+                frames = [blob for _, blob in recognized]
+            else:
+                names = photo_names(item.get("name"), len(points))
+                frames = []
+                for stamp in points:
+                    frames.append(await asyncio.to_thread(
+                        self.slice_reader, item["path"], self.store.settings["frameToolPath"], stamp))
+            configured = (self.store.settings.get("sliceOutputDirectory") or "").strip()
+            if configured:
+                folder = self.slice_output_root() / category_name / str(item["sourceVideoId"])
+            else:
+                self._checked_output_directory(Path(item["path"]).parent)
+                folder = package_directory(item["path"], category_name)
             image_dir = folder / "image"
             image_dir.mkdir(parents=True, exist_ok=True)
             for name, blob in zip(names, frames):
                 (image_dir / name).write_bytes(blob)
             archive = folder / f"{Path(names[0]).stem.rsplit('_', 1)[0]}.zip"
             write_image_archive(archive, names, frames)
-        except (OSError, RuntimeError, ValueError):
-            category.update(state="attention", errorCode="frame_extract_failed", message=ERROR_TEXT["frame_extract_failed"])
+        except (OSError, RuntimeError, ValueError) as error:
+            code = str(error) if str(error) in ERROR_TEXT else "frame_extract_failed"
+            category.update(state="attention", errorCode=code, message=ERROR_TEXT.get(code, ERROR_TEXT["frame_extract_failed"]))
             self._save_category_progress(item)
             return
         # Bed exports are already accepted and can upload immediately. Magnet stays for review.
@@ -1942,7 +2077,8 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
         record = {"id": package_identity(item["sourceDatasetId"], item["sourceVideoId"], category_name),
                   "dataset": PACKAGE_DATASETS[category_name], "category": category_name,
                   "sourceDatasetId": str(item["sourceDatasetId"]), "sourceVideoId": str(item["sourceVideoId"]),
-                  "itemId": item["id"], "name": archive.name, "path": str(archive), "imageDir": str(image_dir),
+                  "itemId": item["id"], "videoPath": item.get("path", ""), "name": archive.name,
+                  "path": str(archive), "imageDir": str(image_dir),
                   "images": names, "size": archive.stat().st_size, "fileVersion": source_fingerprint(archive),
                   "imageCount": len(names), "bytes": 0, "retries": 0,
                   "state": "review" if review else "queued",

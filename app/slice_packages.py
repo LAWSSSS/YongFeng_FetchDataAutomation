@@ -1,11 +1,13 @@
 """Upload one slice archive per category, then import one package at a time."""
 import asyncio
 import json
+import os
+import shutil
 from pathlib import Path
 
 from .audit_moves import source_fingerprint
 from .domain import now_iso
-from .slice_export import PACKAGE_DATASETS
+from .slice_export import PACKAGE_DATASETS, package_directory
 from .upload_audit import AuditError, name_key
 from .upload_remote import source_keys
 from .uploads import CHECK_SECONDS, ProcessWorker, RETRY_DELAYS, STALL_SECONDS, safe_message
@@ -14,6 +16,28 @@ PACKAGE_TARGETS = (
     {"id": "27892", "category": "bed", "name": "车斗切片照片"},
     {"id": "27893", "category": "magnet", "name": "磁盘吊切片照片"},
 )
+
+
+def _place_file(source, destination):
+    """Move a file onto another volume without copying macOS-only flags."""
+    if not source.is_file():
+        return destination.is_file()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        if destination.stat().st_size == source.stat().st_size:
+            source.unlink()
+            return True
+        return False
+    try:
+        os.replace(source, destination)
+    except OSError:
+        with source.open("rb") as incoming, destination.open("wb") as outgoing:
+            shutil.copyfileobj(incoming, outgoing, 1024 * 1024)
+        if destination.stat().st_size != source.stat().st_size:
+            destination.unlink(missing_ok=True)
+            raise OSError("copy_incomplete")
+        source.unlink()
+    return True
 
 
 class SlicePackageStore:
@@ -57,6 +81,57 @@ class SlicePackageManager:
         self.stopping = False
         self.loop_task = None
         self.grants = {}
+        for item in self.store.list("items"):
+            try:
+                changed = self._move_beside_video(item) or self._requeue_failed_upload(item)
+            except OSError:
+                continue
+            if changed:
+                self.store.save("items", item)
+
+    def _move_beside_video(self, item):
+        video = item.get("videoPath") or ""
+        if not video or not item.get("path") or item.get("uploadId"):
+            return False
+        dest = package_directory(video, item.get("category") or "bed")
+        archive = Path(item["path"])
+        if archive.parent == dest:
+            return False
+        protected = (Path.home() / "Desktop" / "视频抽帧").resolve()
+        if dest.resolve().is_relative_to(protected) or archive.resolve().is_relative_to(protected):
+            return False
+        dest.mkdir(parents=True, exist_ok=True)
+        moved = False
+        target = dest / archive.name
+        if _place_file(archive, target):
+            moved = True
+        images = Path(item["imageDir"]) if item.get("imageDir") else None
+        image_dest = dest / "image"
+        if images and images.is_dir() and images.resolve() != image_dest.resolve():
+            image_dest.mkdir(parents=True, exist_ok=True)
+            for child in list(images.iterdir()):
+                if _place_file(child, image_dest / child.name):
+                    moved = True
+        if target.is_file():
+            item["path"] = str(target)
+            item["fileVersion"] = source_fingerprint(target)
+            moved = True
+        if image_dest.is_dir():
+            item["imageDir"] = str(image_dest)
+        return moved
+
+    def _requeue_failed_upload(self, item):
+        key = (item.get("object") or {}).get("key") or ""
+        if item.get("uploadId") or item.get("state") not in {"attention", "queued"}:
+            return False
+        if "/simple-" + str(item.get("id")) + "/" in "/" + key:
+            return False
+        item.pop("object", None)
+        item.pop("createAttempted", None)
+        if item.get("state") == "attention" and item.get("errorCode") == "upload_failed":
+            item.update(retries=0, state="queued", errorCode="", nextAttempt=0,
+                        message="正在排队上传切片压缩包。")
+        return True
 
     def state(self):
         items = self.store.list("items")
@@ -176,8 +251,9 @@ class SlicePackageManager:
                 raise ValueError("file_changed")
             credentials = await self.remote.signature(item["dataset"])
             prefix = credentials.get("prefix")
-            if not item.get("object"):
-                key = (prefix or "") + "slice-" + identity + "/" + item["name"]
+            key = (prefix or "") + "simple-" + identity + "/" + item["name"]
+            current = (item.get("object") or {}).get("key") or ""
+            if not item.get("uploadId") and ("/simple-" + identity + "/") not in ("/" + current):
                 item["object"] = {"key": key, "bucket": credentials["bucket"], "endpoint": credentials["endpoint"]}
             item.update(state="uploading", message="正在上传切片压缩包。")
             self.store.save("items", item)
@@ -271,6 +347,54 @@ class SlicePackageManager:
         named = [row for row in images if stem and stem in name_key(str(row.get("name", row.get("fileName", ""))))]
         if str(job.get("status")) == "3" and (proofs or named) and not evidence.get("reason"):
             item.update(state="complete", message="切片压缩包已导入并核对。", errorCode="")
-        else:
-            item.update(state="attention", errorCode="verification", message="导入结束，但没有核对到这个压缩包。")
+            self.store.save("items", item)
+            self.delete_if_both_complete(item)
+            return
+        item.update(state="attention", errorCode="verification", message="导入结束，但没有核对到这个压缩包。")
         self.store.save("items", item)
+
+    def delete_if_both_complete(self, item):
+        video_id = str(item.get("sourceVideoId") or "")
+        video_path = item.get("videoPath") or ""
+        related = [row for row in self.store.list("items")
+                   if str(row.get("sourceVideoId") or "") == video_id and (row.get("videoPath") or "") == video_path]
+        states = {row.get("category"): row.get("state") for row in related}
+        if states.get("bed") != "complete" or states.get("magnet") != "complete":
+            return
+        removed = []
+        try:
+            protected = (Path.home() / "Desktop" / "视频抽帧").resolve()
+            for row in related:
+                for raw in (row.get("path"), row.get("imageDir")):
+                    if not raw:
+                        continue
+                    path = Path(raw)
+                    if path.resolve().is_relative_to(protected):
+                        raise ValueError("protected")
+                    if not path.exists():
+                        continue
+                    if path.is_file():
+                        path.unlink()
+                        removed.append(str(path))
+                    elif path.is_dir():
+                        for child in path.glob("*.jpg"):
+                            child.unlink()
+                        if not any(path.iterdir()):
+                            path.rmdir()
+                        removed.append(str(path))
+            source = Path(video_path) if video_path else None
+            if source and source.is_file():
+                if source.resolve().is_relative_to(protected):
+                    raise ValueError("protected")
+                source.unlink()
+                removed.append(str(source))
+        except (OSError, ValueError) as error:
+            for row in related:
+                row.update(cleanupState="attention", cleanupMessage="照片或原片尚未删除，请核对后重试。",
+                           cleanupError=type(error).__name__)
+                self.store.save("items", row)
+            return
+        for row in related:
+            row.update(cleanupState="complete", cleanupMessage="车斗和磁盘吊都已导入，照片和原片已删除。",
+                       deletedPaths=removed)
+            self.store.save("items", row)

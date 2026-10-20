@@ -102,6 +102,36 @@ def test_new_bed_videos_aim_at_180_frames_and_magnet_stays_at_150():
     assert category_image_target({"targetImages": 150}, "magnet") == 150
 
 
+def test_magnet_image_keeps_only_recognized_frames_and_marks_refine_gaps():
+    from app.slice_export import magnet_refine_windows, select_recognized_frames
+    samples = [(0, "clear"), (30, "target"), (60, "clear"), (120, "target"), (150, "target")]
+    assert select_recognized_frames(samples, target=150, maximum=200) == [30, 120, 150]
+    windows = magnet_refine_windows(samples, 30)
+    assert (0, 30) in windows and (30, 60) in windows
+    assert (60, 120) in windows
+
+
+def test_photos_and_video_stay_until_both_categories_are_imported(tmp_path):
+    from app.main import create_app
+    app = create_app(data_dir=tmp_path / "data")
+    packages = app.state.slicing.packages
+    video = tmp_path / "source.mp4"
+    video.write_bytes(b"video")
+    photo = tmp_path / "image"
+    photo.mkdir()
+    (photo / "a.jpg").write_bytes(b"\xff\xd8\xff\xd9")
+    archive = tmp_path / "pack.zip"
+    archive.write_bytes(b"zip")
+    common = {"sourceVideoId": "9", "videoPath": str(video), "imageDir": str(photo), "path": str(archive)}
+    packages.store.save("items", {**common, "id": "bed", "category": "bed", "state": "complete", "name": "a.zip"})
+    packages.store.save("items", {**common, "id": "magnet", "category": "magnet", "state": "importing", "name": "b.zip"})
+    packages.delete_if_both_complete(packages.store.get("items", "bed"))
+    assert video.exists() and (photo / "a.jpg").exists()
+    packages.store.save("items", {**packages.store.get("items", "magnet"), "state": "complete"})
+    packages.delete_if_both_complete(packages.store.get("items", "magnet"))
+    assert not video.exists() and not archive.exists() and not (photo / "a.jpg").exists()
+
+
 def test_timestamps_follow_the_inclusive_interval_grid():
     assert slice_timestamps([{"start": 0, "end": 10}], 5) == [0, 5, 10]
     assert photo_names("鲁A12345_20261005050441_abc.mp4", 2) == [
@@ -112,6 +142,7 @@ def test_timestamps_follow_the_inclusive_interval_grid():
 async def test_review_keeps_the_archive_local_until_confirmed(manager):
     app, slicing = manager
     slicing.store.settings["reviewBeforeUpload"] = True
+    slicing.magnet_classifier = lambda _blob: "target"
     item = ready_item(Path(slicing.data_dir))
     item["sourceDatasetId"] = "27944"
     item["categories"] = {"magnet": {"state": "ready", "intervals": [{"start": 0, "end": 2}], "intervalSeconds": 1},
@@ -154,6 +185,9 @@ async def test_disabled_review_enqueues_immediately_and_imports_one_at_a_time(ma
         slicing.store.save("items", item)
         await slicing._export_ready(slicing.store.get("items", item["id"]))
     assert {row["state"] for row in slicing.packages.store.list("items")} == {"queued"}
+    for row in slicing.packages.store.list("items"):
+        video = Path(row["videoPath"])
+        assert Path(row["path"]).parent == video.parent / video.stem / "车斗"
     await slicing.packages.tick()
     if slicing.packages.running:
         await __import__("asyncio").gather(*slicing.packages.running.values())
@@ -162,6 +196,7 @@ async def test_disabled_review_enqueues_immediately_and_imports_one_at_a_time(ma
         await __import__("asyncio").gather(*slicing.packages.running.values())
     await slicing.packages.tick()
     assert len(slicing.packages.remote.submitted) == 1
+    assert "/simple-" in slicing.packages.remote.submitted[0][1]
     waiting = [row for row in slicing.packages.store.list("items") if row["state"] == "uploaded"]
     importing = [row for row in slicing.packages.store.list("items") if row["state"] == "importing"]
     assert len(importing) == 1 and len(waiting) == 1

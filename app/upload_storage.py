@@ -53,7 +53,8 @@ class BoundStorage:
 
     def management(self):
         identity, name = self.item["id"], self.item["name"]
-        if (not re.fullmatch(r"[a-f0-9]{32}", identity) or self.item.get("dataset") not in ("27912", "27944")
+        if (not re.fullmatch(r"[a-f0-9]{24,64}", identity)
+                or self.item.get("dataset") not in {"27912", "27944", "27892", "27893"}
                 or not self.key.endswith("/simple-" + identity + "/" + name)):
             raise StorageBindingError()
         if self.recovery is None:
