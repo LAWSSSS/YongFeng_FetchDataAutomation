@@ -175,8 +175,9 @@ export default function Slicing({onConnect}: {onConnect: () => void}) {
   }
   function set<K extends keyof Settings>(key: K, value: Settings[K]) {dirty.current=true;setSettings(current => ({...current,[key]:value}));setSettingsDirty(true);}
   const groups = useMemo(() => physicalFiles(state.items), [state.items]);
+  const groupState = (group:typeof groups[number]) => state.archive?.items.some(file=>file.path === group.records[0].path && file.archiveState === 'attention') ? 'attention' : physicalState(group.records);
   const filtered = groups.filter(group => {
-    if (source === 'all' && filter !== 'all' && physicalState(group.records) !== filter) return false;
+    if (source === 'all' && filter !== 'all' && groupState(group) !== filter) return false;
     return slicePage(group.records,{status:source === 'all' ? 'all' : filter,source,search,page:1,pageSize:group.records.length}).total > 0;
   });
   const pages = Math.max(1,Math.ceil(filtered.length/12));
@@ -219,7 +220,7 @@ export default function Slicing({onConnect}: {onConnect: () => void}) {
         <button className="link" disabled={!!busy} onClick={() => void run('refresh', () => request<State>(''),'状态已更新。')}>刷新</button>
       </div>
       <p className="slice-flow">扫描去重 → 共用抽帧 → 自动切片 → 核验归档。关闭网页后继续处理。</p>
-      <div className="slice-overall"><span>{groups.length} 个视频</span><span>完成 {groups.filter(group=>group.records.every(item=>['complete','no_target'].includes(item.state))).length}</span><span>需处理 {groups.filter(group=>group.records.some(item=>item.state === 'attention')).length}</span><span>已归档 {state.archive?.counts.complete || 0}</span></div>
+      <div className="slice-overall"><span>{groups.length} 个视频</span><span>完成 {groups.filter(group=>group.records.every(item=>['complete','no_target'].includes(item.state))).length}</span><span>需处理 {groups.filter(group=>groupState(group) === 'attention').length}</span><span>已归档 {state.archive?.counts.complete || 0}</span></div>
       {settingsDirty && <p className="notice">设置有未保存修改，请先保存，或重新载入已保存的设置。</p>}
       {settingsStale && <p className="notice">模型或目录设置已变化，请重新扫描，再选择待处理视频。已有结果会保留。</p>}
       {state.run && <div className={`slice-run-status ${state.run.state === 'attention' ? 'attention' : ''}`} role="status"><strong>{statusTitle}</strong><span>{statusMessage}</span>{!state.enabled && state.run.singleMode && !controls.canResume && state.run.state === 'attention' && <span>可重试该条，也可以选择下方其他待处理视频。</span>}</div>}
@@ -276,7 +277,7 @@ export default function Slicing({onConnect}: {onConnect: () => void}) {
         const first = group.records[0];
         const heading = sliceTitle(first.name);
         const archive = state.archive?.items.find(file=>file.path === first.path);
-        const overall = physicalState(group.records);
+        const overall = groupState(group);
         return <article className="slice-video-card" key={group.key}>
           <div className="slice-video-head"><div><h3 title={first.name}>{heading.title}{heading.restored && <small className="slice-restored">恢复版</small>}</h3>{heading.when && <p className="slice-record-time">{heading.when}</p>}<span className="slice-video-source">{formatDuration(first.metadata?.duration || first.remote?.duration)}</span></div><span className={`slice-state ${overall}`}>{labels[overall] || overall}</span></div>
           <div className="slice-categories">{group.records.map(item => {

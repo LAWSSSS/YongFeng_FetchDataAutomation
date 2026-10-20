@@ -1577,8 +1577,8 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
                             else self.process_with_recovery(item))
                         self.analysis_task.add_done_callback(lambda _task: self.wake.set())
                         break
-            if self.files and workflow.get("enabled") and not single_item_id:
-                self.files.schedule(self.wake.set)
+            if self.files and (workflow.get("enabled") or single_item_id):
+                self.files.schedule(self.wake.set, item_id=single_item_id)
             items = self.store.list("items")
             if single_item_id:
                 items = [item for item in items if item.get("id") == single_item_id]
@@ -1604,8 +1604,9 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
                     else:
                         self.run.update(state="complete" if not unresolved else "attention",
                             message=f"自动队列已结束：{sum(item.get('state') == 'complete' for item in items)} 项类别完成，{len(unresolved)} 项需处理。")
-                    archive_pending = self.files and workflow.get("enabled") and any(
-                        row.get("archiveState") == "waiting" for row in self.files.rows("files"))
+                    archive_pending = self.files and (workflow.get("enabled") or single_item_id) and any(
+                        row.get("archiveState") == "waiting" and (not single_item_id or single_item_id in row.get("links", {}).get("slicing", []))
+                        for row in self.files.rows("files"))
                     if archive_pending:
                         self.run.update(state="running", message="等待文件释放或磁盘恢复后归档。")
                     else:

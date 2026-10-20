@@ -482,3 +482,58 @@ async def test_isolated_database_never_reads_or_saves_machine_connections(tmp_pa
     async with app.router.lifespan_context(app):
         assert not app.state.upload_audit.client.connected
         assert not app.state.slicing.store.settings['enabled']
+
+
+@pytest.mark.asyncio
+async def test_archive_scheduler_has_no_idle_wakeup_or_busy_file_spin(environment,tmp_path):
+    app,manager=environment
+    pair(manager,tmp_path)
+    files=app.state.files;wakeups=[]
+    files.schedule(lambda:wakeups.append(True))
+    assert files.task is None and not wakeups
+    for item in manager.store.list('items'):
+        name='bed' if item['sourceDatasetId']=='27912' else 'magnet'
+        item['categories'][name].update(state='complete',actualImages=150);item['state']='complete'
+        manager.store.save('items',item)
+    with manager.leases.read(str(tmp_path/'bed.mp4')):
+        files.schedule(lambda:wakeups.append(True))
+        first=files.task;await first;await asyncio.sleep(0)
+        assert len(wakeups)==1
+        files.schedule(lambda:wakeups.append(True))
+        assert files.task is first
+    await close_app(app)
+
+
+@pytest.mark.asyncio
+async def test_single_archive_never_moves_unrelated_files(environment,tmp_path):
+    app,manager=environment
+    first_dir=tmp_path/'one';second_dir=tmp_path/'two';first_dir.mkdir();second_dir.mkdir()
+    pair(manager,first_dir,('complete','complete'))
+    initial=manager.store.list('items')
+    for item in initial:
+        item['id']='first-'+item['id'];manager.store.save('items',item)
+    # Replace the two fixture IDs with a second independently completed file.
+    pair(manager,second_dir,('complete','complete'))
+    files=app.state.files
+    files.schedule(lambda:None,item_id='first-bed')
+    await files.task
+    assert (tmp_path/'切片完成'/'one'/'bed.mp4').exists()
+    assert (second_dir/'bed.mp4').exists()
+    assert not (tmp_path/'切片完成'/'two').exists()
+    await close_app(app)
+
+
+@pytest.mark.asyncio
+async def test_rate_limited_archive_keeps_single_run_enabled_until_move_can_start(environment,tmp_path):
+    app,manager=environment
+    pair(manager,tmp_path,('complete','complete'))
+    manager.run={'id':'single','state':'running','singleMode':True,'singleItemId':'bed','settingsRevision':0}
+    manager.store.settings['enabled']=True
+    manager.store.settings['latestRunId']='single'
+    manager.store.save('runs',manager.run)
+    app.state.files.next_check=manager.clock()+30
+    await manager._tick()
+    assert app.state.files.task is None
+    assert manager.store.settings['enabled']
+    assert app.state.files.state()['counts']['waiting']==1
+    await close_app(app)

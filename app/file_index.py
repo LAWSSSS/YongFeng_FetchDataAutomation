@@ -20,6 +20,7 @@ class FileIndex:
         self.moves, self.leases = moves, leases
         self.lock = asyncio.Lock()
         self.task = None
+        self.next_check = 0
         for table in ('files', 'file_moves'):
             self.db.execute(f'CREATE TABLE IF NOT EXISTS simple_{table} (id TEXT PRIMARY KEY, payload TEXT NOT NULL)')
         self.db.commit()
@@ -119,18 +120,25 @@ class FileIndex:
     def busy(self):
         return bool(self.task and not self.task.done())
 
-    def schedule(self, wake):
-        if self.busy or not self.slicing.store.settings.get('autoArchive', True):
+    def schedule(self, wake, item_id=None):
+        if not self.slicing.store.settings.get('autoArchive', True):
             return
+        candidates = []
         for row in self.refresh():
+            if item_id and item_id not in row.get('links', {}).get('slicing', []):
+                continue
             kind = self.eligible(row)
             if kind and row.get('archiveState') != 'attention' and (row.get('archiveState') != 'complete' or row.get('archiveKind', kind) != kind):
                 row['archiveState'] = 'waiting'
                 self.save('files', row)
-        self.task = asyncio.create_task(self.tick())
+                candidates.append(row['id'])
+        if not candidates or self.busy or self.slicing.clock() < self.next_check:
+            return
+        # A deferred move must not wake a tight loop that floods cloud polls.
+        self.next_check = self.slicing.clock() + 30
+        self.task = asyncio.create_task(self.tick(file_ids=set(candidates)))
         def finished(task):
             if not task.cancelled():
-                # Retrieve errors, preserving the journal for a later retry.
                 task.exception()
             wake()
         self.task.add_done_callback(finished)
@@ -139,7 +147,7 @@ class FileIndex:
         if self.task:
             await asyncio.gather(self.task, return_exceptions=True)
 
-    async def tick(self):
+    async def tick(self, file_ids=None):
         async with self.lock:
             settings = self.slicing.store.settings
             if not settings.get('autoArchive', True):
@@ -147,6 +155,8 @@ class FileIndex:
             rows = self.refresh()
             journals = {row['fileId']: row for row in self.rows('file_moves') if row['state'] not in {'complete', 'superseded'}}
             for row in rows:
+                if file_ids is not None and row['id'] not in file_ids:
+                    continue
                 kind = self.eligible(row)
                 journal = journals.get(row['id'])
                 if not kind or row.get('archiveState') == 'attention':
@@ -221,7 +231,7 @@ class FileIndex:
             raise ValueError('文件记录不存在。')
         row.update(archiveState='waiting', archiveMessage='等待重试归档。')
         self.save('files', row)
-        await self.tick()
+        await self.tick(file_ids={identity})
         return self.state()
 
     async def reconcile(self):
