@@ -30,6 +30,7 @@ from .models import (SlicingSettingsInput, SlicingScanInput, SlicingStartInput,
 from .remote import RemoteClient, RemoteError
 from .source import scan_source
 from .store import JobStore
+from .submissions import SubmissionLog
 from .videos import EXTERNAL_VIDEO_DIR, Conflict, VideoManager
 from .upload_audit import AuditError, AthenaClient, UploadAuditManager
 from .audit_moves import AuditMoveManager
@@ -61,6 +62,7 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
     production_data = data_dir is None
     data_dir = data_dir or ROOT / "data"
     store = JobStore(data_dir / "collection.sqlite3")
+    submissions = SubmissionLog(store.db)
     admission_settings = AdmissionSettings(store.db)
     jobs = JobManager(target, store)
     fixed_directory = video_directory or (EXTERNAL_VIDEO_DIR if production_data else None)
@@ -275,7 +277,49 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
 
     @application.post("/api/slicing/execute-all", status_code=202)
     async def slicing_execute_all(payload: SlicingItemActionInput):
-        return await slicing.execute_all(payload.requestId, payload.expectedRevision)
+        result = await slicing.execute_all(payload.requestId, payload.expectedRevision)
+        run = result.get("run") or {}
+        submissions.add("slicing", "全部切片", {
+            "requestId": payload.requestId,
+            "phase": result.get("phase") or "",
+            "message": run.get("message") or "已接受全部切片",
+        }, request_id=payload.requestId)
+        return result
+
+    def _collection_record(job):
+        return {"jobId": job["id"], "downloadAfterCollection": bool(job.get("downloadAfterCollection")),
+                "items": [{"videoName": item.get("videoName") or "", "startTime": item.get("startTime") or "",
+                           "endTime": item.get("endTime") or "", "status": item.get("status") or "",
+                           "camera": item.get("cameraName") or ""} for item in job.get("items") or []]}
+
+    @application.get("/api/submissions")
+    async def submission_list(kind: str = ""):
+        if kind in ("", "collection"):
+            known = {((row.get("detail") or {}).get("jobId")) for row in submissions.list("collection")}
+            for job in store.list():
+                if job["id"] not in known:
+                    submissions.add("collection", "采集提交", _collection_record(job), submitted_at=job.get("createdAt") or "")
+        rows = []
+        for row in submissions.list(kind):
+            detail = row.get("detail") or {}
+            job = store.get(detail.get("jobId") or "") if row.get("kind") == "collection" else None
+            if job:
+                submitted = sum(item.get("status") == "submitted" for item in job.get("items") or [])
+                row = {**row, "status": job["status"], "submitted": submitted, "total": len(job.get("items") or []),
+                       "detail": _collection_record(job)}
+            rows.append(row)
+        return rows
+
+    @application.delete("/api/submissions/{identity}")
+    async def submission_delete(identity: str):
+        row = submissions.get(identity)
+        if not row:
+            raise HTTPException(404, "记录不存在。")
+        job_id = (row.get("detail") or {}).get("jobId")
+        if job_id and store.get(job_id):
+            jobs.remove(job_id)
+        submissions.delete(identity)
+        return {"ok": True}
 
     @application.get("/api/files")
     async def file_state():
@@ -559,7 +603,14 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
         job = jobs.start(plan, download_directory=directory)
         videos.sync_jobs()
         videos.wake.set()
+        if not already_submitted:
+            submissions.add("collection", "采集提交" if directory else "仅采集", _collection_record(job))
         return job
+
+    @application.delete("/api/jobs/{job_id}")
+    async def delete_job(job_id: str):
+        jobs.remove(job_id)
+        return {"ok": True}
 
     @application.get("/api/jobs")
     async def job_list(request: Request, summary: bool = False):

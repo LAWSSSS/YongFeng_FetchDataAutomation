@@ -143,7 +143,8 @@ class SlicingSettingsInput(BaseModel):
     bedTargetImages: int = Field(default=180, ge=100, le=200)
     targetDatasetIds: dict[str, str | None] = Field(default_factory=lambda: {"27912": None, "27944": None})
     autoArchive: bool = True
-    reviewBeforeUpload: bool = True
+    reviewBeforeUpload: bool = False
+    sliceOutputDirectory: str = ""
     archiveCompletedDirectory: str = Field(default="切片完成", min_length=1, max_length=100)
     archiveEmptyDirectory: str = Field(default="未检出目标", min_length=1, max_length=100)
 

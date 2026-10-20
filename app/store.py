@@ -29,6 +29,10 @@ class JobStore:
         )
         self.db.commit()
 
+    def delete(self, job_id: str) -> None:
+        self.db.execute("DELETE FROM jobs WHERE id=?", (job_id,))
+        self.db.commit()
+
     def get(self, job_id: str) -> dict | None:
         row = self.db.execute("SELECT payload FROM jobs WHERE id=?", (job_id,)).fetchone()
         return json.loads(row[0]) if row else None

@@ -253,7 +253,8 @@ class Multipart:
             created_now = False
             if not self.upload_id:
                 self.event("creating", critical=True)
-                response = self.request("create_multipart_upload", **self.base, ContentType="video/" + (path.suffix[1:] or "mp4"),
+                content_type = "application/zip" if path.suffix.lower() == ".zip" else "video/" + (path.suffix[1:] or "mp4")
+                response = self.request("create_multipart_upload", **self.base, ContentType=content_type,
                     ContentDisposition="attachment; filename=" + quote(self.item["name"]),
                     Metadata={"uploader-id": self.item["id"], "file-version": self.marker})
                 self.upload_id = response["UploadId"]

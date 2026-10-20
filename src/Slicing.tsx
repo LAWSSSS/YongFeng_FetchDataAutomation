@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
 import { usePolling } from './usePolling';
 import { physicalFiles, physicalState, slicePage, sliceTitle, slicingControls } from './slicing-view';
+import SubmissionRecords from './SubmissionRecords';
 import './slicing.css';
 
 type Category = {
@@ -24,7 +25,8 @@ type Settings = {
   bedDeployDirectory: string; bedModelPath: string; bedGeometryPath: string; frameToolPath: string;
   workerPythonPath: string; sharedSampling: boolean; sampleIntervalSeconds: number;
   magnetIntervalSeconds: number; bedIntervalSeconds: number; magnetConfidence: number;
-  autoArchive: boolean; reviewBeforeUpload: boolean; archiveCompletedDirectory: string; archiveEmptyDirectory: string;
+  autoArchive: boolean; reviewBeforeUpload: boolean; sliceOutputDirectory: string;
+  archiveCompletedDirectory: string; archiveEmptyDirectory: string;
   targetImages: number; bedTargetImages: number; targetDatasetIds: Record<string, string | null>;
 };
 type Candidate = {id: string; name: string; category: string; namespace: string; namespaceInferred?: boolean; verified?: boolean; selected?: boolean};
@@ -42,7 +44,7 @@ type State = {phase?:string; connected: boolean; user: string; settings: Setting
 const emptySettings: Settings = {revision: 0, directories: ['/Volumes/out/视频'], magnetDeployDirectory: '', magnetModelPath: '',
   bedDeployDirectory: '', bedModelPath: '', bedGeometryPath: '', frameToolPath: '', workerPythonPath: '', sharedSampling: true,
   sampleIntervalSeconds: 30, magnetIntervalSeconds: 30, bedIntervalSeconds: 30, magnetConfidence: .25,
-  autoArchive:true, reviewBeforeUpload:true, archiveCompletedDirectory:'切片完成', archiveEmptyDirectory:'未检出目标',
+  autoArchive:true, reviewBeforeUpload:false, sliceOutputDirectory:'', archiveCompletedDirectory:'切片完成', archiveEmptyDirectory:'未检出目标',
   targetImages: 150, bedTargetImages: 180, targetDatasetIds: {'27912': null, '27944': null}};
 const empty: State = {connected: false, user: '', settings: emptySettings, settingsRevision: 0, run: null, items: [], counts: {}, busy: false, enabled: false};
 const labels: Record<string,string> = {pending:'待处理',analyzing:'识别中',platform_processing:'平台处理中',review:'待校对',queued:'排队上传',uploading:'正在上传',uploaded:'等待导入',importing:'正在导入',waiting:'等待平台结果',waiting_slot:'等待平台空位',
@@ -282,7 +284,8 @@ export default function Slicing({onConnect}: {onConnect: () => void}) {
         <button className="secondary" disabled={!controls.canResume || !!busy || settingsDirty} onClick={() => void run('resume', () => request('/resume',{requestId:uid()}),'正在继续。')}>继续</button>
         <button className="link" disabled={!!busy} onClick={() => void run('refresh', () => request<State>(''),'状态已更新。')}>刷新</button>
       </div>
-      <p className="slice-flow">扫描去重 → 共用抽帧 → 本地打包 → 排队导入。关闭网页后上传继续。</p>
+      <p className="slice-flow">{settings.reviewBeforeUpload ? '已打开审核：磁盘吊照片确认后才上传。' : '自动模式：切片完成后直接上传压缩包。车斗导入 27892，磁盘吊导入 27893，不需要审核。'}</p>
+      <p className="slice-flow">照片保存在每条原视频旁边。关闭网页后上传继续。</p>
       <SliceClassify />
       {!!state.packages?.targets.length && <div className="slice-overall">{state.packages.targets.map(target =>
         <span key={target.id}>{target.name} · 上传 {target.uploading} · 导入 {target.importing} · 排队 {target.queued}</span>)}</div>}
@@ -293,6 +296,7 @@ export default function Slicing({onConnect}: {onConnect: () => void}) {
       {Object.keys(excluded).length > 0 && <details className="slice-scan-details"><summary>扫描与去重明细</summary><p className="slice-detail">已排除：平台处理中 {excluded.active || 0} · 平台已完成 {excluded.complete || 0} · 已切片视频 {excluded.cut || 0} · 程序已有任务 {excluded.submitted || 0}</p></details>}
       {(error || pollError) && <p className="error" role="alert">{error || pollError}</p>}{notice && <p className="success" role="status">{notice}</p>}
     </section>
+    <SubmissionRecords kind="slicing" />
 
     <details className="panel slicing-settings"><summary>模型、目录与切片参数</summary>
       <div className="slice-settings-grid">
@@ -308,7 +312,8 @@ export default function Slicing({onConnect}: {onConnect: () => void}) {
         {settings.sharedSampling ? <label>共用抽样间隔（秒）<input type="number" min={1} max={3600} value={settings.sampleIntervalSeconds} onChange={event => set('sampleIntervalSeconds',Number(event.target.value))} /></label> : <>
           <label>磁盘吊抽样间隔（秒）<input type="number" min={1} max={3600} value={settings.magnetIntervalSeconds} onChange={event => set('magnetIntervalSeconds',Number(event.target.value))} /></label>
           <label>车斗抽样间隔（秒）<input type="number" min={1} max={3600} value={settings.bedIntervalSeconds} onChange={event => set('bedIntervalSeconds',Number(event.target.value))} /></label></>}
-        <label className="wide check-label"><input type="checkbox" checked={settings.reviewBeforeUpload ?? true} onChange={event=>set('reviewBeforeUpload',event.target.checked)} />上传前查看切片照片；关闭后抽完直接上传</label>
+        <label className="wide">抽帧照片保存位置（留空则放在每条视频旁边）<input value={settings.sliceOutputDirectory || ''} onChange={event => set('sliceOutputDirectory', event.target.value)} placeholder="留空即可" /></label>
+        <label className="wide check-label"><input type="checkbox" checked={!settings.reviewBeforeUpload} onChange={event=>set('reviewBeforeUpload', !event.target.checked)} />不需要审核：切片完成后直接上传压缩包并按数据集导入</label>
         <label className="wide check-label"><input type="checkbox" checked={settings.autoArchive ?? true} onChange={event=>set('autoArchive',event.target.checked)} />两类处理结束后自动剪切归档</label>
         <label>完成文件夹名<input value={settings.archiveCompletedDirectory || '切片完成'} onChange={event=>set('archiveCompletedDirectory',event.target.value)} /></label>
         <label>未检出文件夹名<input value={settings.archiveEmptyDirectory || '未检出目标'} onChange={event=>set('archiveEmptyDirectory',event.target.value)} /></label>

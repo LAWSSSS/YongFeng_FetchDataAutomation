@@ -7,6 +7,49 @@ from pathlib import Path
 
 _NAME = re.compile(r"^(.+)_(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})_")
 PACKAGE_DATASETS = {"bed": "27892", "magnet": "27893"}
+CATEGORY_FOLDERS = {"bed": "车斗", "magnet": "磁盘吊"}
+
+
+def package_directory(video_path, category):
+    """Photos and the zip live beside the source video, one folder per category."""
+    video = Path(video_path)
+    return video.parent / video.stem / CATEGORY_FOLDERS[category]
+
+
+def select_recognized_frames(samples, *, target=150, maximum=200):
+    """Return only timestamps already labeled target, thinning a long run toward the target count."""
+    positive = sorted({round(float(stamp), 3) for stamp, label in samples if label == "target"})
+    if len(positive) <= maximum:
+        return positive
+    if target <= 1 or len(positive) == 1:
+        return positive[:1]
+    step = (len(positive) - 1) / (target - 1)
+    chosen = []
+    for index in range(target):
+        stamp = positive[round(index * step)]
+        if not chosen or chosen[-1] != stamp:
+            chosen.append(stamp)
+    return chosen
+
+
+def magnet_refine_windows(samples, gap):
+    """Windows between a hit and a miss, and the open gap between two hits."""
+    rows = sorted((round(float(stamp), 3), "target" if label == "target" else "other") for stamp, label in samples)
+    windows = []
+    for (left, left_label), (right, right_label) in zip(rows, rows[1:]):
+        if left_label != right_label or (left_label == "target" and right - left > gap + 1e-3):
+            windows.append((left, right))
+    return windows
+
+
+def interior_timestamps(start, end, step):
+    points = []
+    stamp = round(float(start) + step, 3)
+    limit = float(end) - 1e-6
+    while stamp < limit:
+        points.append(stamp)
+        stamp = round(stamp + step, 3)
+    return points
 
 
 def slice_timestamps(intervals, seconds):

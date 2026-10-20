@@ -8,7 +8,8 @@ import type { AdmissionRule } from './admission';
 import { correctionInterval, correctionReviewCurrent, prepareCorrection } from './corrections';
 import type { PreparedCorrection } from './corrections';
 import { InspectionResults, VideoBatches, VideoStatusFilters } from './RecordGroups';
-import { batchDate, canDownload, syncVideoSelection, videoStatusOptions } from './record-groups';
+import { canDownload, syncVideoSelection, videoStatusOptions } from './record-groups';
+import SubmissionRecords from './SubmissionRecords';
 import type { CollectionJob, InspectionRecord } from './record-groups';
 
 const Slicing = lazy(() => import('./Slicing'));
@@ -349,7 +350,7 @@ export default function App() {
             onClick={() => void submitPlan(false)}>仅采集</button>
             <button disabled={!session.capabilities?.batchDownload || !state.directory || !session.target.connected || !plan.tasks.some(task => task.status === 'ready') || plan.tasks.some(task => task.status === 'invalid') || !!busy}
               onClick={() => void submitPlan(true)}>确认采集并下载</button></div></div></section>}
-      {jobs.length > 0 && <section className="panel"><div className="section-title"><h2>简易版批次</h2><span>保留提交凭证，视频记录可单独清理</span></div><div className="job-list">{jobs.map(job => <div key={job.id}><strong>{batchDate(job.createdAt)}</strong><span>{({running:'提交中',complete:'提交结束',attention:'待核对',stopped:'已停止'} as Record<string,string>)[job.status] || job.status} · 已提交 {job.items.filter(item => item.status === 'submitted').length} / {job.items.length} 条 · 当前记录 {state.byJob[job.id] || 0} 条</span><button className="link" disabled={!!busy || job.status === 'running'} onClick={() => {void run('refresh', async () => {await api(`/jobs/${job.id}/refresh`, {}); await refresh();});}}>核对平台</button></div>)}</div></section>}</>
+      <SubmissionRecords kind="collection" onChanged={() => {void refresh();}} /></>
       : <><section className="panel"><div className="section-title"><div><p className="eyebrow">最终文件夹</p><h2>保存你明确选择的版本</h2></div><button className="secondary" disabled={!session.target.connected || !!busy} onClick={() => {void run('check', async () => {await api('/videos/check', {}); await refresh();});}}>检查平台状态</button></div>
         <div className="directory-form"><input aria-label="最终视频保存目录" placeholder="请输入本机文件夹完整路径" value={directory} onChange={e => setDirectory(e.target.value)} /><button disabled={!directory.trim() || !!busy} onClick={() => {void run('directory', async () => {await api('/settings/directory', {directory}); await refresh(); setMessage('后续确认下载将保存到新文件夹。');});}}>保存文件夹</button></div>
         <p className="subtle">当前保存目录：{state.directory || '尚未设置'}。更改目录只影响之后确认的下载，已排队的任务仍使用提交时的目录。最多同时下载 5 条；外置盘断开时保留本机断点，连接后可继续保存。可逐条查看后确认，也可批量批准当前版本下载。</p>{state.checkError && <p className="notice">{state.checkError}</p>}</section>
