@@ -27,11 +27,8 @@ class SlicingWorkflow:
 
     async def _workflow_scan(self):
         """Run one refresh between analyses; retain the same batch identity."""
-        if self.analysis_task and self.analysis_task.done():
-            finished, self.analysis_task = self.analysis_task, None
-            if not finished.cancelled():
-                finished.result()
-        if self.analysis_task or (self.files and self.files.busy) or (self.scan_task and not self.scan_task.done()):
+        self._reap_analysis_tasks()
+        if self._active_analysis_tasks() or (self.files and self.files.busy) or (self.scan_task and not self.scan_task.done()):
             return False
         from uuid import uuid4
         workflow = self.store.settings['workflow']

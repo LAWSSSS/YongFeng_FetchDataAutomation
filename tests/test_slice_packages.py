@@ -4,11 +4,34 @@ from pathlib import Path
 import pytest
 
 from app.main import create_app
-from app.slice_export import photo_names, slice_timestamps
+from app.slice_export import package_directory, photo_names, slice_timestamps
 from app.upload_audit import name_key
 
 
 JPEG = b"\xff\xd8\xff\xd9"
+
+
+def test_slice_outputs_are_central_and_grouped_by_model_and_video():
+    result = package_directory("/videos/鲁A12345_20261005050441_abc.mp4", "bed",
+                               output_root="/output/切片结果", video_id="981")
+    assert result == Path("/output/切片结果/车斗/鲁A12345_20261005050441_abc_981")
+
+
+@pytest.mark.asyncio
+async def test_local_slicing_and_package_upload_pause_controls_are_independent(tmp_path):
+    from tests.test_slicing_performance import close_app
+    app = create_app(data_dir=tmp_path)
+    slicing = app.state.slicing
+    slicing.store.settings["enabled"] = True
+
+    slicing.pause()
+    assert slicing.packages.paused is False
+
+    slicing.store.settings["enabled"] = True
+    slicing.packages.pause()
+    assert slicing.store.settings["enabled"] is True
+    slicing.packages.resume()
+    await close_app(app)
 
 
 def reader(path, ffmpeg, timestamp):
@@ -31,7 +54,7 @@ class Remote:
     async def submit(self, dataset, keys):
         assert len(keys) == 1
         self.submitted.append((dataset, keys[0]))
-        job = {"id": str(700 + len(self.submitted)), "status": "1", "dataset": dataset,
+        job = {"id": str(700 + len(self.submitted)), "type": 1, "status": "1", "dataset": dataset,
                "config": {"source": {"files": [{"key": keys[0]}]}}}
         self.jobs_by_dataset[dataset].append(job)
         return job["id"]
@@ -39,7 +62,7 @@ class Remote:
     async def evidence(self, dataset, job):
         return {"evidence": {}, "reason": ""}
 
-    async def images(self, dataset):
+    async def images(self, dataset, *, prefix):
         return list(self.rows)
 
 
@@ -129,7 +152,19 @@ def test_photos_and_video_stay_until_both_categories_are_imported(tmp_path):
     assert video.exists() and (photo / "a.jpg").exists()
     packages.store.save("items", {**packages.store.get("items", "magnet"), "state": "complete"})
     packages.delete_if_both_complete(packages.store.get("items", "magnet"))
-    assert not video.exists() and not archive.exists() and not (photo / "a.jpg").exists()
+    # Legacy rows without immutable file receipts must never authorize deletion.
+    assert video.exists() and archive.exists() and (photo / "a.jpg").exists()
+    from app.audit_moves import source_fingerprint
+    for row in packages.store.list("items"):
+        row.update(videoFileVersion=source_fingerprint(video), fileVersion=source_fingerprint(archive),
+                   images=["a.jpg"], imageVersions={"a.jpg": source_fingerprint(photo / "a.jpg")},
+                   imageCount=1, actualImages=1, verifiedJobId="7")
+        packages.store.save("items", row)
+    unrelated = photo / "user.jpg"
+    unrelated.write_bytes(JPEG)
+    packages.delete_if_both_complete(packages.store.get("items", "magnet"))
+    assert video.exists() and not archive.exists() and not (photo / "a.jpg").exists()
+    assert unrelated.exists()
 
 
 def test_timestamps_follow_the_inclusive_interval_grid():
@@ -154,7 +189,7 @@ async def test_review_keeps_the_archive_local_until_confirmed(manager):
     assert saved["categories"]["magnet"]["state"] == "review"
     assert package["state"] == "review" and slicing.packages.remote.submitted == []
     with zipfile.ZipFile(package["path"]) as archive:
-        assert archive.namelist() == [f"image/{name}" for name in package["images"]]
+        assert archive.namelist() == [f"images/{name}" for name in package["images"]]
     await slicing._export_ready(slicing.store.get("items", item["id"]))
     assert len(slicing.packages.store.list("items")) == 1
     slicing.confirm_package(package["id"])
@@ -173,7 +208,9 @@ async def test_disabled_review_enqueues_immediately_and_imports_one_at_a_time(ma
     app, slicing = manager
     slicing.store.settings["reviewBeforeUpload"] = False
     first = ready_item(tmp_path, "1")
-    second = ready_item(tmp_path, "2")
+    import copy
+    second = copy.deepcopy(first)
+    second["sourceVideoId"] = "2"
     second["id"] = "item-2"
     second["name"] = "鲁B00001_20261005060606_def.mp4"
     path = tmp_path / second["name"]
@@ -187,7 +224,9 @@ async def test_disabled_review_enqueues_immediately_and_imports_one_at_a_time(ma
     assert {row["state"] for row in slicing.packages.store.list("items")} == {"queued"}
     for row in slicing.packages.store.list("items"):
         video = Path(row["videoPath"])
-        assert Path(row["path"]).parent == video.parent / video.stem / "车斗"
+        from app.slice_export import package_directory
+        assert Path(row["path"]).parent == package_directory(video, "bed",
+            output_root=slicing.slice_output_root(), video_id=row["sourceVideoId"])
     await slicing.packages.tick()
     if slicing.packages.running:
         await __import__("asyncio").gather(*slicing.packages.running.values())
@@ -203,7 +242,8 @@ async def test_disabled_review_enqueues_immediately_and_imports_one_at_a_time(ma
     job = slicing.packages.remote.jobs_by_dataset["27892"][0]
     job["status"] = "3"
     stem = Path(importing[0]["name"]).stem
-    slicing.packages.remote.rows = [{"name": f"{stem}_001.jpg"}]
+    slicing.packages.remote.rows = [{"id": str(900+i), "name": name, "taskId": job["id"]}
+                                   for i,name in enumerate(importing[0]["images"])]
     await slicing.packages.tick()
     assert slicing.packages.store.get("items", importing[0]["id"])["state"] == "complete"
     assert name_key(stem)

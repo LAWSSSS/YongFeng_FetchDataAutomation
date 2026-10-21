@@ -1,6 +1,6 @@
 # Separate Python 3.11 CPU inference environment. The deployed model files are not copied.
 numpy==1.26.4
-Pillow==10.4.0
+Pillow==13.0.0
 onnxruntime==1.19.2
 opencv-python-headless==4.10.0.84
-torch==2.4.1
+torch==2.14.1

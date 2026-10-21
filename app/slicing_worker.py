@@ -88,7 +88,7 @@ def probe(path, ffprobe):
             "frameRate": frame_rate if math.isfinite(frame_rate) and frame_rate > 0 else 25.0}
 
 
-def extract_requested_frames(path, ffmpeg, metadata, points):
+def extract_requested_frames(path, ffmpeg, metadata, points, *, skip_undecodable=False):
     """Yield requested JPEGs one at a time; never materialize them on disk."""
     if not os.path.isfile(path) or not os.access(path, os.R_OK):
         raise RuntimeError("local_video_missing")
@@ -109,17 +109,29 @@ def extract_requested_frames(path, ffmpeg, metadata, points):
         min(second - first for first, second in zip(regular, regular[1:])) >= 5 or
         any(len({round(b - a, 6) for a, b in zip(values, values[1:])}) > 1
             for values in regular_by_category.values()))
+    # In salvage mode, decode each requested position independently so a bad
+    # packet cannot shift timestamps assigned to later frames.
+    sparse = sparse or bool(skip_undecodable)
     if sparse:
         for timestamp in regular:
             command = [ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-threads", "2",
                        "-ss", f"{timestamp:.6f}", "-i", path, "-map", "0:v:0", "-an", "-sn",
                        "-frames:v", "1", "-threads", "2", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"]
             image_bytes = None
-            for decoded in jpeg_frames(command):
-                if image_bytes is not None:
-                    raise RuntimeError("frame_extract_failed")
-                image_bytes = decoded
+            try:
+                for decoded in jpeg_frames(command):
+                    if image_bytes is not None:
+                        raise RuntimeError("frame_extract_failed")
+                    image_bytes = decoded
+            except FrameExtractionError:
+                if not skip_undecodable:
+                    raise FrameExtractionError(timestamp=timestamp) from None
+                yield timestamp, None
+                continue
             if image_bytes is None or not image_bytes.startswith(b"\xff\xd8") or not image_bytes.endswith(b"\xff\xd9"):
+                if skip_undecodable:
+                    yield timestamp, None
+                    continue
                 raise FrameExtractionError(timestamp=timestamp)
             yield timestamp, image_bytes
             del image_bytes
@@ -181,11 +193,18 @@ def extract_requested_frames(path, ffmpeg, metadata, points):
                    "-sseof", f"-{tail_window:.6f}", "-i", path, "-map", "0:v:0", "-an", "-sn",
                    "-threads", "2", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"]
         image_bytes = None
-        for extra in jpeg_frames(command):
-            if image_bytes is not None:
-                del image_bytes
-            image_bytes = extra
+        try:
+            for extra in jpeg_frames(command):
+                if image_bytes is not None:
+                    del image_bytes
+                image_bytes = extra
+        except FrameExtractionError:
+            if not skip_undecodable:
+                raise FrameExtractionError("media_incomplete", timestamp=timestamp) from None
         if image_bytes is None:
+            if skip_undecodable:
+                yield timestamp, None
+                continue
             raise FrameExtractionError("media_incomplete", timestamp=timestamp)
         yield timestamp, image_bytes
         del image_bytes
@@ -292,12 +311,14 @@ def process(request):
         return
     emit({"event": "stage", "stage": "checking_media", "total": len(set(
         value for values in categories.values() for value in values))})
-    try:
-        verify_video_tail(path, ffmpeg, metadata["duration"])
-    except MediaValidationError as error:
-        emit({"event": "error", "category": "both", "code": str(error),
-              "stage": "checking_media", "time": metadata["duration"]})
-        return
+    skip_undecodable = bool(request.get("skipUndecodableSamples"))
+    if not skip_undecodable:
+        try:
+            verify_video_tail(path, ffmpeg, metadata["duration"])
+        except MediaValidationError as error:
+            emit({"event": "error", "category": "both", "code": str(error),
+                  "stage": "checking_media", "time": metadata["duration"]})
+            return
     emit({"event": "stage", "stage": "loading_model"})
     models = Models(settings, set(categories))
     available = set(categories)
@@ -318,10 +339,17 @@ def process(request):
     observations = 0
     emit({"event": "stage", "stage": "sampling"})
     try:
-        frames = extract_requested_frames(path, ffmpeg, metadata, categories)
+        frames = extract_requested_frames(path, ffmpeg, metadata, categories,
+                                          skip_undecodable=skip_undecodable)
         for timestamp, image_bytes in frames:
             active = [category for category, values in categories.items()
                       if any(abs(value - timestamp) < 0.05 for value in values)]
+            if image_bytes is None:
+                for category in active:
+                    emit({"event": "observation", "category": category, "time": timestamp,
+                          "label": "unavailable", "score": None, "code": "decode_unavailable"})
+                    observations += 1
+                continue
             for category in active:
                 try:
                     result = models.classify(image_bytes, category)

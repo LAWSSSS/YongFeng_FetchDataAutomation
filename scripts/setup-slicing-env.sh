@@ -16,5 +16,5 @@ if [ ! -x .venv-slicing/bin/python ]; then
   "$python_bin" -m venv .venv-slicing
 fi
 PIP_CACHE_DIR="$project_dir/.cache/pip-slicing" .venv-slicing/bin/python -m pip install --upgrade pip
-PIP_CACHE_DIR="$project_dir/.cache/pip-slicing" .venv-slicing/bin/python -m pip install -r requirements-slicing.txt
+PIP_CACHE_DIR="$project_dir/.cache/pip-slicing" .venv-slicing/bin/python -m pip install -r requirements-slicing.lock.txt
 printf '模型推理环境已安装：%s\n' "$project_dir/.venv-slicing/bin/python"

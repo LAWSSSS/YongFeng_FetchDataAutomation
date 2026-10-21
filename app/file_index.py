@@ -76,28 +76,47 @@ class FileIndex:
     def state(self):
         rows = self.rows('files')
         counts = {}
+        public = []
         for row in rows:
             state = row.get('archiveState', 'not_ready')
             counts[state] = counts.get(state, 0) + 1
-        return {'items': rows, 'counts': counts}
+            value = dict(row)
+            if value.get('cleanup'):
+                value['cleanup'] = {key: value['cleanup'].get(key) for key in
+                                    ('state', 'message', 'startedAt', 'completedAt')}
+            public.append(value)
+        return {'items': public, 'counts': counts}
 
     def destination(self, path, kind, settings):
         source = checked_path(path)
         roots = [checked_path(root) for root in settings['directories']]
-        classifications = ('已上传', '磁盘吊未上传', '车斗未上传')
-        roots += [root / name for root in list(roots) for name in classifications]
-        last_plan = self.moves.latest() or {}
-        roots += [checked_path(last_plan[key]) for key in ('uploadedDirectory', 'magnetMissingDirectory', 'bedMissingDirectory') if last_plan.get(key)]
-        roots.sort(key=lambda path: len(path.parts), reverse=True)
-        root = next((root for root in roots if source.is_relative_to(root)), None)
+        # Always classify against the configured source root, never against an
+        # intermediate folder such as 已上传/车斗未上传. If roots overlap, use
+        # the most specific configured root for deterministic relative paths.
+        matches = [root for root in roots if source.is_relative_to(root)]
+        if not matches:
+            # A user may have moved a source outside the configured scan roots
+            # through UploadAudit. Keep that binding usable without treating a
+            # sibling classification folder as the new global root.
+            last_plan = self.moves.latest() or {}
+            plan_roots = [checked_path(last_plan[key]) for key in
+                          ('uploadedDirectory', 'magnetMissingDirectory', 'bedMissingDirectory') if last_plan.get(key)]
+            matches = [root for root in plan_roots if source.is_relative_to(root)]
+        root = max(matches, key=lambda path: len(path.parts), default=None)
         if root is None:
             raise ValueError('文件不在视频或分类目录内，保留原位。')
+        if kind == 'complete':
+            return root / settings['archiveCompletedDirectory'] / source.name
         parts = list(source.relative_to(root).parts)
-        archive_names = {settings['archiveCompletedDirectory'], settings['archiveEmptyDirectory']}
-        if parts and parts[0] in archive_names:
+        # Flatten old classification wrappers while retaining real date/source
+        # subdirectories. New videos never become nested under stale labels.
+        wrappers = {'已上传', '磁盘吊未上传', '车斗未上传', '切片分类',
+                    settings['archiveCompletedDirectory'], settings['archiveEmptyDirectory']}
+        while parts and parts[0] in wrappers:
             parts.pop(0)
-        folder = settings['archiveCompletedDirectory'] if kind == 'complete' else settings['archiveEmptyDirectory']
-        return root / folder / Path(*parts)
+        if not parts:
+            parts = [source.name]
+        return root / settings['archiveEmptyDirectory'] / Path(*parts)
 
     def eligible(self, row):
         items = [self.slicing.store.get('items', identity) for identity in row.get('links', {}).get('slicing', [])]
@@ -105,8 +124,10 @@ class FileIndex:
         for item in items:
             if not item:
                 continue
-            name = 'bed' if item['sourceDatasetId'] == '27912' else 'magnet'
-            categories.setdefault(name, []).append(item['categories'][name])
+            for name in ('bed', 'magnet'):
+                category = item.get('categories', {}).get(name, {})
+                if category.get('state') != 'not_applicable':
+                    categories.setdefault(name, []).append(category)
         if set(categories) != {'bed', 'magnet'}:
             return None
         values = [category for group in categories.values() for category in group]
@@ -120,16 +141,26 @@ class FileIndex:
     def busy(self):
         return bool(self.task and not self.task.done())
 
-    def schedule(self, wake, item_id=None):
+    def schedule(self, wake, item_id=None, *, archive_only=False):
         if not self.slicing.store.settings.get('autoArchive', True):
             return
         candidates = []
         for row in self.refresh():
             if item_id and item_id not in row.get('links', {}).get('slicing', []):
                 continue
+            if archive_only and row.get('archiveState') != 'complete':
+                continue
             kind = self.eligible(row)
-            if kind and row.get('archiveState') != 'attention' and (row.get('archiveState') != 'complete' or row.get('archiveKind', kind) != kind):
+            if not kind or row.get('archiveState') == 'attention':
+                continue
+            try:
+                destination = str(self.destination(row['path'], kind, self.slicing.store.settings))
+            except (OSError, ValueError):
+                destination = ''
+            if (not destination or row.get('archiveState') != 'complete'
+                    or row.get('archiveKind', kind) != kind or row.get('path') != destination):
                 row['archiveState'] = 'waiting'
+                row['archiveMessage'] = '正在归入统一完成文件夹。' if archive_only else row.get('archiveMessage', '')
                 self.save('files', row)
                 candidates.append(row['id'])
         if not candidates or self.busy or self.slicing.clock() < self.next_check:
@@ -161,9 +192,11 @@ class FileIndex:
                 journal = journals.get(row['id'])
                 if not kind or row.get('archiveState') == 'attention':
                     continue
+                destination = str(self.destination(row['path'], kind, settings))
+                if (row.get('archiveState') == 'complete' and row.get('archiveKind', kind) == kind
+                        and row.get('path') == destination):
+                    continue
                 if row.get('archiveState') == 'complete':
-                    if row.get('archiveKind', kind) == kind:
-                        continue
                     row['archiveState'] = 'waiting'
                 if self.leases.busy(row['path']):
                     row.update(archiveState='waiting', archiveMessage='文件使用中，释放后归档。')
@@ -176,7 +209,6 @@ class FileIndex:
                         linked = [self.slicing.store.get('items', value) for value in row['links']['slicing']]
                         if any(item.get('fileVersion') != current for item in linked if item):
                             raise ValueError('文件版本已改变，原位保留。')
-                        destination = str(self.destination(row['path'], kind, settings))
                         if destination == row['path']:
                             row.update(archiveState='complete', archivePath=destination, archiveKind=kind)
                             self.save('files', row)
@@ -232,6 +264,142 @@ class FileIndex:
         row.update(archiveState='waiting', archiveMessage='等待重试归档。')
         self.save('files', row)
         await self.tick(file_ids={identity})
+        return self.state()
+
+    async def cleanup_confirmed(self, identity, request_id):
+        """Delete only verified source/output files recorded by this program."""
+        row = next((row for row in self.rows('files') if row['id'] == identity), None)
+        if not row:
+            raise ValueError('文件记录不存在。')
+        cleanup = row.get('cleanup') or {}
+        if cleanup.get('state') == 'complete':
+            return self.state()
+
+        linked = [self.slicing.store.get('items', item_id)
+                  for item_id in row.get('links', {}).get('slicing', [])]
+        linked = [item for item in linked if item]
+        eligibility = self.eligible(row)
+        if eligibility not in {'complete', 'empty'} or row.get('archiveState') != 'complete':
+            raise ValueError('仅能清理已集中归档且切片结果核验完成的视频。')
+        if any(item.get('state') not in {'complete', 'no_target'} for item in linked):
+            raise ValueError('仍有未完成或需处理的类别，原片和照片继续保留。')
+        item_ids = {item['id'] for item in linked}
+        package_rows = [package for package in self.slicing.packages.store.list('items')
+                        if package.get('itemId') in item_ids and package.get('state') != 'dismissed']
+        if any(package.get('state') != 'complete' for package in package_rows):
+            raise ValueError('存在尚未完成的平台图片包，暂不清理本地视频或照片。')
+        for item in linked:
+            category_name = 'bed' if item['sourceDatasetId'] == '27912' else 'magnet'
+            category = item['categories'][category_name]
+            if category.get('state') != 'complete':
+                continue
+            if not any(package.get('itemId') == item['id'] and package.get('category') == category_name
+                       for package in package_rows):
+                raise ValueError('已切片类别缺少已核验的图片包记录，原片和照片继续保留。')
+
+        settings = self.slicing.store.settings
+        roots = [checked_path(root) for root in settings.get('directories', [])]
+        output = str(settings.get('sliceOutputDirectory') or '').strip()
+        if output:
+            roots.append(checked_path(output))
+        manifest = cleanup.get('manifest') if cleanup.get('state') in {'running', 'attention'} else None
+        if manifest is None:
+            from .slicing import source_version
+
+            original_path = row['path']
+            expected_versions = {json.dumps(item.get('fileVersion'), sort_keys=True) for item in linked
+                                 if item.get('path') == original_path and item.get('fileVersion')}
+            if len(expected_versions) != 1:
+                raise ValueError('原视频版本记录不唯一，未删除任何文件。')
+            expected_original = json.loads(next(iter(expected_versions)))
+            if source_version(original_path) != expected_original:
+                raise ValueError('原视频版本与已核验记录不同，未删除任何文件。')
+
+            entries = [{'path': original_path, 'kind': 'video', 'expected': expected_original,
+                        'state': 'planned'}]
+            for package in package_rows:
+                archive = package.get('path')
+                if archive and not package.get('fileVersion'):
+                    raise ValueError('图片包缺少文件版本记录，未删除任何文件。')
+                if archive:
+                    entries.append({'path': archive, 'kind': 'archive',
+                                    'expected': package['fileVersion'], 'state': 'planned'})
+                image_dir = package.get('imageDir')
+                versions = package.get('imageVersions') or {}
+                for name in package.get('images') or []:
+                    expected = versions.get(name)
+                    if not image_dir or not expected:
+                        raise ValueError('图片缺少目录或版本记录，未删除任何文件。')
+                    entries.append({'path': str(Path(image_dir) / name), 'kind': 'image',
+                                    'expected': expected, 'state': 'planned'})
+            seen = {}
+            for entry in entries:
+                entry_path = checked_path(entry['path'])
+                if not any(entry_path.is_relative_to(root) for root in roots):
+                    raise ValueError('待清理文件不在配置的视频或切片目录内，未删除任何文件。')
+                prior = seen.get(entry_path)
+                if prior:
+                    for key in ('device', 'inode', 'size', 'modifiedNs', 'edgeHash', 'sha256'):
+                        first, second = prior.get('expected', {}).get(key), entry.get('expected', {}).get(key)
+                        if first is not None and second is not None and first != second:
+                            raise ValueError('多个结果对同一文件记录了不同版本，未删除任何文件。')
+                else:
+                    seen[entry_path] = entry
+                if entry_path.exists():
+                    if not entry_path.is_file() or entry_path.is_symlink():
+                        raise ValueError('待清理路径不是普通文件，未删除任何文件。')
+                    actual = source_fingerprint(entry_path)
+                    if any(actual.get(key) != entry['expected'].get(key)
+                           for key in ('device', 'inode', 'size', 'modifiedNs') if key in entry['expected']):
+                        raise ValueError('待清理文件版本与核验记录不同，未删除任何文件。')
+                else:
+                    entry['state'] = 'missing'
+            cleanup = {'requestId': request_id, 'state': 'running', 'manifest': entries,
+                       'startedAt': now_iso(), 'message': '正在清理已核验的视频和程序生成照片。'}
+            row['cleanup'] = cleanup
+            self.save('files', row)
+        else:
+            cleanup.update(requestId=request_id, state='running', message='正在续接已核验的本地清理记录。')
+            row['cleanup'] = cleanup
+            self.save('files', row)
+
+        try:
+            for entry in cleanup.get('manifest', []):
+                if entry.get('state') in {'deleted', 'missing'}:
+                    continue
+                path = checked_path(entry['path'])
+                with self.leases.write(path):
+                    if not path.exists():
+                        entry['state'] = 'missing'
+                    else:
+                        if not path.is_file() or path.is_symlink():
+                            raise ValueError('待清理路径不是普通文件，未删除其他用户文件。')
+                        if entry.get('kind') == 'video':
+                            from .slicing import source_version
+                            actual = source_version(path)
+                        else:
+                            actual = source_fingerprint(path)
+                        if any(actual.get(key) != entry['expected'].get(key)
+                               for key in ('device', 'inode', 'size', 'modifiedNs') if key in entry['expected']):
+                            raise ValueError('待清理文件已变化，剩余文件保留。')
+                        path.unlink()
+                        entry['state'] = 'deleted'
+                        entry['deletedAt'] = now_iso()
+                cleanup['manifest'] = cleanup.get('manifest', [])
+                row['cleanup'] = cleanup
+                self.save('files', row)
+            cleanup.update(state='complete', completedAt=now_iso(), message='已清理核验完成的本地原视频和程序生成照片。')
+            for item in linked:
+                item.update(localCleanupState='complete', localCleanupAt=cleanup['completedAt'])
+                self.slicing.store.save('items', item)
+            for package in package_rows:
+                package['localCleanupState'] = 'complete'
+                package['localCleanupAt'] = cleanup['completedAt']
+                self.slicing.packages._save(package)
+        except (OSError, ValueError) as error:
+            cleanup.update(state='attention', message=str(error) or '本地清理未完成；剩余文件保留。')
+        row['cleanup'] = cleanup
+        self.save('files', row)
         return self.state()
 
     async def reconcile(self):

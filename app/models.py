@@ -73,6 +73,12 @@ class DirectoryInput(BaseModel):
     directory: str = Field(min_length=1, max_length=2000)
 
 
+class SliceClassifyConfirmInput(BaseModel):
+    planId: str = Field(pattern=r"^classify:[a-f0-9]{32}$")
+    expectedRevision: int = Field(ge=0, strict=True)
+    requestId: str = Field(pattern=r"^[A-Za-z0-9_-]{1,100}$")
+
+
 class HistoryRemoveInput(BaseModel):
     expectedRevision: int = Field(ge=0)
     requestId: str = Field(min_length=1, max_length=100)
@@ -135,6 +141,7 @@ class SlicingSettingsInput(BaseModel):
     frameToolPath: str = Field(min_length=1, max_length=2000)
     workerPythonPath: str = Field(min_length=1, max_length=2000)
     sharedSampling: bool = True
+    maxLocalSlicingProcesses: int = Field(default=3, ge=1, le=8, strict=True)
     sampleIntervalSeconds: int = Field(default=30, ge=1, le=3600)
     magnetIntervalSeconds: int = Field(default=30, ge=1, le=3600)
     bedIntervalSeconds: int = Field(default=30, ge=1, le=3600)
@@ -165,12 +172,24 @@ class SlicingItemActionInput(BaseModel):
     expectedRevision: int = Field(ge=0, strict=True)
 
 
+class FileCleanupInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    requestId: str = Field(pattern=r"^[A-Za-z0-9_-]{1,100}$")
+    confirm: Literal[True]
+
+
 class SlicingBindInput(SlicingItemActionInput):
     path: str = Field(min_length=1, max_length=4000)
 
 
+class SliceIntervalInput(BaseModel):
+    start: float = Field(ge=0, allow_inf_nan=False)
+    end: float = Field(ge=0, allow_inf_nan=False)
+
+
 class SlicingReviewInput(SlicingItemActionInput):
     category: Literal["bed", "magnet"]
-    intervals: list[dict[str, float]] | None = Field(default=None, max_length=100)
+    intervals: list[SliceIntervalInput] | None = Field(default=None, max_length=100)
     confirmedNoTarget: bool = False
     intervalSeconds: int | None = Field(default=None, ge=1, le=86400)

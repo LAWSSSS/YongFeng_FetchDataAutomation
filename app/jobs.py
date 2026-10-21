@@ -155,7 +155,7 @@ class JobManager:
             raise ValueError("这批仍在提交，不能删除记录。")
         if not self.store.get(job_id):
             raise ValueError("提交记录不存在。")
-        self.store.delete(job_id)
+        self.store.remove_history(job_id)
 
     def launch(self, job: dict):
         job_id = job["id"]

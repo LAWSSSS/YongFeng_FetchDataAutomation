@@ -158,20 +158,55 @@ class UploadRemote:
     async def evidence(self, dataset, job):
         return await self.auth.job_evidence(dataset, job)
 
-    async def images(self, dataset):
+    async def images(self, dataset, *, prefix):
         if dataset not in PACKAGE_IDS:
             raise ValueError("切片照片清单只读取固定的两个导入数据集。")
-        rows, page = [], 1
-        while page <= 5:
+        if not isinstance(prefix, str) or not prefix:
+            raise ValueError("图片核验必须指定完整名称前缀。")
+        rows, seen, total, page = [], set(), None, 1
+        while page <= 10000:
             data, headers = await self.request("GET", f"devel/datasets/{dataset}/images/",
-                params={"namespace": 1, "page": page, "page_size": 100})
+                params={"namespace": 1, "page": page, "page_size": 100, "search": prefix})
             if not isinstance(data, list):
                 raise AuditError("切片照片清单格式异常。", "response")
-            rows.extend(row for row in data if isinstance(row, dict))
-            next_page = headers.get("x-next-page")
-            if not next_page or not str(next_page).strip() or str(next_page) in {"0", "-1"}:
+            try:
+                reported = int(headers["x-total"]) if headers.get("x-total") else None
+                next_page = int(headers.get("x-next-page") or 0) if "x-next-page" in headers else None
+            except (TypeError, ValueError):
+                raise AuditError("图片分页信息无效。", "pagination") from None
+            if page == 1:
+                total = reported
+            elif total != reported:
+                raise AuditError("图片清单正在变化，稍后继续核验。", "pagination")
+            for row in data:
+                if not isinstance(row, dict) or not str(row.get("id", "")).isdigit():
+                    raise AuditError("图片身份缺失。", "identity")
+                identity = str(row["id"])
+                bound = row.get("dataset")
+                bound = bound.get("id") if isinstance(bound, dict) else bound
+                name = str(row.get("name", row.get("fileName", "")))
+                if identity in seen or (bound is not None and str(bound) != dataset):
+                    raise AuditError("图片清单身份重复或目标不符。", "identity")
+                if name_key(prefix) not in name_key(name):
+                    raise AuditError("平台未按名称筛选，未接受无关图片。", "image_filter")
+                seen.add(identity)
+                rows.append(row)
+            if total is None and next_page is None:
+                raise AuditError("图片清单缺少分页凭证。", "pagination")
+            if next_page is not None:
+                if next_page <= 0:
+                    break
+                if next_page != page + 1 or not data:
+                    raise AuditError("图片分页不连续。", "pagination")
+            elif len(rows) >= total:
                 break
+            elif not data:
+                raise AuditError("图片清单不完整。", "pagination")
             page += 1
+        else:
+            raise AuditError("图片清单超过核验范围。", "pagination")
+        if total is not None and total != len(rows):
+            raise AuditError("图片清单数量不完整。", "pagination")
         return rows
 
 

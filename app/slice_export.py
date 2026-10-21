@@ -10,9 +10,14 @@ PACKAGE_DATASETS = {"bed": "27892", "magnet": "27893"}
 CATEGORY_FOLDERS = {"bed": "车斗", "magnet": "磁盘吊"}
 
 
-def package_directory(video_path, category):
-    """Photos and the zip live beside the source video, one folder per category."""
+def package_directory(video_path, category, *, output_root=None, video_id=None):
+    """Return a per-video category folder, optionally under a central output root."""
     video = Path(video_path)
+    if output_root is not None:
+        safe_stem = re.sub(r"[^\w.-]+", "_", video.stem, flags=re.UNICODE).strip("._-")[:120] or "video"
+        safe_id = re.sub(r"[^A-Za-z0-9_-]+", "_", str(video_id or "")).strip("_-")[:64]
+        identity = f"_{safe_id}" if safe_id else ""
+        return Path(output_root) / CATEGORY_FOLDERS[category] / f"{safe_stem}{identity}"
     return video.parent / video.stem / CATEGORY_FOLDERS[category]
 
 
@@ -102,7 +107,7 @@ def read_jpeg(path, ffmpeg, timestamp):
 
 
 def write_image_archive(destination, names, frames):
-    """Zip only an image/ directory. The archive name stays outside that directory."""
+    """Athena's unannotated image importer requires an images/ directory."""
     destination = Path(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_suffix(destination.suffix + ".partial")
@@ -112,6 +117,6 @@ def write_image_archive(destination, names, frames):
         for name, blob in zip(names, frames):
             if not blob.startswith(b"\xff\xd8"):
                 raise ValueError("切片照片不是 JPEG。")
-            archive.writestr(f"image/{name}", blob)
+            archive.writestr(f"images/{name}", blob)
     temporary.replace(destination)
     return destination

@@ -33,6 +33,7 @@ def merge_intervals(intervals: Iterable[tuple[float, float]], *, tolerance: floa
 
 def intervals_from_observations(
     observations: Iterable[dict], *, interval: int, duration: float, positive_labels: set[str],
+    undecodable_points: Iterable[float] = (),
 ) -> list[tuple[float, float]]:
     """Group adjacent positive samples, extending each run by one sample step."""
     if interval < 1 or duration <= 0:
@@ -50,7 +51,25 @@ def intervals_from_observations(
             runs[-1][1] = timestamp
         else:
             runs.append([timestamp, timestamp])
-    return merge_intervals((max(0.0, first - interval), min(duration, last + interval)) for first, last in runs)
+    windows = merge_intervals((max(0.0, first - interval), min(duration, last + interval)) for first, last in runs)
+    # During the explicit partial-recovery flow, do not let the normal one-step
+    # padding cross a timestamp that FFmpeg could not decode. Leave a small
+    # frame-sized guard around the failed timestamp. The regular algorithm
+    # remains unchanged when there are no undecodable points.
+    for bad in sorted(set(float(value) for value in undecodable_points)):
+        guard_start = max(0.0, bad - 0.05)
+        guard_end = min(duration, bad + 0.05)
+        split = []
+        for start, end in windows:
+            if end <= guard_start or start >= guard_end:
+                split.append((start, end))
+                continue
+            if start < guard_start:
+                split.append((start, max(start, guard_start - 0.05)))
+            if end > guard_end:
+                split.append((min(end, guard_end + 0.05), end))
+        windows = [(start, end) for start, end in split if end >= start]
+    return windows
 
 
 def expected_image_count(intervals: Iterable[tuple[float, float]], seconds: int) -> int:
@@ -94,9 +113,11 @@ def category_image_target(settings: dict, category: str) -> int:
 def build_category_result(
     observations: Iterable[dict], *, interval: int, duration: float, positive_labels: set[str],
     target: int = 150, minimum: int = 100, maximum: int = 200,
+    undecodable_points: Iterable[float] = (),
 ) -> dict:
     windows = intervals_from_observations(observations, interval=interval, duration=duration,
-                                          positive_labels=positive_labels)
+                                          positive_labels=positive_labels,
+                                          undecodable_points=undecodable_points)
     picked = choose_slice_interval(windows, target=target, minimum=minimum, maximum=maximum)
     return {"intervals": [{"start": start, "end": end} for start, end in windows],
             "intervalSeconds": picked["interval"], "estimatedImages": picked["count"],

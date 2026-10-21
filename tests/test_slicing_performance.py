@@ -147,6 +147,81 @@ async def test_platform_checks_continue_during_analysis_and_only_one_local_worke
 
 
 @pytest.mark.asyncio
+async def test_local_slicing_uses_configured_parallel_workers_for_distinct_files(tmp_path, monkeypatch):
+    app = create_app(data_dir=tmp_path)
+    manager = app.state.slicing
+    manager.auth.access = "test-token"
+    manager.store.settings["enabled"] = True
+    manager.store.settings["maxLocalSlicingProcesses"] = 2
+    release = asyncio.Event()
+    started = []
+
+    for identity in ("first", "second", "third"):
+        manager.store.save("items", {"id": identity, "state": "pending",
+            "path": str(tmp_path / f"{identity}.mp4"), "fileVersion": {"size": 1, "edgeHash": identity},
+            "sourceDatasetId": "27912", "sourceVideoId": identity, "revision": 0,
+            "categories": {"bed": {"state": "pending"}, "magnet": {"state": "not_applicable"}}})
+
+    async def analyze(item, _candidates):
+        started.append(item["id"])
+        await release.wait()
+        current = manager.store.get("items", item["id"])
+        current.update(state="complete", categories={"bed": {"state": "complete"},
+                                                       "magnet": {"state": "not_applicable"}})
+        manager.store.save("items", current)
+
+    async def poll(**_kwargs):
+        return None
+
+    monkeypatch.setattr(manager, "_process_shared", analyze)
+    monkeypatch.setattr(manager, "_reconcile_waiting", poll)
+    await manager._tick()
+    await asyncio.sleep(0)
+    assert len(started) == 2
+    assert len(manager.analysis_tasks) == 2
+    assert manager.state()["localWorkers"] == {"active": 2, "processes": 0, "max": 2, "queued": 1}
+
+    first_wave = list(manager.analysis_tasks.values())
+    release.set()
+    await asyncio.gather(*first_wave)
+    await manager._tick()
+    await asyncio.sleep(0)
+    assert started == ["first", "second", "third"]
+    await asyncio.gather(*list(manager.analysis_tasks.values()), return_exceptions=True)
+    await close_app(app)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_worker_requeues_only_its_physical_video_peers(tmp_path):
+    app = create_app(data_dir=tmp_path)
+    manager = app.state.slicing
+    path = str(tmp_path / "shared.mp4")
+    version = {"size": 1, "edgeHash": "same"}
+    for identity, source, state in (("bed", "27912", "analyzing"),
+                                    ("magnet", "27944", "analyzing"),
+                                    ("other", "27912", "analyzing")):
+        manager.store.save("items", {"id": identity, "state": state,
+            "path": path if identity != "other" else str(tmp_path / "other.mp4"),
+            "fileVersion": version if identity != "other" else {"size": 1, "edgeHash": "other"},
+            "sourceDatasetId": source, "sourceVideoId": identity, "revision": 0,
+            "categories": {"bed": {"state": "pending"}, "magnet": {"state": "pending"}}})
+
+    task = asyncio.create_task(asyncio.Event().wait())
+    manager.analysis_tasks["bed"] = task
+    manager.analysis_video_keys["bed"] = manager._analysis_video_key(manager.store.get("items", "bed"))
+    manager.analysis_task = task
+    task.add_done_callback(lambda finished: manager._analysis_finished("bed", finished))
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    await asyncio.sleep(0)
+
+    assert manager.store.get("items", "bed")["state"] == "pending"
+    assert manager.store.get("items", "magnet")["state"] == "pending"
+    assert manager.store.get("items", "other")["state"] == "analyzing"
+    await close_app(app)
+
+
+@pytest.mark.asyncio
 async def test_scan_reuses_completed_logs_but_refreshes_active_logs(tmp_path, monkeypatch):
     app = create_app(data_dir=tmp_path); manager = app.state.slicing
     manager.auth.access = "test-token"; remote = FakeSlicingRemote(); manager.remote = remote

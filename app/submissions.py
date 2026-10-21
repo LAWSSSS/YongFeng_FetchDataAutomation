@@ -9,7 +9,16 @@ class SubmissionLog:
     def __init__(self, db):
         self.db = db
         db.execute("CREATE TABLE IF NOT EXISTS simple_submissions (id TEXT PRIMARY KEY, payload TEXT NOT NULL)")
+        db.execute("CREATE TABLE IF NOT EXISTS simple_submission_hidden_jobs (id TEXT PRIMARY KEY)")
         db.commit()
+
+    def import_jobs(self, jobs, describe):
+        """Backfill once at startup; hiding a receipt must survive the next restart."""
+        known = {(row.get("detail") or {}).get("jobId") for row in self.list("collection")}
+        hidden = {row[0] for row in self.db.execute("SELECT id FROM simple_submission_hidden_jobs")}
+        for job in jobs:
+            if job["id"] not in known | hidden and not job.get("deletedAt"):
+                self.add("collection", "采集提交", describe(job), submitted_at=job.get("createdAt") or "")
 
     def add(self, kind, title, detail, request_id="", submitted_at=""):
         if request_id:
@@ -32,5 +41,9 @@ class SubmissionLog:
         return sorted(rows, key=lambda row: row.get("submittedAt") or "", reverse=True)
 
     def delete(self, identity):
+        row = self.get(identity)
+        job_id = (row.get("detail") or {}).get("jobId") if row else None
+        if job_id:
+            self.db.execute("INSERT OR IGNORE INTO simple_submission_hidden_jobs VALUES(?)", (job_id,))
         self.db.execute("DELETE FROM simple_submissions WHERE id=?", (identity,))
         self.db.commit()

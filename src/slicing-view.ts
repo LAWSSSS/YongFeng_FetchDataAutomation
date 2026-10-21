@@ -1,5 +1,19 @@
 type SliceItem = {name: string; sourceDatasetId: string; sourceVideoId: string; state: string;
-  categories: Record<string, {state: string}>};
+  categories: Record<string, {state: string; packageId?: string; taskId?: string}>};
+
+export function physicalCategories<T extends SliceItem>(records: T[], source = 'all') {
+  return (['bed','magnet'] as const).flatMap(categoryName => {
+    if (source !== 'all' && source !== (categoryName === 'bed' ? '27912' : '27944')) return [];
+    const candidates = records.filter(item => item.categories[categoryName] && item.categories[categoryName].state !== 'not_applicable');
+    const score = (item: T) => {
+      const category = item.categories[categoryName];
+      return (category.packageId || category.taskId ? 100 : 0) + (category.state !== 'pending' ? 10 : 0) +
+        (item.sourceDatasetId === (categoryName === 'bed' ? '27912' : '27944') ? 1 : 0);
+    };
+    const item = candidates.sort((a,b) => score(b)-score(a))[0];
+    return item ? [{item,categoryName,category:item.categories[categoryName]}] : [];
+  });
+}
 
 export function sliceTitle(name: string) {
   const match = name.match(/^(.+)_(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})_/);
@@ -26,12 +40,15 @@ export function slicePage<T extends SliceItem>(items: T[], options: {
 }) {
   const needle = options.search.trim().toLocaleLowerCase();
   const filtered = items.filter(item => {
-    const statuses = Object.values(item.categories).map(category => category.state);
+    const selectedCategory = options.source === 'all' ? undefined : options.source === '27912' ? 'bed' : 'magnet';
+    const values = selectedCategory ? [item.categories[selectedCategory]].filter(Boolean) : Object.values(item.categories);
+    const statuses = values.map(category => category.state).filter(state => state !== 'not_applicable');
     const finished = item.state === 'complete' || item.state === 'no_target';
-    const matching = options.status === 'all' || item.state === options.status ||
+    const matching = options.status === 'all' || (selectedCategory ? statuses.includes(options.status) : item.state === options.status) ||
       (options.status === 'unsliced' && !finished) ||
-      (options.status === 'platform_processing' && statuses.some(state => ['ready','waiting_slot','waiting','submitting'].includes(state)));
-    return matching && (options.source === 'all' || item.sourceDatasetId === options.source) &&
+      (options.status === 'analyzing' && item.state === 'analyzing' && statuses.includes('pending')) ||
+      (options.status === 'platform_processing' && statuses.some(state => ['ready','exporting','waiting_slot','waiting','submitting','queued','uploading','uploaded','importing'].includes(state)));
+    return matching && (options.source === 'all' || statuses.length > 0) &&
       (!needle || (item.name + ' ' + item.sourceVideoId).toLocaleLowerCase().includes(needle));
   });
   const pageSize = Math.max(1, Math.floor(options.pageSize));

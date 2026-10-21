@@ -112,19 +112,28 @@ class SharedSlicingAnalysis:
                 for name in active:
                     observations = self._category_observations(work, name, points, keys[name], fingerprints[name])
                     category = work['categories'][name]
-                    result = build_category_result(observations, interval=interval, duration=metadata['duration'],
-                        positive_labels={'target'}, target=category_image_target(self.store.settings, name))
+                    partial = bool(work.get('partialRecovery'))
+                    unavailable = [row for row in observations if row.get('code') == 'decode_unavailable']
+                    valid = [row for row in observations if row.get('code') != 'decode_unavailable']
+                    result = build_category_result(valid, interval=interval, duration=metadata['duration'],
+                        positive_labels={'target'}, target=category_image_target(self.store.settings, name),
+                        undecodable_points=[row['time'] for row in unavailable] if partial else ())
                     category.update(intervals=result['intervals'], intervalSeconds=result['intervalSeconds'],
-                        estimatedImages=result['estimatedImages'], observations=len(observations),
+                        estimatedImages=result['estimatedImages'], observations=len(valid),
                         samplingIntervalSeconds=interval, modelFingerprint=fingerprints[name],
-                        targetDatasetId=self.store.settings['targetDatasetIds'][peers[name]['sourceDatasetId']])
-                    uncertain = next((row for row in observations if row.get('code') or row['label'] == 'uncertain'), None)
+                        targetDatasetId=self.store.settings['targetDatasetIds'][peers[name]['sourceDatasetId']],
+                        partialRecovery=partial, skippedSamples=len(unavailable))
+                    uncertain = next((row for row in valid if row.get('code') or row['label'] == 'uncertain'), None)
                     if category.get('state') == 'attention':
                         continue
-                    if len(observations) != len(points):
+                    if partial and not valid:
+                        code = 'no_decodable_samples'
+                    elif len(valid) + len(unavailable) != len(points):
                         code = 'observations_incomplete'
                     elif uncertain:
                         code = uncertain.get('code') or 'bed_alignment_uncertain'
+                    elif partial and any(row['label'] == 'target' for row in valid) and not result['intervals']:
+                        code = 'no_cuttable_fragments'
                     elif result['tooMany']:
                         code = 'slice_limit'
                     else:
@@ -133,7 +142,9 @@ class SharedSlicingAnalysis:
                         category.update(state='attention', errorCode=code, message=ERROR_TEXT.get(code, ERROR_TEXT['inference_failed']))
                     else:
                         category.update(state='ready' if result['intervals'] else 'no_target', errorCode='',
-                                        message='等待平台空位。' if result['intervals'] else '未检出目标')
+                                        message=('仅处理可解码片段；损坏位置已跳过。' if partial and result['intervals'] else
+                                                 '可解码片段未检出目标，损坏位置已跳过。' if partial else
+                                                 '等待平台空位。' if result['intervals'] else '未检出目标'))
                 self._save_analysis_item(work)
                 magnet = work['categories'].get('magnet', {})
                 if phase == 'refine' or 'magnet' not in fingerprints or magnet.get('state') == 'attention' or 100 <= (magnet.get('estimatedImages') or 0) <= 200:

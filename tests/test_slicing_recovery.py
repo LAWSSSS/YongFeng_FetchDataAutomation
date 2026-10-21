@@ -93,6 +93,29 @@ async def test_idle_retry_really_starts_only_that_video_and_replays_safely(tmp_p
 
 
 @pytest.mark.asyncio
+async def test_partial_recovery_queues_only_media_incomplete_items_once(tmp_path, monkeypatch):
+    app = create_app(data_dir=tmp_path / "data"); manager = app.state.slicing
+    prepare_run(manager, monkeypatch)
+    item = item_fixture(tmp_path)
+    item.update(errorCode="media_incomplete", message="末段不可解码")
+    item["categories"]["bed"].update(errorCode="media_incomplete", message="末段不可解码")
+    manager.store.save("items", item)
+    other = item_fixture(tmp_path, "other")
+    other.update(errorCode="frame_extract_failed")
+    manager.store.save("items", other)
+
+    state = manager.recover_decodable_all(0, "partial-all")
+    recovered = manager.store.get("items", item["id"])
+    untouched = manager.store.get("items", other["id"])
+    assert state["enabled"] and state["run"]["executeAll"] and not state["run"]["singleMode"]
+    assert recovered["state"] == "pending" and recovered["partialRecovery"]
+    assert recovered["categories"]["bed"]["state"] == "pending"
+    assert untouched["state"] == "attention" and not untouched.get("partialRecovery")
+    assert manager.recover_decodable_all(0, "partial-all")["enabled"]
+    await close_app(app)
+
+
+@pytest.mark.asyncio
 async def test_another_single_video_can_start_after_last_selected_video_failed(tmp_path, monkeypatch):
     app = create_app(data_dir=tmp_path / "data"); manager = app.state.slicing
     prepare_run(manager, monkeypatch)

@@ -25,6 +25,10 @@ from .models import (BulkVideoInput, CollectionRule, CorrectionInput, DirectoryI
                      LoginInput, PreviewInput, RecordRemoveInput, SearchInput, SubmitInput, VersionActionInput,
                      UploadAuditInput, UploadAuditLoginInput, AuditMovePreviewInput, AuditMoveConfirmInput)
 from .models import AdmissionSettingsInput, UploadScanInput
+from .models import FileCleanupInput
+from .models import SliceClassifyConfirmInput
+from .slice_classify import SliceClassification
+from .original_restore import OriginalRestoreManager
 from .models import (SlicingSettingsInput, SlicingScanInput, SlicingStartInput,
                      SlicingItemActionInput, SlicingBindInput, SlicingReviewInput)
 from .remote import RemoteClient, RemoteError
@@ -79,7 +83,9 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
     uploads = UploadManager(store, upload_audit, leases, remote=upload_remote, worker=upload_worker,
                             file_check=upload_file_check)
     slicing = SlicingManager(store, upload_audit.client, data_dir, leases, remote=slicing_remote)
+    slice_classification = SliceClassification(slicing.packages)
     files = FileIndex(store, videos, uploads, slicing, audit_moves, leases)
+    original_restore = OriginalRestoreManager(store.db, uploads, slicing, leases)
     slicing.files = files
     files.refresh()
     searches: dict[str, dict] = {}
@@ -117,11 +123,16 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
         await videos.start()
         await uploads.start()
         await slicing.startup()
+        await original_restore.startup()
+        # Reconcile only legacy rows that were already archived as complete;
+        # pending/attention items and restoration targets stay in place.
+        files.schedule(slicing.wake.set, archive_only=True)
         yield
         for task in search_tasks:
             task.cancel()
         if search_tasks:
             await asyncio.gather(*search_tasks, return_exceptions=True)
+        await original_restore.shutdown()
         await slicing.shutdown()
         await uploads.shutdown()
         await audit_moves.shutdown()
@@ -139,6 +150,7 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
     application.state.store = store
     application.state.upload_audit = upload_audit
     application.state.audit_moves = audit_moves
+    application.state.original_restore = original_restore
     application.state.admission_settings = admission_settings
     application.state.uploads = uploads
     application.state.slicing = slicing
@@ -149,13 +161,19 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
     async def local_only(request: Request, call_next):
         if request.url.path.startswith("/api/"):
             origin = request.headers.get("origin")
-            if origin and origin != f"{request.url.scheme}://{request.url.netloc}":
+            if (request.headers.get("sec-fetch-site") == "cross-site"
+                    or (origin and origin != f"{request.url.scheme}://{request.url.netloc}")):
                 return JSONResponse({"message": "仅允许本地网页访问此接口。"}, status_code=403)
             if request.method in ("POST", "PUT", "PATCH") and "application/json" not in request.headers.get("content-type", ""):
                 return JSONResponse({"message": "请求必须使用 JSON。"}, status_code=415)
         response = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' blob: data:; media-src 'self' blob:; connect-src 'self'; "
+            "object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'")
         if request.url.path.startswith("/api/"):
             response.headers["Cache-Control"] = "no-store"
         return response
@@ -207,8 +225,8 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
 
     @application.post("/api/upload-audit/login")
     async def upload_audit_login(payload: UploadAuditLoginInput):
-        slicing_reconnecting = slicing.run and slicing.run.get("state") == "waiting_connection"
-        if upload_audit.busy or uploads.busy or (slicing.busy and not slicing_reconnecting):
+        reconnecting = not upload_audit.client.connected
+        if not reconnecting and (upload_audit.busy or uploads.busy or slicing.busy or slicing.packages.running):
             raise ValueError("切片、核对或上传正在进行，请先暂停对应队列再切换视觉AI账号。")
         await upload_audit.client.login(payload.account, payload.password)
         uploads.wake.set()
@@ -233,6 +251,24 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
     @application.get("/api/uploads")
     async def upload_state():
         return uploads.state()
+
+    @application.get("/api/original-restore")
+    async def original_restore_state(request: Request):
+        if not request.client or request.client.host not in {"127.0.0.1", "::1"}:
+            raise HTTPException(403, "仅允许本机访问。")
+        return original_restore.state()
+
+    @application.post("/api/original-restore/start", status_code=202)
+    async def original_restore_start(request: Request):
+        if not request.client or request.client.host not in {"127.0.0.1", "::1"}:
+            raise HTTPException(403, "仅允许本机访问。")
+        try:
+            payload = await request.json()
+        except Exception:
+            raise ValueError("恢复请求格式无效。") from None
+        if not isinstance(payload, dict) or set(payload) != {"requestId"}:
+            raise ValueError("恢复请求格式无效。")
+        return await original_restore.start(payload["requestId"])
 
     @application.post("/api/uploads/check-connection")
     async def check_upload_connection():
@@ -292,13 +328,10 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
                            "endTime": item.get("endTime") or "", "status": item.get("status") or "",
                            "camera": item.get("cameraName") or ""} for item in job.get("items") or []]}
 
+    submissions.import_jobs(store.list(), _collection_record)
+
     @application.get("/api/submissions")
     async def submission_list(kind: str = ""):
-        if kind in ("", "collection"):
-            known = {((row.get("detail") or {}).get("jobId")) for row in submissions.list("collection")}
-            for job in store.list():
-                if job["id"] not in known:
-                    submissions.add("collection", "采集提交", _collection_record(job), submitted_at=job.get("createdAt") or "")
         rows = []
         for row in submissions.list(kind):
             detail = row.get("detail") or {}
@@ -315,9 +348,7 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
         row = submissions.get(identity)
         if not row:
             raise HTTPException(404, "记录不存在。")
-        job_id = (row.get("detail") or {}).get("jobId")
-        if job_id and store.get(job_id):
-            jobs.remove(job_id)
+        # A presentation log is not the durable task/identity ledger.
         submissions.delete(identity)
         return {"ok": True}
 
@@ -334,29 +365,35 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
     async def archive_retry(identity: str):
         return await files.retry(identity)
 
+    @application.post("/api/files/{identity}/cleanup-confirmed")
+    async def cleanup_confirmed_files(identity: str, payload: FileCleanupInput):
+        return await files.cleanup_confirmed(identity, payload.requestId)
+
     @application.post("/api/slicing/classify/preview")
     async def preview_slice_classification(payload: DirectoryInput):
-        from .slice_classify import plan_moves
-        return plan_moves(slicing.packages.store.list("items"), payload.directory)
+        return slice_classification.preview(payload.directory)
 
     @application.post("/api/slicing/classify/confirm")
-    async def confirm_slice_classification(payload: DirectoryInput):
-        from .slice_classify import apply_moves, plan_moves
-        plan = plan_moves(slicing.packages.store.list("items"), payload.directory)
-        result = apply_moves(plan)
-        for item in slicing.packages.store.list("items"):
-            path = item.get("path")
-            if not path:
-                continue
-            for destination in result["moved"]:
-                if Path(destination).name == Path(path).name:
-                    item["path"] = destination
-                    slicing.packages.store.save("items", item)
-        return {**plan, **result}
+    async def confirm_slice_classification(payload: SliceClassifyConfirmInput):
+        return await slice_classification.confirm(payload.planId, payload.requestId, payload.expectedRevision)
 
     @application.post("/api/slicing/packages/{identity}/confirm")
     async def confirm_slice_package(identity: str):
         return slicing.confirm_package(identity)
+
+    @application.post("/api/slicing/packages/pause")
+    async def pause_slice_package_uploads():
+        slicing.packages.pause()
+        return slicing.state()
+
+    @application.post("/api/slicing/packages/resume")
+    async def resume_slice_package_uploads():
+        slicing.packages.resume()
+        return slicing.state()
+
+    @application.post("/api/slicing/packages/{identity}/retry")
+    async def retry_slice_package(identity: str, payload: SlicingItemActionInput):
+        return await slicing.retry_package(identity, payload.model_dump())
 
     @application.get("/api/slicing/packages/{identity}/images/{name}")
     async def slice_package_image(identity: str, name: str):
@@ -387,9 +424,17 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
     async def slicing_resume(payload: SlicingScanInput):
         return slicing.resume(payload.requestId)
 
+    @application.post("/api/slicing/recover-decodable-all", status_code=202)
+    async def slicing_recover_decodable_all(payload: SlicingItemActionInput):
+        return slicing.recover_decodable_all(payload.expectedRevision, payload.requestId)
+
     @application.post("/api/slicing/{identity}/retry", status_code=202)
     async def slicing_retry(identity: str, payload: SlicingItemActionInput):
         return slicing.retry(identity, payload.expectedRevision, payload.requestId)
+
+    @application.post("/api/slicing/{identity}/recover-decodable", status_code=202)
+    async def slicing_recover_decodable(identity: str, payload: SlicingItemActionInput):
+        return slicing.retry(identity, payload.expectedRevision, payload.requestId, recover_decodable=True)
 
     @application.post("/api/slicing/{identity}/bind")
     async def slicing_bind(identity: str, payload: SlicingBindInput):
@@ -614,7 +659,7 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
 
     @application.get("/api/jobs")
     async def job_list(request: Request, summary: bool = False):
-        rows = store.list()
+        rows = [row for row in store.list() if not row.get("deletedAt")]
         if not summary:
             return state_response(rows, request)
         result = [{key: row[key] for key in ("id", "status", "createdAt", "downloadAfterCollection", "deletedAt")

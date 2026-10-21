@@ -8,6 +8,7 @@ import pytest
 
 from app.main import create_app
 from app.slicing import source_version
+from app.audit_moves import source_fingerprint
 from app.upload_audit import AuditError
 from app.videos import Conflict
 from tests.test_slicing import FakeSlicingRemote
@@ -145,7 +146,10 @@ async def test_archive_after_both_categories_updates_all_bindings(environment,tm
     manager.store.settings['directories']=[str(root)]
     files=app.state.files
     await files.tick()
-    destination=root/'已上传'/folder/'day'/'bed.mp4'
+    # All resolved originals share one central archive folder; source-day
+    # subdirectories are intentionally flattened for easier management.
+    destination=(root/folder/'bed.mp4' if folder == '切片完成'
+                 else root/folder/'day'/'bed.mp4')
     assert destination.exists() and not Path(bed['path']).exists()
     for identity in ('bed','magnet'):
         item=manager.store.get('items',identity)
@@ -155,6 +159,60 @@ async def test_archive_after_both_categories_updates_all_bindings(environment,tm
     assert files.state()['counts']['complete']==1
     await files.tick()
     assert len(files.rows('file_moves'))==1
+    await close_app(app)
+
+
+@pytest.mark.asyncio
+async def test_cleanup_deletes_only_verified_original_and_program_photo_files(environment,tmp_path):
+    app, manager = environment
+    root = tmp_path / '视频'
+    root.mkdir()
+    pair(manager, root, ('complete', 'no_target'))
+    manager.store.settings['directories'] = [str(root)]
+    await app.state.files.tick()
+
+    archive = root / '切片完成' / 'bed.mp4'
+    assert archive.is_file()
+    output = tmp_path / 'slice-output'
+    image_dir = output / 'bed' / '101' / 'image'
+    image_dir.mkdir(parents=True)
+    photo = image_dir / 'bed_001.jpg'
+    photo.write_bytes(b'program generated image')
+    zip_file = image_dir.parent / 'bed.zip'
+    zip_file.write_bytes(b'program generated archive')
+    unrelated = output / 'keep.txt'
+    unrelated.write_text('unrelated file')
+    manager.store.settings['sliceOutputDirectory'] = str(output)
+    manager.packages.store.save('items', {
+        'id': 'verified-bed-package', 'itemId': 'bed', 'category': 'bed', 'state': 'complete',
+        'path': str(zip_file), 'fileVersion': source_fingerprint(zip_file),
+        'imageDir': str(image_dir), 'images': [photo.name],
+        'imageVersions': {photo.name: source_fingerprint(photo)},
+    })
+
+    files = app.state.files
+    row = next(item for item in files.refresh() if item['path'] == str(archive))
+    await files.cleanup_confirmed(row['id'], 'cleanup-confirmed')
+    assert not archive.exists() and not photo.exists() and not zip_file.exists()
+    assert unrelated.read_text() == 'unrelated file'
+    assert next(item for item in files.rows('files') if item['id'] == row['id'])['cleanup']['state'] == 'complete'
+    await close_app(app)
+
+
+@pytest.mark.asyncio
+async def test_cleanup_holds_original_when_a_cut_category_has_no_verified_package(environment,tmp_path):
+    app, manager = environment
+    root = tmp_path / '视频'
+    root.mkdir()
+    bed, _magnet = pair(manager, root, ('complete', 'no_target'))
+    manager.store.settings['directories'] = [str(root)]
+    await app.state.files.tick()
+    archive = root / '切片完成' / 'bed.mp4'
+    row = next(item for item in app.state.files.refresh() if item['path'] == str(archive))
+
+    with pytest.raises(ValueError, match='缺少已核验的图片包'):
+        await app.state.files.cleanup_confirmed(row['id'], 'cleanup-without-package')
+    assert archive.is_file()
     await close_app(app)
 
 
@@ -173,6 +231,64 @@ async def test_archive_conflict_never_overwrites_and_lease_defers(environment,tm
     destination.unlink()
     await files.retry(files.rows('files')[0]['id'])
     assert destination.exists() and files.state()['counts']['complete']==1
+    await close_app(app)
+
+
+@pytest.mark.asyncio
+async def test_legacy_completed_archives_migrate_to_one_flat_folder(environment,tmp_path):
+    app,manager=environment
+    root=tmp_path/'视频'
+    legacy=root/'已上传'/'切片完成'/'day'
+    legacy.mkdir(parents=True)
+    bed,magnet=pair(manager,legacy,('complete','complete'))
+    manager.store.settings['directories']=[str(root)]
+    files=app.state.files
+    row=next(value for value in files.refresh() if value['path']==bed['path'])
+    row.update(archiveState='complete',archiveKind='complete',archivePath=bed['path'])
+    files.save('files',row)
+
+    files.schedule(lambda:None,archive_only=True)
+    await files.task
+    destination=root/'切片完成'/'bed.mp4'
+    assert destination.is_file() and not Path(bed['path']).exists()
+    assert files.rows('file_moves')[0]['state']=='complete'
+    moved=manager.store.get('items','bed')
+    assert moved['path']==str(destination)
+    assert manager.store.get('items','magnet')['path']==str(destination)
+    await close_app(app)
+
+
+@pytest.mark.asyncio
+async def test_archive_classification_flattens_legacy_upload_wrappers(environment, tmp_path):
+    app, manager = environment
+    root = tmp_path / 'video-root'
+    source = root / '已上传' / '磁盘吊未上传' / '2026-10-05' / 'camera' / 'clip.mp4'
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b'video')
+    manager.store.settings['directories'] = [str(root)]
+    files = app.state.files
+
+    assert files.destination(str(source), 'complete', manager.store.settings) == root / '切片完成' / 'clip.mp4'
+    assert files.destination(str(source), 'empty', manager.store.settings) == (
+        root / '未检出目标' / '2026-10-05' / 'camera' / 'clip.mp4')
+    await close_app(app)
+
+
+@pytest.mark.asyncio
+async def test_one_bound_record_can_archive_when_both_category_results_are_verified(environment,tmp_path):
+    app,manager=environment
+    root=tmp_path/'视频';root.mkdir()
+    item=item_fixture(root,'single-source','complete')
+    item.update(sourceDatasetId='27944',errorCode='')
+    item['categories']['bed'].update(state='complete',actualImages=120,errorCode='')
+    item['categories']['magnet'].update(state='complete',actualImages=150,errorCode='')
+    manager.store.save('items',item)
+    manager.store.settings['directories']=[str(root)]
+
+    await app.state.files.tick()
+    destination=root/'切片完成'/Path(item['path']).name
+    assert destination.is_file() and not Path(item['path']).exists()
+    assert manager.store.get('items',item['id'])['path']==str(destination)
     await close_app(app)
 
 
@@ -520,7 +636,7 @@ async def test_single_archive_never_moves_unrelated_files(environment,tmp_path):
     files=app.state.files
     files.schedule(lambda:None,item_id='first-bed')
     await files.task
-    assert (tmp_path/'切片完成'/'one'/'bed.mp4').exists()
+    assert (tmp_path/'切片完成'/'bed.mp4').exists()
     assert (second_dir/'bed.mp4').exists()
     assert not (tmp_path/'切片完成'/'two').exists()
     await close_app(app)
@@ -551,12 +667,12 @@ async def test_archive_updates_nested_audit_paths_and_later_classification_keeps
     pair(manager,nested,('complete','complete'))
     report_for(app,tmp_path,recursive=True)
     await app.state.files.tick()
-    destination=tmp_path/'切片完成'/'day'/'bed.mp4'
+    destination=tmp_path/'切片完成'/'bed.mp4'
     report=app.state.upload_audit.saved['report']
     record=next(row for row in report['files'] if row['name']=='bed.mp4')
     assert record['localMove']['path']==str(destination)
     preview=inspect_plan(report,str(tmp_path/'已上传'),str(tmp_path/'磁盘吊未上传'),str(tmp_path/'车斗未上传'))
     row=next(row for row in preview['items'] if row['relativePath']=='day/bed.mp4')
     assert row['state']=='planned'
-    assert row['destination']==str(tmp_path/'已上传'/'切片完成'/'day'/'bed.mp4')
+    assert row['destination']==str(tmp_path/'已上传'/'切片完成'/'bed.mp4')
     await close_app(app)

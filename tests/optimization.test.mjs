@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {createPoller} from '../src/usePolling.ts';
-import {slicePage,sliceTitle,slicingControls} from '../src/slicing-view.ts';
+import {physicalCategories,slicePage,sliceTitle,slicingControls} from '../src/slicing-view.ts';
 
 test('slicing controls allow another video after a failed single run without a dead resume button',()=>{
   const state={enabled:false,busy:false,run:{state:'attention',singleMode:true,singleItemId:'failed'},
@@ -56,7 +56,7 @@ test('unsliced videos stay listed until the cut is finished',()=>{
 
 test('slicing filters compose before pagination and shrinking results clamp the page',()=>{
   const rows=Array.from({length:117},(_,index)=>({name:'视频 '+index,sourceVideoId:String(index),
-    sourceDatasetId:index%2 ? '27912':'27944',state:index<100 ? 'pending':'complete',categories:{bed:{state:'pending'}}}));
+    sourceDatasetId:index%2 ? '27912':'27944',state:index<100 ? 'pending':'complete',categories:{[index%2 ? 'bed':'magnet']:{state:index<100 ? 'pending':'complete'}}}));
   const options={status:'all',source:'all',search:'',page:2,pageSize:12};
   assert.equal(slicePage(rows,options).rows[0].sourceVideoId,'12');
   assert.equal(slicePage(rows,options).pages,10);
@@ -79,4 +79,22 @@ test('one completed category does not label the whole file complete',async()=>{
   assert.equal(physicalState([{state:'complete'},{state:'attention'}]),'attention');
   assert.equal(physicalState([{state:'complete'},{state:'no_target'}]),'complete');
   assert.equal(physicalState([{state:'no_target'},{state:'no_target'}]),'no_target');
+});
+
+test('both models on one source are visible and filters follow category progress',()=>{
+  const item={id:'one',name:'video',sourceDatasetId:'27912',sourceVideoId:'42',state:'attention',
+    categories:{bed:{state:'complete',packageId:'bed-package'},magnet:{state:'attention',packageId:'magnet-package'}}};
+  assert.deepEqual(physicalCategories([item]).map(row=>row.categoryName),['bed','magnet']);
+  const options={status:'complete',source:'27912',search:'',page:1,pageSize:12};
+  assert.equal(slicePage([item],options).total,1);
+  assert.equal(slicePage([item],{...options,source:'27944'}).total,0);
+  assert.equal(slicePage([item],{...options,source:'27944',status:'attention'}).total,1);
+  assert.equal(physicalCategories([item],'27944')[0].categoryName,'magnet');
+});
+
+test('physical category selection prefers existing receipts over a pending duplicate',()=>{
+  const base={name:'video',sourceDatasetId:'27912',sourceVideoId:'42',state:'pending'};
+  const pending={...base,id:'a',categories:{bed:{state:'pending'},magnet:{state:'not_applicable'}}};
+  const complete={...base,id:'b',categories:{bed:{state:'complete',packageId:'existing'},magnet:{state:'not_applicable'}}};
+  assert.deepEqual(physicalCategories([pending,complete]).map(row=>row.item.id),['b']);
 });

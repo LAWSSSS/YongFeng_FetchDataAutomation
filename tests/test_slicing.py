@@ -12,7 +12,7 @@ from app.slicing_core import (build_category_result, choose_slice_interval, expe
                               intervals_from_observations, merge_intervals, sample_points)
 from app.slicing import data_category, normalize_dataset_name, source_version, target_dataset_identity_matches
 from app.slicing_remote import SlicingRemote, source_video_ids, target_dataset_id, task_state
-from app.slicing_worker import extract_requested_frames, probe
+from app.slicing_worker import FrameExtractionError, extract_requested_frames, probe
 from app.upload_audit import AthenaClient, AuditError
 
 
@@ -31,6 +31,34 @@ def test_adjacent_positive_samples_expand_and_merge_at_video_edges():
     assert intervals_from_observations(observations, interval=30, duration=200,
                                        positive_labels={"target"}) == [(0.0, 120.0), (150.0, 200.0)]
     assert merge_intervals([(0, 3), (3, 7), (9, 10)]) == [(0.0, 7.0), (9.0, 10.0)]
+
+
+def test_partial_recovery_keeps_good_fragments_away_from_undecodable_points():
+    rows = [{"time": 0, "label": "target"}, {"time": 30, "label": "unavailable"},
+            {"time": 60, "label": "target"}]
+    assert intervals_from_observations(rows, interval=30, duration=90, positive_labels={"target"},
+                                       undecodable_points=[30]) == [(0.0, 29.9), (30.1, 90.0)]
+
+
+def test_salvage_frame_sampling_skips_bad_positions_without_shifting_timestamps(tmp_path, monkeypatch):
+    source = tmp_path / "source.mp4"; source.write_bytes(b"source")
+    ffmpeg = tmp_path / "ffmpeg"; ffmpeg.write_text("stub"); ffmpeg.chmod(0o755)
+
+    def fake_jpeg_frames(command):
+        if "-ss" in command:
+            timestamp = float(command[command.index("-ss") + 1])
+            if timestamp == 30:
+                raise FrameExtractionError(timestamp=timestamp)
+            yield b"\xff\xd8frame\xff\xd9"
+        else:
+            raise FrameExtractionError("media_incomplete")
+
+    monkeypatch.setattr("app.slicing_worker.jpeg_frames", fake_jpeg_frames)
+    result = list(extract_requested_frames(str(source), str(ffmpeg),
+        {"duration": 61, "frameRate": 25}, {"bed": [0, 30, 60, 60.96]}, skip_undecodable=True))
+    assert [timestamp for timestamp, _ in result] == [0, 30, 60, 60.96]
+    assert result[1][1] is None and result[3][1] is None
+    assert result[0][1] is not None and result[2][1] is not None
 
 
 def test_interval_counts_include_each_segment_start_and_target_around_150():
