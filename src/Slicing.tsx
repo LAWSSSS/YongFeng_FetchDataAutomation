@@ -323,11 +323,11 @@ export default function Slicing({onConnect}: {onConnect: () => void}) {
         {recoverableCount > 0 && <button className="secondary" disabled={!state.connected || !!busy || state.busy || settingsDirty || settingsStale} onClick={() => void run('recover-decodable', () => request('/recover-decodable-all',{requestId:uid(),expectedRevision:state.settingsRevision}), `正在恢复 ${recoverableCount} 个视频的可解码片段。`)}>恢复可解码片段 · {recoverableCount}</button>}
         <button className="secondary" disabled={!state.enabled || !!busy} onClick={() => void run('pause', () => request('/pause',{}),'已暂停，进度保留。')}>暂停</button>
         <button className="secondary" disabled={!controls.canResume || !!busy || settingsDirty} onClick={() => void run('resume', () => request('/resume',{requestId:uid()}),'正在继续。')}>继续</button>
-        <button className="secondary" disabled={!!busy || !state.packages} onClick={() => void run('package-uploads', () => request(state.packages?.paused ? '/packages/resume' : '/packages/pause',{}), state.packages?.paused ? '图片上传已继续；切片队列独立运行。' : '图片上传已暂停；切片队列独立运行。')}>{state.packages?.paused ? '继续图片上传' : '暂停图片上传'}</button>
+        {state.localWorkers && <button className="secondary" disabled={!!busy || !state.packages} onClick={() => void run('package-uploads', () => request(state.packages?.paused ? '/packages/resume' : '/packages/pause',{}), state.packages?.paused ? '图片上传已继续；切片队列独立运行。' : '图片上传已暂停；切片队列独立运行。')}>{state.packages?.paused ? '继续图片上传' : '暂停图片上传'}</button>}
         <button className="link" disabled={!!busy} onClick={() => void run('refresh', () => request<State>(''),'状态已更新。')}>刷新</button>
       </div>
       <p className="slice-flow">{settings.reviewBeforeUpload ? '已打开审核：磁盘吊照片确认后才上传。' : '自动模式：切片完成后直接上传压缩包。车斗导入 27892，磁盘吊导入 27893，不需要审核。'}</p>
-      <p className="slice-flow">本地识别任务 {state.localWorkers?.active || 0}/{state.localWorkers?.max || settings.maxLocalSlicingProcesses} · 当前进程 {state.localWorkers?.processes || 0} · 待识别 {state.localWorkers?.queued || 0}；图片上传与导入独立运行。</p>
+      {state.localWorkers ? <p className="slice-flow">本地识别任务 {state.localWorkers.active}/{state.localWorkers.max} · 当前进程 {state.localWorkers.processes} · 待识别 {state.localWorkers.queued}；图片上传与导入独立运行。</p> : <p className="slice-flow">正在使用当前后台版本；并行设置会在安全升级服务后启用。</p>}
       {!!state.packages?.targets.length && <div className="slice-overall">{state.packages.targets.map(target =>
         <span key={target.id}>{target.name} · 上传 {target.uploading} · 导入 {target.importing} · 排队 {target.queued}</span>)}</div>}
       <div className="slice-overall"><span>{groups.length} 个视频</span><span>完成 {groups.filter(group=>group.records.every(item=>['complete','no_target'].includes(item.state))).length}</span><span>需处理 {groups.filter(group=>groupState(group) === 'attention').length}</span><span>已归档 {state.archive?.counts.complete || 0}</span></div>
@@ -338,7 +338,7 @@ export default function Slicing({onConnect}: {onConnect: () => void}) {
       {Object.keys(excluded).length > 0 && <details className="slice-scan-details"><summary>扫描与去重明细</summary><p className="slice-detail">已排除：平台处理中 {excluded.active || 0} · 平台已完成 {excluded.complete || 0} · 已切片视频 {excluded.cut || 0} · 程序已有任务 {excluded.submitted || 0}</p></details>}
       {(error || pollError) && <p className="error" role="alert">{error || pollError}</p>}{notice && <p className="success" role="status">{notice}</p>}
     </section>
-    <SliceClassify directory={`${settings.sliceOutputDirectory || state.sliceOutputDirectoryEffective || ''}/上传分类`} onMoved={refresh} />
+    <SliceClassify directory={settings.sliceOutputDirectory ? `${settings.sliceOutputDirectory}/上传分类` : state.sliceOutputDirectoryEffective ? `${state.sliceOutputDirectoryEffective}/上传分类` : ''} onMoved={refresh} />
     <SubmissionRecords kind="slicing" />
 
     <details className="panel slicing-settings"><summary>模型、目录与切片参数</summary>
@@ -355,8 +355,8 @@ export default function Slicing({onConnect}: {onConnect: () => void}) {
         {settings.sharedSampling ? <label>共用抽样间隔（秒）<input type="number" min={1} max={3600} value={settings.sampleIntervalSeconds} onChange={event => set('sampleIntervalSeconds',Number(event.target.value))} /></label> : <>
           <label>磁盘吊抽样间隔（秒）<input type="number" min={1} max={3600} value={settings.magnetIntervalSeconds} onChange={event => set('magnetIntervalSeconds',Number(event.target.value))} /></label>
           <label>车斗抽样间隔（秒）<input type="number" min={1} max={3600} value={settings.bedIntervalSeconds} onChange={event => set('bedIntervalSeconds',Number(event.target.value))} /></label></>}
-        <label className="wide">切片结果目录（留空则使用程序数据目录下的“切片结果”）<input value={settings.sliceOutputDirectory || ''} onChange={event => set('sliceOutputDirectory', event.target.value)} placeholder={state.sliceOutputDirectoryEffective || '留空即可'} /></label>
-        <label>本地切片并行进程（1–8）<input type="number" min={1} max={8} step={1} value={settings.maxLocalSlicingProcesses ?? 3} onChange={event => set('maxLocalSlicingProcesses',Number(event.target.value))} /></label>
+        <label className="wide">切片结果目录（{state.sliceOutputDirectoryEffective ? '留空则使用程序数据目录下的“切片结果”' : '留空则放在原视频旁边'}）<input value={settings.sliceOutputDirectory || ''} onChange={event => set('sliceOutputDirectory', event.target.value)} placeholder={state.sliceOutputDirectoryEffective || '留空即可'} /></label>
+        {state.localWorkers && <label>本地切片并行进程（1–8）<input type="number" min={1} max={8} step={1} value={settings.maxLocalSlicingProcesses ?? 3} onChange={event => set('maxLocalSlicingProcesses',Number(event.target.value))} /></label>}
         <label className="wide check-label"><input type="checkbox" checked={!settings.reviewBeforeUpload} onChange={event=>set('reviewBeforeUpload', !event.target.checked)} />不需要审核：切片完成后直接上传压缩包并按数据集导入</label>
         <label className="wide check-label"><input type="checkbox" checked={settings.autoArchive ?? true} onChange={event=>set('autoArchive',event.target.checked)} />两类处理结束后自动剪切归档</label>
         <label>完成文件夹名<input value={settings.archiveCompletedDirectory || '切片完成'} onChange={event=>set('archiveCompletedDirectory',event.target.value)} /></label>
@@ -383,7 +383,7 @@ export default function Slicing({onConnect}: {onConnect: () => void}) {
         {settingsDirty && <button className="secondary" onClick={()=>{dirty.current=false;settingsBase.current=state.settingsRevision;setSettingsDirty(false);setSettings(state.settings);setDirectoryText(state.settings.directories.join('\n'));}}>重新载入已保存设置</button>}
       </div>
       {(state.busy || state.enabled) && <p className="notice">处理中暂不能保存模型设置。暂停并等待本条停止后，可修改设置；有效观察会继续保留。</p>}
-      <p className="subtle">默认同时识别3个视频，可按内存和显卡负载调整为1–8个；同一物理视频不会重复并行。切片照片按“车斗/磁盘吊 → 视频名_ID → image”集中保存，压缩包与照片同目录。Python 推理环境独立于网站，模型文件不复制或修改。</p>
+      <p className="subtle">{state.localWorkers ? '默认同时识别3个视频，可按内存和显卡负载调整为1–8个；同一物理视频不会重复并行。切片照片按“车斗/磁盘吊 → 视频名_ID → image”集中保存，压缩包与照片同目录。' : '本地并行设置和新的结果分类目录会在后台安全升级后生效。'} Python 推理环境独立于网站，模型文件不复制或修改。</p>
     </details>
 
     <section className="panel slice-records"><div className="section-title"><h2>视频记录</h2><span>同一文件合并显示</span></div>
