@@ -1,0 +1,42 @@
+{
+  "schema": 1,
+  "releaseAsset": "models-v1.zip",
+  "repository": "zhaochengxiaohao-design/search_download_upload_auto",
+  "files": [
+    {
+      "path": "magnet/best.onnx",
+      "bytes": 103606593,
+      "sha256": "c83da5fe6689ec4b8112989d4314d9ef20dcdf109d68d2ae61c56faede768266"
+    },
+    {
+      "path": "bed/model.pt",
+      "bytes": 467334,
+      "sha256": "bbf2c20a5a8b9ea03dfd12c28263b9f7e72e52217ce55e5a68cad869cfc76cb4"
+    },
+    {
+      "path": "bed/geometry.npz",
+      "bytes": 1824340,
+      "sha256": "5384e60bf59de50eb82a84fc5d9fda4c820cc743e34be8ad6f2729ce7c9b2d10"
+    },
+    {
+      "path": "magnet/infer.py",
+      "sha256": "a511a9e86838ea45ab16a6e9d522552717b2964265a3b0e63ff4fd7d42db0f9d",
+      "bytes": 5743
+    },
+    {
+      "path": "bed/training/__init__.py",
+      "sha256": "a7225fb09fe8252ad073adfa5ffe6b60e8015fa2c6bf649eb1a8e13f21f608e1",
+      "bytes": 70
+    },
+    {
+      "path": "bed/training/data.py",
+      "sha256": "bd1d4aeadb9364245e9e8461a7ac13225b7dc686e5b2bfec031464ea1ec4a0cf",
+      "bytes": 4913
+    },
+    {
+      "path": "bed/training/supervised.py",
+      "sha256": "0e7aa97f3d7b5c725fd236a02cd36640c6d44f1970793cda5d3e6aefcb718856",
+      "bytes": 5461
+    }
+  ]
+}

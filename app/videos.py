@@ -89,6 +89,8 @@ class VideoManager:
                  staging_directory: Path | None = None):
         self.jobs, self.target = jobs, target
         self.store = VideoStore(jobs.store)
+        from .record_visibility import RecordVisibility
+        self.record_visibility = RecordVisibility(self.store.db, 'collection')
         self.fixed_directory = Path(os.path.normpath(os.fspath(fixed_directory))) if fixed_directory else None
         self.require_mounted_external = require_mounted_external
         # Direct-transfer mode intentionally avoids probing a removable volume at startup.
@@ -206,16 +208,22 @@ class VideoManager:
 
     def state(self, query=None):
         self.sync_jobs()
-        rows = self.store.list()
+        hidden = self.record_visibility.hidden()
+        rows = [{**row, 'submittedAt': (self.jobs.store.get(row.get('jobId', '')) or {}).get('createdAt') or ''}
+                for row in self.store.list() if row['id'] not in hidden]
         found = filter_records(rows, query)
-        return {"videos": found, "directory": self.store.directory(), "totalCount": len(rows),
+        return {"videos": found, "directory": self.store.directory(), "workspaceManaged": bool(getattr(self, 'workspace', None) and self.workspace.enabled), "totalCount": len(rows),
                 "filteredCount": len(found), "byJob": {job_id: sum(r["jobId"] == job_id for r in rows)
                     for job_id in {r["jobId"] for r in rows}},
                 "counts": {kind: sum(record_status(row) == kind for row in rows)
                            for kind in ("ready", "waiting", "review", "download", "saved", "deleting")},
-                "lastCheck": self.last_check, "checkError": self.storage_error or self.check_error}
+                "lastCheck": self.last_check, "checkError": self.storage_error or self.check_error,
+                "hiddenRecordCount": len(hidden)}
 
     def configure_directory(self, value):
+        if getattr(self, 'workspace', None) and self.workspace.enabled:
+            self.workspace.require_directory(value, download=True)
+            return self.state()
         if self.fixed_directory:
             directory = prepare_directory(value)
             self.store.set_directory(directory)
@@ -225,6 +233,11 @@ class VideoManager:
         return self.state()
 
     def prepare_fixed_storage(self):
+        if getattr(self, 'workspace', None) and self.workspace.enabled:
+            self.workspace.require_root()
+            self.fixed_directory.mkdir(parents=True, exist_ok=True)
+            self.work.mkdir(parents=True, exist_ok=True)
+            return
         if self.require_mounted_external and not os.path.ismount(str(self.fixed_directory.parent)):
             raise OSError("外置盘未挂载。")
         self.fixed_directory.mkdir(parents=True, exist_ok=True)
@@ -508,6 +521,8 @@ class VideoManager:
                 return row
 
     def schedule(self, row):
+        if getattr(self, 'workspace', None) and self.workspace.blocked:
+            return
         if row.get("deletedAt"):
             return
         identity = row["id"]
@@ -555,6 +570,11 @@ class VideoManager:
         if row.get("deletion", {}).get("state") in ("pending", "error"):
             raise Conflict("本条正在清理；请先完成或停止继续清理，不能覆盖当前操作。")
 
+    @staticmethod
+    def repairable_media_failure(version):
+        return (version.get("state") == "failed" and version.get("errorCode") in ("invalid_video", "media_incomplete")
+                and bool(version.get("taskId")) and bool(version.get("resultId")))
+
     async def correct(self, identity, payload):
         async with self.row_lock(identity):
             row = self.store.get(identity)
@@ -599,7 +619,8 @@ class VideoManager:
                     self.store.save(row)
                     if current["state"] == "ready":
                         return row  # A verified result recovered; no new capture is necessary.
-                    if current.get("review", {}).get("code") not in ("task_missing", "task_identity_changed", "result_missing", "platform_failed"):
+                    if (not self.repairable_media_failure(current) and current.get("review", {}).get("code")
+                            not in ("task_missing", "task_identity_changed", "result_missing", "platform_failed")):
                         raise ValueError("该异常需要先人工核对任务或结果身份，不能直接重新采集。")
                 version = {"revision": row["revision"] + 1, "startTime": start_text, "endTime": end_text,
                            "durationSeconds": payload["durationSeconds"], "name": row["name"],
@@ -1204,6 +1225,13 @@ class VideoManager:
             version = self.version(row, revision) if row else None
             if not version or row.get("deletedAt") or row["activeRevision"] != revision or not version.get("downloadRequested"):
                 return
+            if getattr(self, 'workspace', None) and self.workspace.enabled:
+                try:
+                    self.workspace.require_root()
+                except (OSError, ValueError):
+                    self.storage_ready = False
+                    self.storage_error = '等待原工作区磁盘连接；下载意图和断点保留。'
+                    return
             try:
                 if not version.get("outputDirectory"):
                     raise DownloadFailure("请先指定保存文件夹。", "directory_missing")
@@ -1247,6 +1275,8 @@ class VideoManager:
                         part, result, digest, size = await self.download_bound(row, version)
                     destination = Path(version["outputDirectory"]) / video_filename({"videoName": row["name"],
                         "startTime": version["startTime"]}, result)
+                    if getattr(self, 'workspace', None) and self.workspace.enabled:
+                        destination = self.workspace.download_destination(destination.name)
                     version["publishing"] = {"path": str(destination), "sha256": digest, "bytes": size}
                     version["state"] = "publishing"
                     version["message"] = "正在转移到保存目录。"
@@ -1260,6 +1290,9 @@ class VideoManager:
                     await self.copy_to_final(part, destination, self.transfer_report(row, version, destination))
                 version.update(state="saved", filePath=str(destination), sha256=digest, totalBytes=size,
                                downloadRequested=False, savedAt=now_iso())
+                if getattr(self, 'workspace', None) and self.workspace.enabled:
+                    from .workspace_files import file_version
+                    version['fileVersion'] = await self.file_operation(file_version, destination, True)
                 version.pop("message", None)
                 version.pop("errorCode", None)
                 version.pop("transferError", None)

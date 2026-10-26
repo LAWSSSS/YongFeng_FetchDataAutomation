@@ -1,0 +1,37 @@
+{
+  "version": "1.1.0",
+  "platform": "macos-arm64",
+  "minimumMacOS": "14.0",
+  "python": {
+    "provider": "astral-sh/python-build-standalone",
+    "build": "20260623",
+    "backend": "3.13.14",
+    "inference": "3.11.15",
+    "distribution": "aarch64-apple-darwin-install_only",
+    "source": "https://github.com/astral-sh/python-build-standalone/releases/tag/20260623"
+  },
+  "ffmpeg": {
+    "version": "8.1.2",
+    "source": "https://github.com/FFmpeg/FFmpeg/archive/refs/tags/n8.1.2.tar.gz",
+    "archive": "ffmpeg-n8.1.2.tar.gz",
+    "sha256": "9fd092511605bbebafe095ea6d38d9e40f34d12f7386e1258372df8be0576eb7",
+    "license": "LGPL-2.1-or-later",
+    "gpl": false,
+    "nonfree": false,
+    "externalLibraries": false
+  },
+  "opencvEmbeddedFFmpeg": {
+    "version": "6.0",
+    "source": "https://github.com/FFmpeg/FFmpeg/archive/refs/tags/n6.0.tar.gz",
+    "archive": "ffmpeg-n6.0.tar.gz",
+    "sha256": "9a1fa94608300e835bf89bdfcd7d77deceba67bff3494f609816f84bd69a459e",
+    "consumer": "opencv-python-headless==4.10.0.84",
+    "upstreamBuild": "https://pypi.org/project/opencv-python-headless/4.10.0.84/#files"
+  },
+  "opencvSource": {
+    "version": "4.10.0.84",
+    "archive": "opencv-python-headless-4.10.0.84.tar.gz",
+    "sha256": "f2017c6101d7c2ef8d7bc3b414c37ff7f54d64413a1847d89970b6b7069b4e1a",
+    "index": "https://pypi.org/pypi/opencv-python-headless/4.10.0.84/json"
+  }
+}

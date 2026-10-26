@@ -1,0 +1,31 @@
+.workspace-panel { margin-bottom: 24px; }
+.workspace-heading, .workspace-status, .workspace-heading h2 { display: flex; align-items: center; gap: 12px; }
+.workspace-heading { justify-content: space-between; flex-wrap: wrap; }
+.workspace-heading h2 { margin: 0; font-size: 1.125rem; }
+.workspace-heading p { margin: 6px 0 0; color: #526159; overflow-wrap: anywhere; }
+.workspace-status { font-size: .875rem; color: #526159; }
+.workspace-body { margin-top: 24px; }
+.workspace-location { display: flex; align-items: flex-end; gap: 12px; }
+.workspace-location label { flex: 1; min-width: 0; display: flex; flex-direction: column; align-items: stretch; gap: 8px; }
+.workspace-location input { width: 100%; min-width: 0; }
+.workspace-preview, .workspace-migration { padding: 16px 0; border-bottom: 1px solid #dce5df; }
+.workspace-preview strong { overflow-wrap: anywhere; }
+.workspace-migration progress { width: 100%; }
+.workspace-tree { list-style: none; margin: 24px 0 20px; padding: 0 0 0 20px; border-left: 1px solid #b8cdc0; display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); column-gap: 32px; }
+.workspace-tree li { padding: 12px 0; border-bottom: 1px solid #e2e9e4; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.workspace-tree span { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+.workspace-tree svg { color: #367253; }
+.workspace-tree small { color: #526159; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.workspace-foot { color: #526159; font-size: .875rem; }
+.workspace-foot p { display: flex; align-items: start; gap: 8px; margin: 8px 0; }
+.workspace-foot svg { flex: 0 0 auto; color: #367253; }
+.workspace-issues { margin-top: 16px; }
+.workspace-issues ul { list-style: none; padding: 0; max-height: 360px; overflow: auto; }
+.workspace-issues li { padding: 12px 0; border-bottom: 1px solid #e2e9e4; }
+.workspace-issues p { margin: 6px 0; }
+.workspace-issues code { overflow-wrap: anywhere; font-size: .8rem; }
+@media (max-width: 650px) {
+  .workspace-location { flex-direction: column; align-items: stretch; }
+  .workspace-tree { grid-template-columns: 1fr; padding-left: 12px; }
+  .workspace-status { width: 100%; justify-content: space-between; }
+}

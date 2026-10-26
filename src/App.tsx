@@ -1,35 +1,37 @@
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
 import PageBoundary from './PageBoundary';
+import Workspace from './Workspace';
 import type { FormEvent } from 'react';
 import { usePolling } from './usePolling';
 import AdmissionSettings from './AdmissionSettings';
-import { admissionSummary } from './admission';
-import type { AdmissionRule } from './admission';
+import { collectionAction } from './collection-actions';
 import { correctionInterval, correctionReviewCurrent, prepareCorrection } from './corrections';
 import type { PreparedCorrection } from './corrections';
 import { InspectionResults, VideoBatches, VideoStatusFilters } from './RecordGroups';
 import { canDownload, syncVideoSelection, videoStatusOptions } from './record-groups';
 import SubmissionRecords from './SubmissionRecords';
+import RecordDelete from './RecordDelete';
+import { videoRecovery } from './video-recovery';
 import type { CollectionJob, InspectionRecord } from './record-groups';
 
 const Slicing = lazy(() => import('./Slicing'));
+const UploadAudit = lazy(() => import('./UploadAudit'));
 
 type SessionEntry = {connected: boolean; user: string; hasSavedCredentials?: boolean; savedAccount?: string; credentialWarning?: string};
 type Session = { source: SessionEntry; target: SessionEntry; capabilities?: {batchDownload?: boolean} };
 type RecordRow = InspectionRecord;
 type Search = {id: string; status: string; message: string; records: RecordRow[]; scanned: number; total: number; admissionRevision: number};
-type Task = {recordId: string; videoName: string; startTime: string; endTime: string; status: string; reason?: string};
-type Plan = {id: string; tasks: Task[]; admissionRule: AdmissionRule};
 type Job = CollectionJob;
 type Version = {revision: number; startTime: string; endTime: string; durationSeconds: number; state: string;
-  platformStatus?: string; taskId?: string; resultId?: string; message?: string; filePath?: string;
+  platformStatus?: string; taskId?: string; resultId?: string; errorCode?:string; message?: string; filePath?: string; localCleanupState?:string;
   receivedBytes?: number; totalBytes?: number; attempts?: number; downloadRequested?: boolean; writeAttempted?: boolean;
   review?: {code: string; message: string; actual?: {videoName?: string; startTime?: string; endTime?: string; taskStatus?: string} | null}};
-type Video = {id: string; jobId: string; plate: string; name: string; qualityStart: string; qualityEnd: string;
+type Video = {id: string; jobId: string; submittedAt?:string; plate: string; name: string; qualityStart: string; qualityEnd: string;
   revision: number; activeRevision: number; acceptedRevision: number | null; versions: Version[];
   cleanupPending?: boolean; error?: string;
   deletion?: {state: string; message: string; requestId: string; expectedRevision: number; deleteCloud: boolean; deleteLocalFiles: boolean}};
 type VideoState = {videos: Video[]; directory: string; lastCheck: string; checkError: string;
+  hiddenRecordCount?:number;
   totalCount: number; filteredCount: number; byJob: Record<string,number>; counts: Record<string,number>};
 type VideoSelection = {id: string; version: number; expectedRevision: number};
 type BulkResult = {outcomes: {id: string; ok: boolean; message?: string}[]};
@@ -78,7 +80,7 @@ function Login({service, connected, user, savedAccount = '', hasSavedCredentials
     {credentialWarning && <p className="error">{credentialWarning}</p>}{error && <p className="error">{error}</p>}</div>;
 }
 
-function ClearRecord({video, busy, act}: {video: Video; busy: boolean; act: (path: string, body: object) => Promise<void>}) {
+function ClearRecord({video, busy, act}: {video: Video; busy: boolean; act: (path: string, body: object) => Promise<boolean>}) {
   const [scope, setScope] = useState('local');
   const [checked, setChecked] = useState(false);
   const [base, setBase] = useState(video.revision);
@@ -88,8 +90,11 @@ function ClearRecord({video, busy, act}: {video: Video; busy: boolean; act: (pat
       expectedRevision:video.deletion!.expectedRevision,requestId:video.deletion!.requestId,
       deleteCloud:video.deletion!.deleteCloud,deleteLocalFiles:video.deletion!.deleteLocalFiles})}>重新核对并清理</button>}
     <button className="secondary" disabled={busy} onClick={() => void act('cancel-clear', {expectedRevision:video.revision,requestId:uid()})}>停止继续清理</button></div></div>;
-  return <details className="clear-record" onToggle={e => {if (e.currentTarget.open) {setBase(video.revision);setChecked(false);}}}>
-    <summary>清除这条采集记录</summary>
+  return <>
+    <RecordDelete name={`${video.name} · ${video.qualityStart}`} version={video.revision} disabled={busy} onDelete={requestId=>act('hide-record',{
+      expectedRevision:video.revision,requestId})}/>
+    <details className="clear-record" onToggle={e => {if (e.currentTarget.open) {setBase(video.revision);setChecked(false);}}}>
+    <summary>更多清理选项</summary>
     <div className="clear-panel"><label>清除范围<select value={scope} onChange={e => {setScope(e.target.value);setChecked(false);}}>
       <option value="local">仅清除网页记录和临时缓存</option><option value="all">同时清除平台任务、视频和已下载文件</option></select></label>
       <p>{scope === 'all' ? '这条记录的所有绑定版本将被清除，包括已下载到最终目录的文件。其他记录保留。' : '平台任务、视频和最终目录里的文件会保留；本条不再显示在网页中。'}</p>
@@ -97,10 +102,11 @@ function ClearRecord({video, busy, act}: {video: Video; busy: boolean; act: (pat
       {base !== video.revision && <p className="error">记录刚有新操作，请关闭此处后重新核对。</p>}
       <button className="danger" disabled={busy || !checked || base !== video.revision} onClick={() => void act('remove-record', {
         expectedRevision:base,requestId:uid(),deleteCloud:scope === 'all',deleteLocalFiles:scope === 'all'})}>确认清除所选范围</button>
-    </div></details>;
+    </div></details></>;
 }
 
-function VideoCard({video, directory, onRefresh, selected, onSelect}: {video: Video; directory: string; onRefresh: () => Promise<void>; selected: boolean; onSelect: () => void}) {
+function VideoCard({video, directory, onRefresh, selected, onSelect, onRemoved}: {video: Video; directory: string; onRefresh: () => Promise<void>; selected: boolean; onSelect: () => void;
+  onRemoved:(removalId:string)=>void}) {
   const active = video.versions.find(version => version.revision === video.activeRevision)!;
   const draftKey = `correction-draft:${video.id}`;
   const [initialDraft] = useState(() => {
@@ -137,6 +143,7 @@ function VideoCard({video, directory, onRefresh, selected, onSelect}: {video: Vi
   let draftEnd = '';
   try { draftEnd = correctionInterval({date,clock,minutes}).endTime; } catch { /* handled on review */ }
   const isCurrentSaved = video.acceptedRevision === active.revision && active.state === 'saved';
+  const recovery = videoRecovery(active);
   const clearing = ['pending','error'].includes(video.deletion?.state || '');
   const canCorrect = ['ready','saved','waiting','submitted','attention','failed'].includes(active.state)
     && (!active.downloadRequested || active.state === 'failed') && (!active.writeAttempted || !!active.taskId) && !clearing;
@@ -147,18 +154,20 @@ function VideoCard({video, directory, onRefresh, selected, onSelect}: {video: Vi
   async function act(path: string, body: object) {
     setBusy(true); setError('');
     try {
-      const result = await api<Video>(`/videos/${video.id}/${path}`, body);
-      if (path === 'corrections') {setDirty(false);setPrepared(null);setDraftRevision(result.revision);}
+      const result = await api<Video&{recordRemoval?:{removalId:string}}>(`/videos/${video.id}/${path}`, body);
+      if (path === 'corrections' || path === 'recapture') {setDirty(false);setPrepared(null);setDraftRevision(result.revision);}
+      if (path === 'hide-record' && result.recordRemoval) onRemoved(result.recordRemoval.removalId);
       await onRefresh();
+      return true;
     }
-    catch (failure) { setError((failure as Error).message); }
+    catch (failure) { setError((failure as Error).message);return false; }
     finally { setBusy(false); }
   }
   function prepare(event: FormEvent) {
     event.preventDefault();
     try {
       const reviewed = prepareCorrection({date,clock,minutes},video.revision,uid());
-      if (reviewed.startTime === active.startTime && reviewed.endTime === active.endTime) {
+      if (reviewed.startTime === active.startTime && reviewed.endTime === active.endTime && !recovery.canRecapture) {
         throw new Error('采集区间未变化，请先修改日期、时间或时长，再核对修改。');
       }
       setDraftRevision(video.revision);setDirty(true);setPrepared(reviewed);setError('');
@@ -169,8 +178,12 @@ function VideoCard({video, directory, onRefresh, selected, onSelect}: {video: Vi
     if (!prepared || !correctionReviewCurrent(prepared,video.revision)) {
       setPrepared(null);setError('记录已有新操作，你填写的时间已保留，请再次点击“核对修改”。');return;
     }
-    void act('corrections', {startTime:prepared.startTime,durationSeconds:prepared.durationSeconds,
-      expectedRevision:prepared.expectedRevision,requestId:prepared.requestId});
+    if (recovery.canRecapture && prepared.startTime === active.startTime && prepared.endTime === active.endTime) {
+      void act('recapture', {version:active.revision,expectedRevision:prepared.expectedRevision,requestId:prepared.requestId});
+    } else {
+      void act('corrections', {startTime:prepared.startTime,durationSeconds:prepared.durationSeconds,
+        expectedRevision:prepared.expectedRevision,requestId:prepared.requestId});
+    }
   }
   const saved = video.versions.find(version => version.revision === video.acceptedRevision);
   const historical = video.versions.filter(version => version.revision !== active.revision && version.state !== 'withdrawn');
@@ -186,16 +199,17 @@ function VideoCard({video, directory, onRefresh, selected, onSelect}: {video: Vi
       {!!historical.length && <details className="version-history"><summary>历史版本（{historical.length}）</summary>{historical.map(renderVersion)}</details>}
     </div>
     {active.message && <p className="notice">{active.message}</p>}
+    {recovery.failedMedia && <div className="notice"><strong>视频未通过完整性检查</strong><p>可查看当前视频，修改日期、时间或时长后重采，也可按当前区间重新采集。重试下载会复用原平台文件；若原文件损坏，建议重新采集。旧版在新版验证成功前保留。</p></div>}
     {active.state === 'attention' && <div className="notice"><strong>处理方法</strong><p>{({task_missing:'先重新核对这一条；任务仍不存在时，可按保留的更正区间重新采集。',task_identity_changed:'核对平台实际时段。下面的输入保留你的更正；需要修改时可继续更正，也可按保留的区间重采。',result_missing:'先重新核对这一条；也可查看可用旧版。若视频结果仍不存在，手动按当前更正区间重采。',platform_failed:'平台采集失败或终止。确认时段后可手动重采或继续更正。',result_identity_changed:'平台结果ID不同，需要在原平台核对确切视频，程序会保留原绑定。',multiple_results:'原平台返回多个视频，需要核对确切结果，程序不会自动选择。',submission_ambiguous:'提交后出现多个相同任务，需要核对确切任务ID，暂时不要再次提交。'} as Record<string,string>)[active.review?.code || ''] || '先重新核对这一条。异常解除后会恢复可查看状态，更正区间会保留。'}</p>
       {active.review?.actual && <p>平台实际：{active.review.actual.videoName} · {active.review.actual.startTime} → {active.review.actual.endTime} · {active.review.actual.taskStatus}</p>}</div>}
     {video.error && <p className="notice">{video.error}</p>}
     {active.state === 'downloading' && <p className="notice">已下载 {size(active.receivedBytes || 0)} / {size(active.totalBytes || 0)} · 第 {active.attempts || 1} 次尝试</p>}
-    {saved?.filePath && <p className="saved-path">本地最终文件：{saved.filePath}</p>}
+    {saved?.filePath && <p className="saved-path">{saved.localCleanupState==='complete'?'本地文件已按核验规则清理，云端视频与历史记录保留。':`本地最终文件：${saved.filePath}`}</p>}
     {video.cleanupPending && <p className="notice">新版已保存，旧版仍在核对清理。</p>}
     {!clearing && <div className="actions">{playable.some(v => v.revision === active.revision) && <button className="secondary" onClick={() => {setPlaying(playing === active.revision ? null : active.revision); setReviewed(false);}}>{playing === active.revision ? '关闭视频' : '查看视频'}</button>}
       {playable.some(v => v.revision !== active.revision) && <select aria-label={`查看${video.name}的其他版本`} value={playing ?? ''} onChange={e => {setPlaying(e.target.value === '' ? null : Number(e.target.value));setReviewed(false);}}><option value="">查看其他可用版本</option>{playable.map(v => <option key={v.revision} value={v.revision}>第{v.revision+1}版 · {v.startTime}</option>)}</select>}
       {['attention','uncertain','waiting','failed'].includes(active.state) && <button className="secondary" disabled={busy} onClick={() => {void act('check', {});}}>重新核对这一条</button>}
-      {active.state === 'attention' && ['task_missing','task_identity_changed','result_missing','platform_failed'].includes(active.review?.code || '') && <button disabled={busy} onClick={() => {if(window.confirm(`按已保存的更正区间重新采集：${active.startTime} → ${active.endTime}。现有更正和旧版将保留，是否提交？`)) void act('recapture', {version:active.revision,expectedRevision:video.revision,requestId:uid()});}}>按当前更正区间重采</button>}
+      {recovery.canRecapture && <button disabled={busy} onClick={() => {if(window.confirm(`按已保存的区间重新采集：${active.startTime} → ${active.endTime}。现有更正和旧版将保留，是否提交？`)) void act('recapture', {version:active.revision,expectedRevision:video.revision,requestId:uid()});}}>按当前区间重新采集</button>}
       {active.revision > 0 && !isCurrentSaved && !['saved','downloading','publishing','withdrawn'].includes(active.state) && <button className="secondary" disabled={busy} onClick={() => {void act('withdraw', {version: active.revision, expectedRevision: video.revision, requestId: uid()});}}>撤回本次更正</button>}
       {active.state === 'failed' && active.downloadRequested && <button disabled={busy} onClick={() => {void act('retry-download', {});}}>重试下载</button>}
       {active.downloadRequested && <button className="secondary" disabled={busy} onClick={() => void act('cancel-download', {version:active.revision,expectedRevision:video.revision,requestId:uid()})}>停止本条下载，保留断点</button>}</div>}
@@ -221,9 +235,10 @@ function VideoCard({video, directory, onRefresh, selected, onSelect}: {video: Vi
 }
 
 export default function App() {
+  const [removedVideo,setRemovedVideo]=useState<{id:string;name:string;removalId:string;restoreRequestId:string}|null>(null);
   const [tab, setTab] = useState<'collect' | 'videos' | 'audit' | 'slicing'>(() => {
     try {const saved=sessionStorage.getItem('simple-active-tab');
-      if (saved === 'audit' || saved === 'slicing') return 'slicing';
+      if (saved === 'audit' || saved === 'slicing') return saved;
       if (saved === 'videos') return saved;
     } catch { /* The initial page also works when local preferences are unavailable. */ }
     return 'collect';
@@ -231,12 +246,11 @@ export default function App() {
   useEffect(() => {try {sessionStorage.setItem('simple-active-tab',tab);} catch { /* Optional preference. */ }}, [tab]);
   const [session, setSession] = useState<Session>(emptySession);
   const [state, setState] = useState<VideoState>(emptyVideos);
-  const [directory, setDirectory] = useState('');
   const [jobs, setJobs] = useState<Job[]>([]);
   const [filters, setFilters] = useState({dateFrom: chinaToday(), dateTo: chinaToday(), timeFrom: '00:00:00', timeTo: '23:59:59', plates: ''});
   const [search, setSearch] = useState<Search | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
-  const [plan, setPlan] = useState<Plan | null>(null);
+  const collectAction = useRef(collectionAction(api));
   const [admissionBlocked,setAdmissionBlocked] = useState(true);
   const [busy, setBusy] = useState('');
   const [error, setError] = useState('');
@@ -250,7 +264,7 @@ export default function App() {
   const refreshSequence = useRef(0);
   const admissionChanged = useCallback((blocked: boolean) => {
     setAdmissionBlocked(blocked);
-    if (blocked) {setPlan(null);setSelected(new Set());}
+    if (blocked) {setSelected(new Set());}
   },[]);
   const refresh = useCallback(async () => {
     const sequence = ++refreshSequence.current;
@@ -260,7 +274,7 @@ export default function App() {
     const [s, v, j] = await Promise.all([api<Session>('/session'), api<VideoState>(`/videos?${query}`),
       tab === 'collect' || tab === 'videos' ? api<Job[]>('/jobs?summary=true') : Promise.resolve(null)]);
     if (sequence !== refreshSequence.current) return;
-    setSession(s); setState(v); if (j) setJobs(j); setDirectory(old => old || v.directory);
+    setSession(s); setState(v); if (j) setJobs(j);
     setVideoSelection(before => syncVideoSelection(before, v.videos));
   }, [appliedVideoFilters, tab]);
   useEffect(() => {void refresh().catch(() => undefined);}, [refresh]);
@@ -272,7 +286,7 @@ export default function App() {
     try { await fn(); } catch (failure) { setError((failure as Error).message); }
     finally { setBusy(''); }
   }
-  function select(record: RecordRow) { setSelected(before => {const next = new Set(before); if (next.has(record.id)) next.delete(record.id); else next.add(record.id); return next;}); setPlan(null); }
+  function select(record: RecordRow) { setSelected(before => {const next = new Set(before); if (next.has(record.id)) next.delete(record.id); else next.add(record.id); return next;});  }
   function pickVideo(video: Video) {
     setShowBulkClear(false);
     setVideoSelection(before => {const next = new Map(before); if (next.has(video.id)) next.delete(video.id);
@@ -292,13 +306,21 @@ export default function App() {
       else next.delete(video.id);
     }); return next;});
   }
-  async function submitPlan(downloadAfterCollection: boolean) {
-    if (!plan) return;
-    await run('submit', async () => {
-      const job = await api<Job>('/jobs', {planId:plan.id, downloadAfterCollection});
-      await refresh();setPlan(null);setSelected(new Set());setTab('videos');
-      setMessage(job.downloadAfterCollection ? '已批准的任务已加入采集队列，平台完成后自动下载到提交时指定的文件夹。' : '采集任务已加入队列；平台完成后可查看视频。');
+  async function submitSelected(downloadAfterCollection:boolean) {
+    if(!search || search.status!=='complete' || !selected.size)return;
+    await run('submit',async()=>{
+      const job=await collectAction.current<Job>(search.id,[...selected],search.admissionRevision,downloadAfterCollection);
+      await refresh();setSelected(new Set());setTab('videos');
+      setMessage(job.downloadAfterCollection?'已加入采集队列，平台完成后自动下载。':'已加入采集队列，完成后可查看和更正。');
     });
+  }
+  async function deleteVideoRecords(records:Video[],name:string,requestId:string) {
+    const result=await api<{recordRemoval:{removalId:string}}>('/videos/records/remove',{
+      requestId,selections:records.map(row=>({id:row.id,expectedRevision:row.revision})),
+    });
+    setRemovedVideo({id:requestId,name,removalId:result.recordRemoval.removalId,restoreRequestId:uid()});
+    setVideoSelection(before=>{const next=new Map(before);records.forEach(row=>next.delete(row.id));return next;});
+    await refresh();
   }
   async function bulk(action: 'confirm' | 'remove', explicit?: VideoSelection[]) {
     const selections = explicit || [...videoSelection.values()];
@@ -314,9 +336,10 @@ export default function App() {
       setShowBulkClear(false);await refresh();
     });
   }
-  return <div className="app-shell"><header className="site-header"><div className="brand"><span className="brand-symbol">映</span><div><strong>简易版质检视频采集</strong><small>人工查看 · 手动更正 · 最终版留存</small></div></div>
-    <nav><button className={tab === 'collect' ? 'selected' : ''} onClick={() => setTab('collect')}>查询与批量采集</button><button className={tab === 'videos' ? 'selected' : ''} onClick={() => setTab('videos')}>视频查看与更正 <span>{state.totalCount}</span></button><button className={tab === 'slicing' ? 'selected' : ''} onClick={() => setTab('slicing')}>模型识别与切片</button></nav></header>
-    <main><section className={`hero ${tab === 'slicing' || tab === 'audit' ? 'compact' : ''}`}><div>{tab !== 'slicing' && <p className="eyebrow">独立简易版 · 北京时间</p>}<h1>{tab === 'slicing' ? '按模型识别视频片段' : tab === 'audit' ? '找出还没上传的视频' : tab === 'collect' ? '从质检实绩发起采集' : '亲自决定留下哪一版'}</h1><p>{tab === 'slicing' ? '识别车斗和磁盘吊片段，导出照片并上传到对应图片集。' : tab === 'audit' ? '读取本地目录中的视频文件名，分别核对车斗检测与磁盘吊的导入日志。' : tab === 'collect' ? '初次采集固定为质检开始后 5 分钟，时长 60 分钟。提交前逐条核对。' : '平台完成后先在线播放；确认原版或手动更正，最终才下载到你指定的文件夹。'}</p></div><div className="rule-card"><span>{tab === 'slicing' ? '默认模型抽样' : tab === 'audit' ? '共用一份本地清单' : '默认采集规则'}</span><strong>{tab === 'slicing' ? '30 秒 · 150 张' : tab === 'audit' ? '2 个数据集' : '+5 分钟'}</strong><small>{tab === 'slicing' ? '按目标区间自动选择切片间隔' : tab === 'audit' ? '各自读取日志 · 分别显示缺失名单' : '从质检开始时间计算 · 采集 60 分钟'}</small></div></section>
+  return <div className="app-shell"><header className="site-header"><div className="brand"><span className="brand-symbol">映</span><div><strong>简易版质检视频采集</strong><small>采集 · 更正 · 上传 · 切片</small></div></div>
+    <nav><button className={tab === 'collect' ? 'selected' : ''} onClick={() => setTab('collect')}>查询与批量采集</button><button className={tab === 'videos' ? 'selected' : ''} onClick={() => setTab('videos')}>视频查看与更正 <span>{state.totalCount}</span></button><button className={tab === 'audit' ? 'selected' : ''} onClick={() => setTab('audit')}>上传核对与自动上传</button><button className={tab === 'slicing' ? 'selected' : ''} onClick={() => setTab('slicing')}>模型识别与切片</button></nav></header>
+    <main><section className={`hero ${tab === 'slicing' || tab === 'audit' ? 'compact' : ''}`}><div><h1>{tab === 'slicing' ? '按模型识别视频片段' : tab === 'audit' ? '找出还没上传的视频' : tab === 'collect' ? '从质检实绩发起采集' : '亲自决定留下哪一版'}</h1><p>{tab === 'slicing' ? '识别车斗和磁盘吊片段，导出照片并上传到对应图片集。' : tab === 'audit' ? '读取本地目录中的视频文件名，分别核对车斗检测与磁盘吊的导入日志。' : tab === 'collect' ? '初次采集固定为质检开始后 5 分钟，时长 60 分钟。在查询结果中选择后即可采集。' : '平台完成后先在线播放；确认原版或手动更正，最终才下载到你指定的文件夹。'}</p></div><div className="rule-card"><span>{tab === 'slicing' ? '默认模型抽样' : tab === 'audit' ? '共用一份本地清单' : '默认采集规则'}</span><strong>{tab === 'slicing' ? '30 秒 · 150 张' : tab === 'audit' ? '2 个数据集' : '+5 分钟'}</strong><small>{tab === 'slicing' ? '按目标区间自动选择切片间隔' : tab === 'audit' ? '各自读取日志 · 分别显示缺失名单' : '从质检开始时间计算 · 采集 60 分钟'}</small></div></section>
+    <Workspace onChanged={refresh} />
     {(tab === 'collect' || tab === 'videos') && <div className="connections"><Login service="source" connected={session.source.connected} user={session.source.user}
       savedAccount={session.source.savedAccount} hasSavedCredentials={session.source.hasSavedCredentials} credentialWarning={session.source.credentialWarning} onDone={refresh} />
       <Login service="target" connected={session.target.connected} user={session.target.user}
@@ -324,11 +347,11 @@ export default function App() {
     {error && <p className="error global" role="alert">{error}</p>}{message && <p className="success global" role="status">{message}</p>}
     {bulkErrors.length > 0 && <div className="notice"><strong>这些条目已保留</strong><ul>{bulkErrors.map((item,i) => <li key={i}>{item}</li>)}</ul></div>}
     <PageBoundary key={tab}><Suspense fallback={<section className="panel" role="status">正在打开页面…</section>}>
-    {tab === 'slicing' ? <Slicing onConnect={() => setTab('slicing')} /> : tab === 'collect' ? <><section className="panel"><div className="section-title"><div><p className="eyebrow">第一步</p><h2>筛选质检实绩</h2></div><span>按保存的准入条件区分已批准与未批准</span></div>
-      <AdmissionSettings<Search> searchId={search?.status === 'complete' ? search.id : undefined}
+    {tab === 'slicing' ? <Slicing onConnect={() => setTab('audit')} /> : tab === 'audit' ? <UploadAudit defaultDirectory={state.directory} /> : tab === 'collect' ? <><section className="panel"><div className="section-title"><div><h2>筛选质检实绩</h2></div><span>按保存的准入条件区分已批准与未批准</span></div>
+      <details className="collection-admission"><summary>准入条件 <span>车牌、质检时长与照片要求</span></summary><AdmissionSettings<Search> searchId={search?.status === 'complete' ? search.id : undefined}
         disabled={!!busy || search?.status === 'running'} onBlockedChange={admissionChanged}
-        onApplied={result => {if (result.search) setSearch(result.search);setSelected(new Set());setPlan(null);}} />
-      <form className="filters" onSubmit={event => {event.preventDefault(); void run('search', async () => {const result = await api<Search>('/search', {filters}); setSearch(result); setSelected(new Set()); setPlan(null);});}}>
+        onApplied={result => {if (result.search) setSearch(result.search);setSelected(new Set());}} /></details>
+      <form className="filters" onSubmit={event => {event.preventDefault(); void run('search', async () => {const result = await api<Search>('/search', {filters}); setSearch(result); setSelected(new Set()); });}}>
         <label>开始日期<input type="date" value={filters.dateFrom} onChange={e => setFilters({...filters, dateFrom: e.target.value})} required /></label>
         <label>结束日期<input type="date" value={filters.dateTo} onChange={e => setFilters({...filters, dateTo: e.target.value})} required /></label>
         <label>每日开始<input type="time" step="1" value={filters.timeFrom} onChange={e => setFilters({...filters, timeFrom: e.target.value})} required /></label>
@@ -337,23 +360,12 @@ export default function App() {
         <button disabled={!session.source.connected || !!busy || admissionBlocked || search?.status === 'running'}>{busy === 'search' ? '查询中…' : '查询质检实绩'}</button></form>
       {search && <p className="notice">{search.message}{search.status === 'running' ? ` · 已检查 ${search.scanned} / ${search.total}` : ''}</p>}
       {search?.status === 'complete' && <InspectionResults key={`${search.id}:${search.admissionRevision}`} records={search.records} selected={selected} disabled={!!busy || admissionBlocked}
-        onToggle={select} onSelectAll={ids => {setSelected(new Set(ids));setPlan(null);}}
-        onPreview={() => {void run('preview', async () => {setPlan(await api<Plan>('/preview', {searchId:search.id,recordIds:[...selected]}));});}} />}</section>
-      {plan && <section className="panel"><div className="section-title"><div><p className="eyebrow">第二步</p><h2>核对采集时段</h2></div><span>符合平台限制的任务每批最多提交 20 条</span></div>
-        <p className="notice">本次准入条件：{admissionSummary(plan.admissionRule)}</p>
-        <div className="table-scroll"><table><thead><tr><th>视频名称</th><th>开始</th><th>结束</th><th>状态</th></tr></thead><tbody>{plan.tasks.map(task => <tr key={task.recordId}><td><strong>{task.videoName}</strong></td><td>{task.startTime}</td><td>{task.endTime}</td><td>{task.status === 'ready' ? <span className="approved">准备就绪</span> : <span className="muted" title={task.reason}>{task.reason || task.status}</span>}</td></tr>)}</tbody></table></div>
-        <div className="mobile-previews">{plan.tasks.map(task => <div className="mobile-preview" key={task.recordId}><div><strong>{task.videoName}</strong><span className={task.status === 'ready' ? 'approved' : 'muted'}>{task.status === 'ready' ? '准备就绪' : task.reason || task.status}</span></div><p>采集开始：{task.startTime}</p><p>采集结束：{task.endTime}</p></div>)}</div>
-        <div className="capture-submit"><div><strong>{plan.tasks.filter(task => task.status === 'ready').length} 条可创建 · 每条 60 分钟</strong>
-          <p>采集后下载至：{state.directory || '尚未设置。请先在“视频查看与更正”设置文件夹。'}</p>
-          <p>选择“采集并下载”即确认保存这些初采版本；已有任务和未批准项不会重复采集。</p></div>
-          <div className="actions"><button className="secondary" disabled={!session.target.connected || !plan.tasks.some(task => task.status === 'ready') || plan.tasks.some(task => task.status === 'invalid') || !!busy}
-            onClick={() => void submitPlan(false)}>仅采集</button>
-            <button disabled={!session.capabilities?.batchDownload || !state.directory || !session.target.connected || !plan.tasks.some(task => task.status === 'ready') || plan.tasks.some(task => task.status === 'invalid') || !!busy}
-              onClick={() => void submitPlan(true)}>确认采集并下载</button></div></div></section>}
+        onToggle={select} onSelectAll={ids => {setSelected(new Set(ids));}}
+        canCollect={session.target.connected} canSave={!!session.capabilities?.batchDownload && !!state.directory && session.target.connected}
+        directory={state.directory} onCollect={download=>void submitSelected(download)} />}</section>
       <SubmissionRecords kind="collection" onChanged={() => {void refresh();}} /></>
-      : <><section className="panel"><div className="section-title"><div><p className="eyebrow">最终文件夹</p><h2>保存你明确选择的版本</h2></div><button className="secondary" disabled={!session.target.connected || !!busy} onClick={() => {void run('check', async () => {await api('/videos/check', {}); await refresh();});}}>检查平台状态</button></div>
-        <div className="directory-form"><input aria-label="最终视频保存目录" placeholder="请输入本机文件夹完整路径" value={directory} onChange={e => setDirectory(e.target.value)} /><button disabled={!directory.trim() || !!busy} onClick={() => {void run('directory', async () => {await api('/settings/directory', {directory}); await refresh(); setMessage('后续确认下载将保存到新文件夹。');});}}>保存文件夹</button></div>
-        <p className="subtle">当前保存目录：{state.directory || '尚未设置'}。更改目录只影响之后确认的下载，已排队的任务仍使用提交时的目录。最多同时下载 5 条；外置盘断开时保留本机断点，连接后可继续保存。可逐条查看后确认，也可批量批准当前版本下载。</p>{state.checkError && <p className="notice">{state.checkError}</p>}</section>
+      : <><section className="panel"><div className="section-title"><div><h2>保存你明确选择的版本</h2></div><button className="secondary" disabled={!session.target.connected || !!busy} onClick={() => {void run('check', async () => {await api('/videos/check', {}); await refresh();});}}>检查平台状态</button></div>
+        <p className="subtle">保存到工作区“采集视频”：{state.directory || '请先启用上方的文件工作区'}。最多同时下载 5 条；断盘时保留断点。可逐条查看后确认，也可批量批准下载。</p>{state.checkError && <p className="notice">{state.checkError}</p>}</section>
         <section className="panel record-controls"><div className="section-title"><h2>筛选采集记录</h2><span>筛选到 {state.filteredCount} / {state.totalCount} 条</span></div>
           <VideoStatusFilters value={appliedVideoFilters.status} counts={state.counts} total={state.totalCount}
             disabled={!!busy} onChange={filterVideoStatus} />
@@ -377,10 +389,21 @@ export default function App() {
             <p className="selected-names">{[...videoSelection.keys()].map(id => state.videos.find(v => v.id === id)?.name || id).join('、')}</p>
             <div className="actions"><button className="danger" disabled={!!busy || !videoSelection.size} onClick={() => void bulk('remove')}>确认清除这 {videoSelection.size} 条</button><button className="secondary" onClick={() => setShowBulkClear(false)}>取消</button></div></div>}
         </section>
-    <div id="video-record-results">{state.videos.length ? <VideoBatches videos={state.videos} jobs={jobs} totalByJob={state.byJob} selectedIds={new Set(videoSelection.keys())}
-      disabled={!!busy} downloadEnabled={!!state.directory} onSelectBatch={selectBatch}
+    <div id="video-record-results">{removedVideo&&<section className="panel record-deleted-notice" role="status">
+      <span>已删除 {removedVideo.name} 的网页记录，原视频和更正进度保留。</span>
+      <button className="link" disabled={!!busy} onClick={async()=>{
+        setBusy('restore-record');setError('');
+        try{await api('/videos/records/restore',{requestId:removedVideo.restoreRequestId,removalId:removedVideo.removalId});
+          setRemovedVideo(null);await refresh();}
+        catch(failure){setError((failure as Error).message);}finally{setBusy('');}
+      }}>撤销删除</button></section>}
+    {state.videos.length ? <VideoBatches videos={state.videos} jobs={jobs} totalByJob={state.byJob} selectedIds={new Set(videoSelection.keys())}
+      disabled={!!busy} downloadEnabled={!!state.directory} onSelectBatch={selectBatch} onDeleteRecords={deleteVideoRecords}
       onDownloadBatch={records => void bulk('confirm', records.map(video => ({id:video.id,version:video.activeRevision,expectedRevision:video.revision})))}>
-      {video => <VideoCard video={video} directory={state.directory} onRefresh={refresh} selected={videoSelection.has(video.id)} onSelect={() => pickVideo(video)} />}
-    </VideoBatches> : <section className="panel empty"><h2>{state.totalCount ? '没有符合条件的记录' : '还没有采集记录'}</h2><p>{state.totalCount ? '可以调整日期、车牌和状态，或重置筛选。' : '在“查询与批量采集”中提交任务后，这里会显示每辆车的采集进度。'}</p></section>}</div></>}
+      {video => <VideoCard video={video} directory={state.directory} onRefresh={refresh} selected={videoSelection.has(video.id)} onSelect={() => pickVideo(video)} onRemoved={removalId=>{
+        setRemovedVideo({id:video.id,name:video.name,removalId,restoreRequestId:uid()});
+        setVideoSelection(before=>{const next=new Map(before);next.delete(video.id);return next;});
+      }}/>}
+    </VideoBatches> : <section className="panel empty"><h2>{state.totalCount ? '没有符合条件的记录' : state.hiddenRecordCount ? '当前没有可显示的记录' : '还没有采集记录'}</h2><p>{state.totalCount ? '可以调整日期、车牌和状态，或重置筛选。' : state.hiddenRecordCount ? '已删除记录的文件、更正和后台进度保留。' : '在“查询与批量采集”中提交任务后，这里会显示每辆车的采集进度。'}</p></section>}</div></>}
     </Suspense></PageBoundary></main><footer className="site-footer">本地运行 · 时间按北京时间显示 · 操作进度保存在本机</footer></div>;
 }

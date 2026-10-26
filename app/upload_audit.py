@@ -548,14 +548,23 @@ class UploadAuditManager:
         self.db.commit()
 
     def state(self, default_directory=""):
+        workspace = getattr(self, 'workspace', None)
+        managed = bool(workspace and workspace.enabled)
         return {"connected": self.client.connected, "user": self.client.user,
                 "savedConnection": self.client.saved_connection,
                 "connectionWarning": self.client.connection_warning,
-                "directory": self.saved.get("directory") or default_directory, "recursive": self.saved.get("recursive", False),
+                "directory": str(workspace.root) if managed else self.saved.get("directory") or default_directory,
+                "workspaceManaged": managed, "recursive": True if managed else self.saved.get("recursive", False),
                 "datasets": [{**d, "url": dataset_url(d["id"])} for d in DATASETS],
                 "run": self.run, "report": self.saved.get("report")}
 
     def start(self, directory, recursive=False):
+        workspace = getattr(self, 'workspace', None)
+        if workspace and workspace.enabled:
+            directory = workspace.require_directory(directory)
+            recursive = True
+        if workspace and workspace.maintenance:
+            raise ValueError('工作区正在整理，请稍后核对。')
         if not self.client.connected:
             raise AuditError("请先连接视觉AI平台。", "auth", 401)
         if self.busy or self.file_move_busy:
@@ -569,7 +578,9 @@ class UploadAuditManager:
 
     async def audit(self, directory, recursive):
         try:
-            files, ignored = await asyncio.wait_for(asyncio.to_thread(scan_directory, directory, recursive), timeout=20)
+            workspace = getattr(self, 'workspace', None)
+            scanner = workspace.scan_directory if workspace and workspace.enabled else scan_directory
+            files, ignored = await asyncio.wait_for(asyncio.to_thread(scanner, directory, recursive), timeout=20)
             if not files:
                 raise ValueError("这个目录没有可核对的视频；旧报告已保留。")
             births = [timestamp_ns(file.get("createdNs")) for file in files]

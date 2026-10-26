@@ -485,7 +485,11 @@ class OriginalRestoreManager:
             raise RestoreFailure("identity", "切片记录中的原片位置或指纹不唯一。")
         path = Path(next(iter(paths)))
         root = Path("/Volumes/HIKSEMI/视频/已上传")
-        if path.parent != root or path.name != name:
+        workspace = getattr(self.uploads, 'workspace', None)
+        managed = bool(workspace and workspace.enabled and workspace.asset_for(path))
+        if managed:
+            workspace.require_root()
+        if (not managed and path.parent != root) or path.name != name:
             raise RestoreFailure("identity", "原片记录不在已确认的外置盘目标目录。")
         expected = versions[0]
         if expected.get("size") is None or not re.fullmatch(r"[a-f0-9]{64}", str(expected.get("edgeHash", ""))):
@@ -509,6 +513,10 @@ class OriginalRestoreManager:
     async def _restore_one(self, row):
         name = row["name"]
         try:
+            records = [i for i in self.slicing.store.list('items') if i.get('name') == name]
+            if records and all(i.get('localCleanupState') == 'complete' for i in records):
+                self._save_row(row, state='cleaned', message='已核验并按工作区规则清理，保留云端原片和恢复凭证。')
+                return
             source, path, expected, upload_item = self._records(name)
             if path.exists():
                 from .slicing import source_version
@@ -586,13 +594,16 @@ class OriginalRestoreManager:
                         if row.get("state") in {"queued", "running", "retry_wait", "waiting_connection", "waiting_disk"}]
                 if not todo:
                     self.job["state"] = "partial" if any(i.get("state") == "attention" for i in self.job["items"]) else "complete"
+                    if any(i.get('state') == 'cleaned' for i in self.job['items']):
+                        self.job['message'] = '恢复记录已核对；已按规则清理的媒体不再下载。'
                     self.store.save(self.job)
                     return
                 self.job["state"] = "running"
                 self.store.save(self.job)
                 await asyncio.gather(*(self._restore_one(row) for row in todo))
-                if all(i.get("state") == "complete" for i in self.job["items"]):
-                    self.job.update(state="complete", message="五条原片均已恢复并校验。")
+                if all(i.get("state") in {"complete", "cleaned"} for i in self.job["items"]):
+                    self.job.update(state="complete", message='恢复记录已核对；已清理的媒体不再下载。'
+                                    if any(i.get('state') == 'cleaned' for i in self.job['items']) else "五条原片均已恢复并校验。")
                     self.store.save(self.job)
                     return
                 retryable = any(i.get("state") in {"queued", "running", "retry_wait", "waiting_connection", "waiting_disk"}

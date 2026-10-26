@@ -790,6 +790,51 @@ async def test_review_recovers_exact_result_and_missing_result_can_be_recaptured
 
 
 @pytest.mark.asyncio
+async def test_invalid_video_recapture_keeps_versions_and_only_creates_once(app_factory, platform, tmp_path):
+    app = app_factory()
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1") as client:
+            row = await new_video(client, app)
+            version = row["versions"][0]
+            version.update(state="failed", errorCode="invalid_video", downloadRequested=True,
+                           message="Video tail cannot be decoded.")
+            app.state.videos.store.save(row)
+            cached = app.state.videos.work / row["id"] / "v0.part"
+            cached.parent.mkdir(parents=True, exist_ok=True)
+            cached.write_bytes(b"keep-unverified-original")
+            payload = {"version": 0, "expectedRevision": 0, "requestId": "repair-incomplete-video"}
+            result = await client.post(f'/api/videos/{row["id"]}/recapture', json=payload)
+            assert result.status_code == 202, result.text
+            current = result.json()
+            assert current["activeRevision"] == 1
+            assert current["versions"][1]["startTime"] == version["startTime"]
+            assert current["versions"][1]["durationSeconds"] == version["durationSeconds"]
+            assert current["versions"][0]["resultId"] == version["resultId"]
+            assert current["versions"][0]["state"] == "failed"
+            assert cached.read_bytes() == b"keep-unverified-original"
+            assert version["taskId"] in platform.parents
+            assert version["resultId"] == platform.results[version["taskId"]][0]["id"]
+            replay = await client.post(f'/api/videos/{row["id"]}/recapture', json=payload)
+            assert replay.status_code == 202 and len(platform.parents) == 2
+            stale = await client.post(f'/api/videos/{row["id"]}/recapture', json={**payload, "requestId": "stale-repair"})
+            assert stale.status_code == 409 and len(platform.parents) == 2
+
+
+@pytest.mark.asyncio
+async def test_recapture_does_not_turn_disk_failure_into_new_cloud_task(app_factory, platform):
+    app = app_factory()
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1") as client:
+            row = await new_video(client, app)
+            row["versions"][0].update(state="failed", errorCode="disk_full", downloadRequested=True)
+            app.state.videos.store.save(row)
+            result = await client.post(f'/api/videos/{row["id"]}/recapture', json={
+                "version": 0, "expectedRevision": 0, "requestId": "do-not-recapture-disk"})
+            assert result.status_code == 400
+            assert len(platform.parents) == 1
+
+
+@pytest.mark.asyncio
 async def test_remove_uncorrected_only_clears_own_cache_and_does_not_reappear(app_factory, platform):
     app = app_factory()
     async with app.router.lifespan_context(app):

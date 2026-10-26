@@ -1,6 +1,7 @@
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
+from . import runtime
 
 
 class AdmissionRule(BaseModel):
@@ -125,7 +126,7 @@ class AuditMoveConfirmInput(BaseModel):
 
 
 class UploadScanInput(BaseModel):
-    directory: str = Field(default="/Volumes/out/视频", min_length=1, max_length=2000)
+    directory: str = Field(default_factory=lambda: "" if runtime.portable() else "/Volumes/out/视频", min_length=1, max_length=2000)
     requestId: str = Field(pattern=r"^[A-Za-z0-9_-]{1,100}$")
 
 
@@ -156,6 +157,22 @@ class SlicingSettingsInput(BaseModel):
     archiveEmptyDirectory: str = Field(default="未检出目标", min_length=1, max_length=100)
 
 
+class SlicingProcessInput(BaseModel):
+    expectedRevision: int = Field(ge=0, strict=True)
+    requestId: str = Field(pattern=r"^[A-Za-z0-9_-]{1,100}$")
+    maxLocalSlicingProcesses: int = Field(ge=1, le=8, strict=True)
+
+
+class SliceOutputOrganizationPreviewInput(BaseModel):
+    expectedRevision: int = Field(ge=0, strict=True)
+    requestId: str = Field(pattern=r"^[A-Za-z0-9_-]{1,100}$")
+
+
+class SliceOutputOrganizationConfirmInput(BaseModel):
+    expectedRevision: int = Field(ge=0, strict=True)
+    requestId: str = Field(pattern=r"^[A-Za-z0-9_-]{1,100}$")
+
+
 class SlicingScanInput(BaseModel):
     requestId: str = Field(pattern=r"^[A-Za-z0-9_-]{1,100}$")
 
@@ -179,6 +196,38 @@ class FileCleanupInput(BaseModel):
     confirm: Literal[True]
 
 
+class WorkspacePreviewInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    parent: str = Field(min_length=1, max_length=4000)
+    expectedRevision: int = Field(ge=0)
+    requestId: str = Field(pattern=r"^[A-Za-z0-9_-]{1,100}$")
+
+
+class WorkspaceActionInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    expectedRevision: int = Field(ge=0)
+    requestId: str = Field(pattern=r"^[A-Za-z0-9_-]{1,80}$")
+    pilot: bool = False
+
+
+class RecordSelection(BaseModel):
+    model_config = ConfigDict(extra='forbid', strict=True)
+    id: str = Field(min_length=1, max_length=100)
+    expectedRevision: int = Field(ge=0)
+
+
+class SlicingRecordRemoveInput(BaseModel):
+    model_config = ConfigDict(extra='forbid', strict=True)
+    requestId: str = Field(pattern=r'^[A-Za-z0-9_-]{1,100}$')
+    selections: list[RecordSelection] = Field(min_length=1, max_length=5000)
+
+
+class RecordRestoreInput(BaseModel):
+    model_config = ConfigDict(extra='forbid', strict=True)
+    requestId: str = Field(pattern=r'^[A-Za-z0-9_-]{1,100}$')
+    removalId: str = Field(min_length=1, max_length=100)
+
+
 class SlicingBindInput(SlicingItemActionInput):
     path: str = Field(min_length=1, max_length=4000)
 
@@ -193,3 +242,10 @@ class SlicingReviewInput(SlicingItemActionInput):
     intervals: list[SliceIntervalInput] | None = Field(default=None, max_length=100)
     confirmedNoTarget: bool = False
     intervalSeconds: int | None = Field(default=None, ge=1, le=86400)
+
+
+class GroupRecordRemoveInput(BaseModel):
+    model_config = ConfigDict(extra='forbid', strict=True)
+    requestId: str = Field(pattern=r'^[A-Za-z0-9_-]{1,100}$')
+    selections: list[RecordSelection] = Field(default_factory=list, max_length=5000)
+    receipts: list[RecordSelection] = Field(default_factory=list, max_length=5000)

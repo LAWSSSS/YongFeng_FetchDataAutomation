@@ -19,6 +19,7 @@ from .file_leases import FileLeases
 from .upload_audit import AuditError, DATASETS, VIDEO_EXTENSIONS, name_key, scan_directory
 from .upload_remote import UploadRemote, source_keys, video_names
 from .videos import Conflict
+from . import runtime
 
 CHECK_SECONDS = 30
 ACTIVE_POLL_SECONDS = 8
@@ -26,7 +27,7 @@ STALL_SECONDS = 600
 RETRY_DELAYS = (10, 30, 60)
 MAX_FILE_BYTES = 10 * 1024 ** 3
 MAX_BATCH_BYTES = 20 * 1024 ** 3  # Strictly smaller than this bound.
-DEFAULT_DIRECTORY = "/Volumes/out/视频"
+DEFAULT_DIRECTORY = "" if runtime.portable() else "/Volumes/out/视频"
 PAUSE_CODES = {"auth", "network", "disk", "authorization"}
 TERMINAL = {"complete", "attention"}
 MESSAGES = {
@@ -227,6 +228,7 @@ class UploadManager:
                 "batches": [{k: b.get(k) for k in ("id", "state", "jobId", "message", "createdAt")}
                     for b in batches if b["dataset"] == dataset["id"] and b["state"] not in ("complete", "empty")]})
         return {"enabled": self.store.settings["enabled"], "connected": self.audit.client.connected,
+            "workspaceManaged": bool(getattr(self, 'workspace', None) and self.workspace.enabled),
             "directory": self.store.settings.get("directory", DEFAULT_DIRECTORY), "scan": self.store.settings.get("scan"),
             "validationMode": not validated, "parallelFilesPerTarget": 4 if validated else 1,
             "checkSeconds": CHECK_SECONDS, "stallSeconds": STALL_SECONDS, "targets": targets}
@@ -264,6 +266,10 @@ class UploadManager:
         return CHECK_SECONDS
 
     def scan(self, directory, request_id):
+        if getattr(self, 'workspace', None) and self.workspace.enabled:
+            self.workspace.require_directory(directory)
+        if getattr(self, 'workspace', None) and self.workspace.maintenance:
+            raise Conflict('工作区正在整理，请稍后扫描。')
         directory = str(Path(directory or DEFAULT_DIRECTORY).expanduser())
         old = self.store.get("requests", request_id)
         if old and old["directory"] != directory:
@@ -440,6 +446,8 @@ class UploadManager:
         return self.state()
 
     async def tick(self):
+        if getattr(self, 'workspace', None) and self.workspace.blocked:
+            return
         async with self.tick_lock:
             now = self.clock()
             for identity, task in list(self.running.items()):

@@ -7,7 +7,10 @@ from .domain import now_iso
 
 class SubmissionLog:
     def __init__(self, db):
+        from .record_visibility import RecordVisibility
         self.db = db
+        self.visibility = RecordVisibility(db, 'receipts')
+        self.item_visibility = RecordVisibility(db, 'receipt_items')
         db.execute("CREATE TABLE IF NOT EXISTS simple_submissions (id TEXT PRIMARY KEY, payload TEXT NOT NULL)")
         db.execute("CREATE TABLE IF NOT EXISTS simple_submission_hidden_jobs (id TEXT PRIMARY KEY)")
         db.commit()

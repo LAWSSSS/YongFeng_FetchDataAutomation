@@ -9,7 +9,7 @@ export type CollectionJob = {
 };
 
 export type BatchVideo = {
-  id: string; jobId: string; activeRevision: number; revision: number;
+  id: string; jobId: string; submittedAt?:string; activeRevision: number; revision: number;
   versions: {revision: number; state: string; downloadRequested?: boolean}[];
   deletion?: {state: string};
 };

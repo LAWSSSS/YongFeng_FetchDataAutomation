@@ -21,7 +21,9 @@ class SlicingWorkflow:
             self.store.settings['workflow'] = workflow
             self.store.settings['enabled'] = True
             self.store.save_settings()
-            self.store.save('requests', {'id': request_id, 'kind': 'execute-all', 'state': 'accepted'})
+            self.store.save('requests', {'id': request_id, 'kind': 'execute-all', 'state': 'accepted',
+                                        'receiptRunId': self.store.settings.get('latestRunId'),
+                                        'receiptItemIds': [i['id'] for i in self.store.list('items')]})
             self._wake_scheduler()
             return self.state()
 

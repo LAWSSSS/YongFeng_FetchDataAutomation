@@ -4,9 +4,10 @@ import json
 import os
 import tempfile
 from pathlib import Path
+from .runtime import credentials_directory
 
 
-CONFIG_DIR = Path.home() / "Library" / "Application Support" / "InspectionVideoGatherSimple"
+CONFIG_DIR = credentials_directory()
 CONFIG_FILE = CONFIG_DIR / "credentials.json"
 _SERVICES = {"source", "target"}
 

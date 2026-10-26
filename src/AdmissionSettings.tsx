@@ -91,6 +91,6 @@ export default function AdmissionSettings<T>({searchId, disabled, onBlockedChang
     </fieldset>
     {error && <p className="error" role="alert">{error}{!saved && <button className="link" type="button" disabled={loading || disabled} onClick={() => void reload()}>重新读取</button>}</p>}
     {notice && <p className="success" role="status">{notice}</p>}
-    {saved && dirty && <p className="admission-help">请先保存条件，再查询或预览采集。已有批次、视频和手动更正按提交时的条件保留。</p>}
+    {saved && dirty && <p className="admission-help">请先保存条件，再查询或提交采集。已有批次、视频和手动更正按提交时的条件保留。</p>}
   </form>;
 }

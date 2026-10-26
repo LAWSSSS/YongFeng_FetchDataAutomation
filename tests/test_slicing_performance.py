@@ -80,6 +80,34 @@ async def test_public_state_excludes_large_snapshots_without_changing_durable_ev
 
 
 @pytest.mark.asyncio
+async def test_process_limit_can_be_changed_without_invalidating_an_active_run(tmp_path):
+    app = create_app(data_dir=tmp_path / "process-data")
+    manager = app.state.slicing
+    manager.store.settings.update(enabled=True, revision=7)
+    manager.store.save_settings()
+    body = {"expectedRevision": 0, "requestId": "process-limit-1", "maxLocalSlicingProcesses": 5}
+    initial = manager.state()
+    assert initial["localWorkers"]["max"] == 3
+    updated = manager.update_process_limit(body)
+    assert updated["localWorkers"]["max"] == 5
+    assert updated["localWorkers"]["revision"] == 1
+    assert updated["settingsRevision"] == 7
+    assert manager.store.settings["enabled"] is True
+    replay = manager.update_process_limit(body)
+    assert replay["localWorkers"]["max"] == 5
+    assert replay["localWorkers"]["revision"] == 1
+    with pytest.raises(Exception, match="进程设置已在其他页面修改"):
+        manager.update_process_limit({**body, "requestId": "process-limit-stale", "expectedRevision": 0,
+                                      "maxLocalSlicingProcesses": 6})
+    with pytest.raises(ValueError, match="1到8"):
+        manager.update_process_limit({**body, "requestId": "process-limit-invalid", "expectedRevision": 1,
+                                      "maxLocalSlicingProcesses": 9})
+    await close_app(app)
+
+
+
+
+@pytest.mark.asyncio
 async def test_bound_task_polling_and_output_check_do_not_reload_task_or_image_history(tmp_path):
     app = create_app(data_dir=tmp_path); manager = app.state.slicing
     manager.auth.access = "test-token"; remote = FakeSlicingRemote(); manager.remote = remote
@@ -179,7 +207,8 @@ async def test_local_slicing_uses_configured_parallel_workers_for_distinct_files
     await asyncio.sleep(0)
     assert len(started) == 2
     assert len(manager.analysis_tasks) == 2
-    assert manager.state()["localWorkers"] == {"active": 2, "processes": 0, "max": 2, "queued": 1}
+    assert manager.state()["localWorkers"] == {"active": 2, "processes": 0, "max": 2,
+                                                "revision": 0, "queued": 1}
 
     first_wave = list(manager.analysis_tasks.values())
     release.set()

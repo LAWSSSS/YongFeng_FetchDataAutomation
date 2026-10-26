@@ -192,6 +192,8 @@ class SlicePackageManager:
             await self._tick()
 
     async def _tick(self):
+        if getattr(self, 'workspace', None) and self.workspace.blocked:
+            return
         now = self.clock()
         for identity, task in list(self.running.items()):
             runtime = self.runtime.get(identity, {})
@@ -487,6 +489,9 @@ class SlicePackageManager:
         self._save(item)
 
     def delete_if_both_complete(self, item):
+        if getattr(self, 'workspace', None) and self.workspace.enabled:
+            self.workspace.wake.set()
+            return
         video_path = item.get("videoPath") or ""
         related = [row for row in self.store.list("items") if (row.get("videoPath") or "") == video_path
                    and row.get("videoFileVersion") == item.get("videoFileVersion")]

@@ -8,9 +8,10 @@ from __future__ import annotations
 import ctypes
 import json
 import sys
+from .runtime import keychain_service
 
 
-_SERVICE = b"com.codex.inspection-video-gather-simple"
+_SERVICE = keychain_service()
 _ACCOUNT = b"pre-athena-visual-ai-refresh"
 _ERR_ITEM_NOT_FOUND = -25300
 _ERR_DUPLICATE_ITEM = -25299

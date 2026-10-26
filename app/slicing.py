@@ -35,6 +35,8 @@ from .slicing_remote import (ACTIVE_STATUSES, CUT_TYPES, FAILED_STATUSES, SUCCES
                              target_dataset_id, task_state)
 from .upload_audit import AuditError, VIDEO_EXTENSIONS
 from .videos import Conflict
+from .record_visibility import RecordVisibility
+from . import runtime
 
 ROOT = Path(__file__).resolve().parents[1]
 POLICY_VERSION = 1
@@ -370,6 +372,7 @@ class SlicingStore:
         self.settings = json.loads(row[0]) if row else self.defaults(python_path, frame_tool)
         for key, value in self.defaults(python_path, frame_tool).items():
             self.settings.setdefault(key, value)
+        runtime.refresh_bundled_paths(self.settings)
         if (type(self.settings.get("maxLocalSlicingProcesses")) is not int
                 or not 1 <= self.settings["maxLocalSlicingProcesses"] <= 8):
             self.settings["maxLocalSlicingProcesses"] = 3
@@ -377,7 +380,7 @@ class SlicingStore:
 
     @staticmethod
     def defaults(python_path=None, frame_tool=None):
-        return {"revision": 0, "directories": ["/Volumes/out/视频"],
+        settings = {"revision": 0, "directories": ["/Volumes/out/视频"],
                 "magnetDeployDirectory": "/Volumes/out/yongfeng_cipandiao_deploy",
                 "magnetModelPath": "/Volumes/out/yongfeng_cipandiao_deploy/best.onnx",
                 "bedDeployDirectory": "/Volumes/out/yongfeng_wall_presence_deploy_20261018_v1",
@@ -386,13 +389,17 @@ class SlicingStore:
                 "frameToolPath": frame_tool or shutil.which("ffmpeg") or "/opt/homebrew/bin/ffmpeg",
                 "workerPythonPath": python_path or str(ROOT / ".venv-slicing" / "bin" / "python"),
                 "sharedSampling": True, "sampleIntervalSeconds": 30, "magnetIntervalSeconds": 30,
-                "maxLocalSlicingProcesses": 3,
+                "maxLocalSlicingProcesses": 3, "processLimitRevision": 0, "processLimitRequests": {},
                 "bedIntervalSeconds": 30, "magnetConfidence": 0.25, "targetImages": 150,
                 "bedTargetImages": 180,
                 "targetDatasetIds": {"27912": None, "27944": None}, "enabled": False,
                 "latestRunId": "", "settingsRequestIds": {}, "autoArchive": True,
                 "archiveCompletedDirectory": "切片完成", "archiveEmptyDirectory": "未检出目标",
                 "reviewBeforeUpload": False, "localExport": True, "sliceOutputDirectory": ""}
+        settings.update(runtime.slicing_paths())
+        if runtime.portable():
+            settings["bundledResources"] = str(runtime.resources())
+        return settings
 
     def save_settings(self):
         self.db.execute("INSERT INTO simple_slicing_settings VALUES(1,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload",
@@ -419,6 +426,7 @@ class SlicingStore:
 class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
     def __init__(self, store, auth, data_dir, leases=None, remote=None, worker_python=None, frame_tool=None, clock=None):
         self.store = SlicingStore(store.db, worker_python, frame_tool)
+        self.visibility = RecordVisibility(store.db)
         self.auth = auth
         self.remote = remote or SlicingRemote(auth)
         self.data_dir = Path(data_dir)
@@ -545,7 +553,9 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
         return "platform_processing"
 
     def state(self):
-        items = self.store.list("items")
+        hidden = self.visibility.hidden()
+        all_items = self.store.list("items")
+        items = [item for item in all_items if item['id'] not in hidden]
         run = self.store.get("runs", self.store.settings.get("latestRunId")) or self.run
         if run:
             self.run = run
@@ -553,29 +563,50 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
         for item in items:
             counts[item.get("state", "attention")] = counts.get(item.get("state", "attention"), 0) + 1
         public_items = []
+        views = getattr(self, 'submission_views', None)
+        submission_dates = views.slicing_dates() if views else {}
         for item in items:
             public = {**item, "categories": {}}
+            known_dates = []
             for name, category in item.get("categories", {}).items():
                 public["categories"][name] = {key: value for key, value in category.items()
                     if key not in {"preSubmitImageIds", "preSubmitTaskIds", "outputImageIds", "fileVersion"}}
                 if (item["id"], name) in self.exporting:
                     public["categories"][name].update(state="exporting", message="正在导出照片并生成压缩包。")
+                operation = self.store.get('operations', category.get('operationId') or '') or {}
+                package = self.packages.store.get('items', category.get('packageId') or '') or {}
+                submitted_at = operation.get('createdAt') or package.get('createdAt')
+                if submitted_at:
+                    public['categories'][name]['submittedAt'] = submitted_at
+                    known_dates.append(submitted_at)
+            public['submittedAt'] = min(known_dates) if known_dates else submission_dates.get(item['id'], '')
             public_items.append(public)
         return {"workflow": self.store.settings.get("workflow"),
+                "workspaceManaged": bool(getattr(self, 'workspace', None) and self.workspace.enabled),
                 "archive": self.files.state() if self.files else {"items": [], "counts": {}},
                 "phase": self.phase(run),
                 "connected": bool(self.auth.connected), "user": self.auth.user if self.auth.connected else "",
                 "settings": self._safe_settings(), "settingsRevision": self.store.settings["revision"],
                 "run": run, "items": public_items, "counts": counts, "busy": self.busy,
+                "hiddenRecordCount": sum(item['id'] in hidden for item in all_items),
+                "submissionReceipts": views.slicing_receipts() if views else [],
                 "enabled": bool(self.store.settings.get("enabled")),
                 "localWorkers": {"active": len(self._active_analysis_tasks()),
                                  "processes": len(self.worker_processes),
                                  "max": self.store.settings.get("maxLocalSlicingProcesses", 3),
+                                 "revision": self.store.settings.get("processLimitRevision", 0),
                                  "queued": sum(item.get("state") == "pending" and bool(item.get("path")) for item in items)},
                 "sliceOutputDirectoryEffective": self.slice_output_directory(),
+                "outputOrganization": (self.output_organizer.state()
+                                       if getattr(self, "output_organizer", None) and not
+                                       (getattr(self, 'workspace', None) and self.workspace.enabled) else None),
                 "packages": self.packages.state()}
 
     def update_settings(self, data):
+        if getattr(self, 'workspace', None) and self.workspace.enabled:
+            for key in ('directories', 'sliceOutputDirectory', 'archiveCompletedDirectory', 'archiveEmptyDirectory'):
+                if key in data and data[key] != self.store.settings.get(key):
+                    raise Conflict('目录已由视频工作区统一管理，请在“文件工作区”修改位置。')
         request = self.store.settings.get("settingsRequestIds", {})
         if data["requestId"] in request:
             return self.state()
@@ -623,9 +654,35 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
         self.store.save_settings()
         return self.state()
 
+    def update_process_limit(self, data):
+        """Change only the local inference limit without invalidating an active run."""
+        requests = self.store.settings.setdefault("processLimitRequests", {})
+        prior = requests.get(data["requestId"])
+        if prior is not None:
+            if prior != data["maxLocalSlicingProcesses"]:
+                raise Conflict("这个请求编号已用于其他进程设置。")
+            return self.state()
+        revision = int(self.store.settings.get("processLimitRevision", 0))
+        if data["expectedRevision"] != revision:
+            raise Conflict("进程设置已在其他页面修改，请刷新后重试。")
+        limit = data["maxLocalSlicingProcesses"]
+        if type(limit) is not int or not 1 <= limit <= 8:
+            raise ValueError("本地切片进程数须为1到8的整数。")
+        current = int(self.store.settings.get("maxLocalSlicingProcesses", 3))
+        requests[data["requestId"]] = limit
+        self.store.settings["processLimitRequests"] = dict(list(requests.items())[-1000:])
+        if current != limit:
+            self.store.settings["maxLocalSlicingProcesses"] = limit
+            self.store.settings["processLimitRevision"] = revision + 1
+        self.store.save_settings()
+        self.wake.set()
+        return self.state()
+
     def _revision(self, item, expected):
         if not item:
             raise ValueError("切片记录不存在，请重新扫描。")
+        if item.get('localCleanupState') == 'complete':
+            raise Conflict('本地媒体已按核验规则清理，历史结果保留，不会重新抽帧或补建文件。')
         if int(item.get("revision", 0)) != expected:
             raise Conflict("这条视频已在其他页面更新，请刷新后重新核对。")
 
@@ -773,6 +830,9 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
                     prior = existing_items.get((source_id, identity))
                     if prior:
                         prior = self.store.get("items", prior["id"])
+                        if prior.get('localCleanupState') == 'complete':
+                            run['excluded']['complete'] += 1
+                            continue
                         active_category = applicable_category(source_id)
                         for category_name, category in prior.get("categories", {}).items():
                             if category_name != active_category and not _category_has_local_work(category):
@@ -858,7 +918,7 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
             self.store.save("runs", run)
             request = self.store.get("requests", run["requestId"])
             if request:
-                request.update(state="complete")
+                request.update(state="complete", receiptRunId=run_id, receiptItemIds=list(run['items']))
                 self.store.save("requests", request)
             self.store.settings["latestRunId"] = run_id
             self.store.save_settings()
@@ -1655,6 +1715,8 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
     async def _recover_moved_sources(self):
         """Repair moved paths and give old frame failures one safe automatic retry."""
         for item in self.store.list("items"):
+            if item.get('localCleanupState') == 'complete':
+                continue
             try:
                 active_category = applicable_category(item.get("sourceDatasetId"))
             except ValueError:
@@ -1773,6 +1835,8 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
         return TICK_SECONDS
 
     async def _tick(self):
+        if getattr(self, 'workspace', None) and self.workspace.blocked:
+            return
         if not self.auth.connected and self.store.settings.get("workflow", {}).get("enabled"):
             await self.auth.restore_saved_connection()
         if not self.auth.connected:
@@ -1800,6 +1864,8 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
             if single_item_id:
                 submit_items = [item for item in submit_items if item.get("id") == single_item_id]
             for item in submit_items:
+                if item.get('localCleanupState') == 'complete':
+                    continue
                 if item.get("state") in {"excluded", "complete", "no_target", "analyzing"}:
                     continue
                 if any(category.get("state") in {"ready", "waiting_slot"} for category in item.get("categories", {}).values()):
@@ -2126,7 +2192,9 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
 
     def slice_output_directory(self):
         configured = (self.store.settings.get("sliceOutputDirectory") or "").strip()
-        return str(Path(configured).expanduser() if configured else self.data_dir / "切片结果")
+        if configured:
+            return str(Path(configured).expanduser())
+        return str(self.data_dir / "切片结果")
 
     def _magnet_label(self, blob, labeler=None):
         checker = labeler or getattr(self, "magnet_classifier", None)
@@ -2154,7 +2222,11 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
             raise RuntimeError(payload.get("code") or "magnet_model_missing")
 
         def label(blob):
-            with tempfile.TemporaryDirectory() as folder:
+            cache = None
+            if getattr(self, 'workspace', None) and self.workspace.enabled:
+                cache = self.workspace.require_root() / '.缓存' / '识别'
+                cache.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(dir=cache) as folder:
                 path = Path(folder) / "frame.jpg"
                 path.write_bytes(blob)
                 process.stdin.write(json.dumps({"paths": [str(path)]}) + "\n")
@@ -2283,10 +2355,15 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
             folder = package_directory(item["path"], category_name,
                                        output_root=self.slice_output_root(),
                                        video_id=item.get("sourceVideoId"))
-            image_dir = folder / "image"
+            managed = bool(getattr(self, 'workspace', None) and self.workspace.enabled)
+            if managed:
+                folder = self.workspace.output_directory(item, category_name)
+            image_dir = folder / ("图片" if managed else "image")
             self._checked_output_directory(folder)
             self._checked_output_directory(image_dir)
             archive = folder / f"{Path(names[0]).stem.rsplit('_', 1)[0]}.zip"
+            if managed:
+                archive = folder / '压缩包.zip'
             if any(os.path.lexists(image_dir / name) for name in names) or os.path.lexists(archive):
                 category.update(state="attention", errorCode="output_conflict", message="输出位置已有同名照片或压缩包，文件保留；请换目录后重试。")
                 self._save_export_progress(item, category_name)

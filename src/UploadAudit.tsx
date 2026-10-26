@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import type { FormEvent } from 'react';
 import './upload-audit.css';
-import UploadMoves from './UploadMoves';
 import UploadQueue from './UploadQueue';
 import { auditBucket } from './upload-audit';
 import { usePolling } from './usePolling';
@@ -16,7 +15,7 @@ type Dataset = {id: string; name: string; url: string; counts?: Partial<Record<F
 type AuditReport = {id: string; createdAt: string; directory: string; recursive: boolean; localCount: number;
   ignoredCount: number; datasets: Dataset[]; files: AuditFile[]; policyVersion?: number;
   scope?: {basis: string; since: string; unknownTimes: number}};
-type AuditState = {connected: boolean; user: string; directory: string; recursive?: boolean; datasets: Dataset[];
+type AuditState = {workspaceManaged?:boolean;connected: boolean; user: string; directory: string; recursive?: boolean; datasets: Dataset[];
   savedConnection?: boolean; connectionWarning?: string;
   run: {id: string; status: string; message: string; totalLogs?: number; completedLogs?: number} | null;
   report: AuditReport | null};
@@ -80,7 +79,7 @@ export default function UploadAudit({defaultDirectory}: {defaultDirectory: strin
     finally {setBusy(false);}
   }
   function login(event: FormEvent) {event.preventDefault();void perform('/login',{account,password});}
-  function audit(event: FormEvent) {event.preventDefault();void perform('/run',{directory:directory.trim(),recursive});}
+  function audit(event: FormEvent) {event.preventDefault();void perform('/run',{directory:state.directory,recursive:true});}
   const report = state.report;
   const rows = useMemo(() => (report?.files || []).filter(file => {
     if (search && !file.relativePath.toLocaleLowerCase().includes(search.toLocaleLowerCase())) return false;
@@ -130,12 +129,8 @@ export default function UploadAudit({defaultDirectory}: {defaultDirectory: strin
 
     <UploadQueue onSessionChange={refreshReport} />
 
-    <section className="panel"><div className="section-title"><h2>选择视频目录</h2><span>同一份文件清单分别核对两个数据集</span></div>
-      <form onSubmit={audit}><label className="audit-directory">本机视频文件夹
-        <div className="directory-form"><input aria-label="上传核对视频目录" value={directory} onChange={e => setDirectory(e.target.value)} placeholder="例如 /Volumes/out 1/视频" disabled={running} required />
-          <button disabled={!state.connected || busy || running || moving || !directory.trim()}>{running ? '正在核对…' : '读取目录并核对'}</button></div></label>
-        <label className="review-check"><input type="checkbox" checked={recursive} onChange={e => setRecursive(e.target.checked)} disabled={running} />包含子文件夹，忽略隐藏缓存和临时文件</label>
-      </form>
+    <section className="panel"><div className="section-title"><h2>核对工作区视频</h2><span>两个数据集分别核对</span></div>
+      <form onSubmit={audit}><p className="audit-path">{state.directory || '请先启用文件工作区'}</p><button disabled={!state.connected || busy || running || !state.directory}>{running ? '正在核对…' : '读取目录并核对'}</button></form>
       <p className="subtle">按每个视频的本地文件创建时间起核对，只读取相关的“数据集导入”日志，跳过更早的任务及视频切片。按完整名称匹配；本地创建时间无法读取时按全量日志核对。</p>
       {state.run && <div className={['failed','interrupted'].includes(state.run.status) ? 'notice audit-run failed' : 'notice audit-run'} role="status">
         {state.run.message}{running && !!state.run.totalLogs && <progress aria-label="日志核对进度" max={state.run.totalLogs} value={state.run.completedLogs || 0} />}
@@ -143,7 +138,7 @@ export default function UploadAudit({defaultDirectory}: {defaultDirectory: strin
       {error && <p className="error" role="alert">{error}</p>}{notice && <p className="success" role="status">{notice}</p>}
     </section>
 
-    {report ? <><UploadMoves key={report.directory} report={report} auditRunning={running} onBusyChange={setMoving} onDone={refreshReport} />
+    {report ? <>
     <div className="audit-summary">{report.datasets.map(dataset => <section className="panel" key={dataset.id}>
       <div className="section-title"><h2>{dataset.name}</h2><a href={dataset.url} target="_blank" rel="noreferrer">详情与日志 ↗</a></div>
       <p className="audit-counts"><strong>{dataset.counts?.uploaded || 0}</strong> 已找到成功记录 <span>·</span> <strong>{dataset.counts?.missing || 0}</strong> 未见上传记录 <span>·</span> <strong>{(dataset.counts?.review || 0)+(dataset.counts?.in_progress || 0)}</strong> 待核对或导入中</p>

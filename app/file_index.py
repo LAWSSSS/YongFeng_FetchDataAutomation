@@ -74,6 +74,19 @@ class FileIndex:
                 self.save('files', row)
 
     def state(self):
+        if getattr(self, 'workspace', None) and self.workspace.enabled:
+            known = {row['path']: row['id'] for row in self.rows('files')}
+            public = []
+            for asset in self.workspace.rows('assets'):
+                state = ('preserved' if self.workspace.is_preserved(asset) else
+                         'attention' if asset.get('status') == 'attention' else
+                         'complete' if asset.get('stage') == '已切片' and
+                         Path(asset['path']).is_relative_to(self.workspace.root) else 'waiting')
+                public.append({'id': known.get(asset['path'], asset['id']), 'path': asset['path'],
+                    'archiveState': state, 'archivePath': asset['path'], 'archiveMessage': asset.get('message', ''),
+                    'cleanup': {k: asset.get('cleanup', {}).get(k) for k in ('state', 'message', 'completedAt')}})
+            return {'items': public, 'counts': {s: sum(r['archiveState'] == s for r in public)
+                                                for s in ('complete', 'waiting', 'attention', 'preserved')}}
         rows = self.rows('files')
         counts = {}
         public = []
@@ -142,6 +155,11 @@ class FileIndex:
         return bool(self.task and not self.task.done())
 
     def schedule(self, wake, item_id=None, *, archive_only=False):
+        if getattr(self, 'workspace', None) and self.workspace.maintenance:
+            return
+        if getattr(self, 'workspace', None) and self.workspace.enabled:
+            self.workspace.wake.set()
+            return
         if not self.slicing.store.settings.get('autoArchive', True):
             return
         candidates = []
@@ -179,6 +197,9 @@ class FileIndex:
             await asyncio.gather(self.task, return_exceptions=True)
 
     async def tick(self, file_ids=None):
+        if getattr(self, 'workspace', None) and self.workspace.enabled:
+            await self.workspace.reconcile()
+            return
         async with self.lock:
             settings = self.slicing.store.settings
             if not settings.get('autoArchive', True):
@@ -268,6 +289,13 @@ class FileIndex:
 
     async def cleanup_confirmed(self, identity, request_id):
         """Delete only verified source/output files recorded by this program."""
+        if getattr(self, 'workspace', None) and self.workspace.enabled:
+            row = next((r for r in self.rows('files') if r['id'] == identity), None)
+            asset = self.workspace.asset_for(row['path']) if row else None
+            if not asset:
+                raise ValueError('请在工作区重新核对文件。')
+            await self.workspace.reconcile(only=asset['id'])
+            return self.state()
         row = next((row for row in self.rows('files') if row['id'] == identity), None)
         if not row:
             raise ValueError('文件记录不存在。')

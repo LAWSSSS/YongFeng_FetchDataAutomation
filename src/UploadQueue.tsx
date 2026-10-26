@@ -78,7 +78,7 @@ function TargetQueue({target,busy,onRetry,onRemove,onRestore}:{target:Target;bus
 
 export default function UploadQueue({onSessionChange}:{onSessionChange:()=>Promise<void>}) {
   const [state,setState]=useState<State|null>(null);
-  const [directory,setDirectory]=useState('/Volumes/out/视频');
+  const [directory,setDirectory]=useState('');
   const [busy,setBusy]=useState(false);
   const [error,setError]=useState('');
   const refresh=useCallback(async()=>{const value=await api();setState(value);return value;},[]);
@@ -99,7 +99,7 @@ export default function UploadQueue({onSessionChange}:{onSessionChange:()=>Promi
     const key='simple-upload-scan-request';
     let saved:{directory:string;requestId:string}|null=null;
     try{saved=JSON.parse(sessionStorage.getItem(key)||'null');}catch{/* Invalid local draft creates a new request. */}
-    const request=saved?.directory===directory.trim() ? saved : {directory:directory.trim(),requestId:crypto.randomUUID()};
+    const request=saved && saved.directory===state?.directory ? saved : {directory:state?.directory||'',requestId:crypto.randomUUID()};
     sessionStorage.setItem(key,JSON.stringify(request));
     setBusy(true);setError('');
     try {setState(await api('/scan',request));sessionStorage.removeItem(key);}
@@ -113,8 +113,8 @@ export default function UploadQueue({onSessionChange}:{onSessionChange:()=>Promi
     <div className="section-title"><h2>自动上传与导入</h2><span>{complete ? '当前队列已完成' : state?.enabled ? '后台队列已启用' : '队列已暂停'}</span></div>
     <p className="upload-intro">只补传两个目标分别缺少的视频。点一次扫描添加本次文件，已入队任务会在关闭网页后继续处理。</p>
     <form className="upload-controls" onSubmit={e=>{e.preventDefault();void scan();}}>
-      <label>补传目录（包含分类子目录）<input value={directory} onChange={e=>setDirectory(e.target.value)} required disabled={busy||scanning} /></label>
-      <button disabled={busy||scanning||!state?.connected||!directory.trim()}>{scanning ? '正在扫描并核对…' : '扫描并补传'}</button>
+      <p className="audit-path">{state?.directory || '请先启用文件工作区'}</p>
+      <button disabled={busy||scanning||!state?.connected||!state?.directory}>{scanning ? '正在扫描并核对…' : '扫描并补传'}</button>
       {state?.enabled ? <button className="secondary" type="button" disabled={busy} onClick={()=>void perform('/pause')}>暂停上传</button> :
         <button className="secondary" type="button" disabled={busy||!state?.connected} onClick={()=>void perform('/resume')}>继续队列</button>}
       <button className="link" type="button" disabled={busy} onClick={()=>void refresh().then(()=>setError('')).catch(e=>setError((e as Error).message))}>刷新状态</button>

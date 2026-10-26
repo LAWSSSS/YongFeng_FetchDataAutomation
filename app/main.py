@@ -9,7 +9,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -28,13 +28,19 @@ from .models import AdmissionSettingsInput, UploadScanInput
 from .models import FileCleanupInput
 from .models import SliceClassifyConfirmInput
 from .slice_classify import SliceClassification
+from .slice_output_organizer import SliceOutputOrganizer
 from .original_restore import OriginalRestoreManager
 from .models import (SlicingSettingsInput, SlicingScanInput, SlicingStartInput,
-                     SlicingItemActionInput, SlicingBindInput, SlicingReviewInput)
+                     SlicingItemActionInput, SlicingBindInput, SlicingReviewInput,
+                     SlicingProcessInput, SliceOutputOrganizationPreviewInput,
+                     SliceOutputOrganizationConfirmInput)
 from .remote import RemoteClient, RemoteError
 from .source import scan_source
 from .store import JobStore
 from .submissions import SubmissionLog
+from .submission_views import SubmissionViews, collection_record
+from .models import SlicingRecordRemoveInput, RecordRestoreInput, GroupRecordRemoveInput
+from .record_visibility import hide_groups, restore_groups
 from .videos import EXTERNAL_VIDEO_DIR, Conflict, VideoManager
 from .upload_audit import AuditError, AthenaClient, UploadAuditManager
 from .audit_moves import AuditMoveManager
@@ -42,6 +48,9 @@ from .file_index import FileIndex
 from .file_leases import FileLeases
 from .uploads import UploadManager
 from .slicing import SlicingManager, source_version
+from .workspace import WorkspaceManager
+from .models import WorkspacePreviewInput, WorkspaceActionInput
+from . import runtime
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -64,16 +73,16 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
     source = source or RemoteClient("source")
     target = target or RemoteClient("target")
     production_data = data_dir is None
-    data_dir = data_dir or ROOT / "data"
+    data_dir = data_dir or (runtime.profile_directory() / "data" if runtime.portable() else ROOT / "data")
     store = JobStore(data_dir / "collection.sqlite3")
     submissions = SubmissionLog(store.db)
     admission_settings = AdmissionSettings(store.db)
     jobs = JobManager(target, store)
-    fixed_directory = video_directory or (EXTERNAL_VIDEO_DIR if production_data else None)
+    fixed_directory = video_directory or (EXTERNAL_VIDEO_DIR if production_data and not runtime.portable() else None)
     if production_data and staging_directory is None:
         staging_directory = data_dir / "work"
     videos = VideoManager(jobs, target, data_dir, fixed_directory=fixed_directory,
-                          require_mounted_external=production_data and video_directory is None,
+                          require_mounted_external=production_data and video_directory is None and not runtime.portable(),
                           staging_directory=staging_directory)
     upload_audit = UploadAuditManager(store, audit_client or AthenaClient(persist_connection=production_data))
     audit_moves = AuditMoveManager(store, upload_audit, videos)
@@ -85,9 +94,14 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
     slicing = SlicingManager(store, upload_audit.client, data_dir, leases, remote=slicing_remote)
     slice_classification = SliceClassification(slicing.packages)
     files = FileIndex(store, videos, uploads, slicing, audit_moves, leases)
+    slice_output_organizer = SliceOutputOrganizer(slicing)
     original_restore = OriginalRestoreManager(store.db, uploads, slicing, leases)
     slicing.files = files
+    slicing.output_organizer = slice_output_organizer
     files.refresh()
+    workspace = WorkspaceManager(store, data_dir, videos, uploads, slicing, upload_audit, audit_moves, files, leases)
+    submission_views = SubmissionViews(store, slicing, submissions)
+    slicing.submission_views = submission_views
     searches: dict[str, dict] = {}
     plans: dict[str, dict] = {}
     search_tasks: set[asyncio.Task] = set()
@@ -120,6 +134,7 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         await restore_saved_credentials()
+        await workspace.startup()
         await videos.start()
         await uploads.start()
         await slicing.startup()
@@ -133,6 +148,7 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
         if search_tasks:
             await asyncio.gather(*search_tasks, return_exceptions=True)
         await original_restore.shutdown()
+        await workspace.shutdown()
         await slicing.shutdown()
         await uploads.shutdown()
         await audit_moves.shutdown()
@@ -155,11 +171,17 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
     application.state.uploads = uploads
     application.state.slicing = slicing
     application.state.files = files
+    application.state.slice_output_organizer = slice_output_organizer
+    application.state.workspace = workspace
     application.add_middleware(TrustedHostMiddleware, allowed_hosts=["localhost", "127.0.0.1", "[::1]"])
 
     @application.middleware("http")
     async def local_only(request: Request, call_next):
         if request.url.path.startswith("/api/"):
+            if (workspace.maintenance and request.method in ('POST', 'PUT', 'PATCH', 'DELETE')
+                    and not request.url.path.startswith('/api/workspace/')
+                    and not request.url.path.endswith('/pause')):
+                return JSONResponse({'message': '工作区正在整理，草稿和进度保留；完成后可继续操作。'}, status_code=409)
             origin = request.headers.get("origin")
             if (request.headers.get("sec-fetch-site") == "cross-site"
                     or (origin and origin != f"{request.url.scheme}://{request.url.netloc}")):
@@ -213,11 +235,45 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
 
     @application.get("/api/health")
     async def health():
-        return {"ok": True, "app": "inspection-video-gather-simple"}
+        return {"ok": True, "app": "inspection-video-gather-simple", **runtime.identity()}
 
     @application.get("/api/session")
     async def get_session():
         return session()
+
+    @application.get('/api/workspace')
+    async def workspace_state(request: Request):
+        return state_response(workspace.state(), request)
+
+    @application.post('/api/workspace/preview')
+    async def workspace_preview(payload: WorkspacePreviewInput):
+        return await workspace.preview(payload.parent.strip(), payload.expectedRevision, payload.requestId)
+
+    @application.post('/api/workspace/preserve-uploaded')
+    async def workspace_preserve_uploaded(payload: WorkspaceActionInput):
+        return await workspace.preserve_uploaded(payload.expectedRevision, payload.requestId)
+
+    @application.post('/api/workspace/{identity}/cancel')
+    async def workspace_cancel(identity: str, payload: WorkspaceActionInput):
+        return await workspace.cancel_preview(identity, payload.expectedRevision, payload.requestId)
+
+    @application.post('/api/workspace/{identity}/apply', status_code=202)
+    async def workspace_apply(identity: str, payload: WorkspaceActionInput):
+        return await workspace.apply(identity, payload.expectedRevision, payload.requestId, payload.pilot)
+
+    @application.post('/api/workspace/{identity}/retry', status_code=202)
+    async def workspace_retry(identity: str, payload: WorkspaceActionInput):
+        return await workspace.retry(identity, payload.expectedRevision, payload.requestId)
+
+    @application.post('/api/workspace/reconcile')
+    async def workspace_reconcile(payload: WorkspaceActionInput):
+        if payload.expectedRevision != workspace.config['revision']:
+            raise Conflict('工作区已更新，请刷新后重试。')
+        return await workspace.reconcile()
+
+    def unified_directory_only():
+        if workspace.enabled or workspace.maintenance:
+            raise Conflict('文件已由视频工作区统一整理，请使用“文件工作区”入口。')
 
     @application.get("/api/upload-audit")
     async def upload_audit_state():
@@ -311,6 +367,34 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
     async def slicing_state(request: Request):
         return state_response(slicing.state(), request)
 
+    @application.post('/api/slicing/records/remove')
+    async def slicing_record_remove(payload: SlicingRecordRemoveInput):
+        result = slicing.visibility.hide(slicing.store, payload.requestId,
+                                        [choice.model_dump() for choice in payload.selections])
+        return {**slicing.state(), 'recordRemoval': result}
+
+    @application.post('/api/slicing/records/restore')
+    async def slicing_record_restore(payload: RecordRestoreInput):
+        slicing.visibility.restore(payload.requestId, payload.removalId)
+        return slicing.state()
+
+    @application.post('/api/slicing/records/remove-group')
+    async def slicing_record_remove_group(payload: GroupRecordRemoveInput):
+        if not payload.selections and not payload.receipts:
+            raise ValueError('请先选择记录。')
+        if any((submissions.get(choice.id) or {}).get('kind') != 'slicing' for choice in payload.receipts):
+            raise ValueError('切片提交记录不存在，请刷新。')
+        result = hide_groups(payload.requestId, [
+            (slicing.visibility, slicing.store, [s.model_dump() for s in payload.selections]),
+            (submissions.visibility, submissions, [s.model_dump() for s in payload.receipts]),
+        ])
+        return {**slicing.state(), 'recordRemoval': result}
+
+    @application.post('/api/slicing/records/restore-group')
+    async def slicing_record_restore_group(payload: RecordRestoreInput):
+        restore_groups(payload.requestId, payload.removalId, [slicing.visibility, submissions.visibility])
+        return slicing.state()
+
     @application.post("/api/slicing/execute-all", status_code=202)
     async def slicing_execute_all(payload: SlicingItemActionInput):
         result = await slicing.execute_all(payload.requestId, payload.expectedRevision)
@@ -322,26 +406,37 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
         }, request_id=payload.requestId)
         return result
 
-    def _collection_record(job):
-        return {"jobId": job["id"], "downloadAfterCollection": bool(job.get("downloadAfterCollection")),
-                "items": [{"videoName": item.get("videoName") or "", "startTime": item.get("startTime") or "",
-                           "endTime": item.get("endTime") or "", "status": item.get("status") or "",
-                           "camera": item.get("cameraName") or ""} for item in job.get("items") or []]}
+    _collection_record = collection_record
 
     submissions.import_jobs(store.list(), _collection_record)
 
     @application.get("/api/submissions")
     async def submission_list(kind: str = ""):
-        rows = []
-        for row in submissions.list(kind):
-            detail = row.get("detail") or {}
-            job = store.get(detail.get("jobId") or "") if row.get("kind") == "collection" else None
-            if job:
-                submitted = sum(item.get("status") == "submitted" for item in job.get("items") or [])
-                row = {**row, "status": job["status"], "submitted": submitted, "total": len(job.get("items") or []),
-                       "detail": _collection_record(job)}
-            rows.append(row)
-        return rows
+        hidden = submissions.visibility.hidden()
+        return [submission_views.project(row) for row in submissions.list(kind) if row['id'] not in hidden]
+
+    @application.post('/api/submissions/records/remove')
+    async def submission_remove_records(payload: SlicingRecordRemoveInput):
+        return submissions.visibility.hide(submissions, payload.requestId, [s.model_dump() for s in payload.selections])
+
+    @application.post('/api/submissions/records/restore')
+    async def submission_restore_records(payload: RecordRestoreInput):
+        return submissions.visibility.restore(payload.requestId, payload.removalId)
+
+    @application.post('/api/submissions/items/remove')
+    async def submission_remove_items(payload: SlicingRecordRemoveInput):
+        return submissions.item_visibility.hide(submission_views, payload.requestId, [s.model_dump() for s in payload.selections])
+
+    @application.post('/api/submissions/items/restore')
+    async def submission_restore_items(payload: RecordRestoreInput):
+        return submissions.item_visibility.restore(payload.requestId, payload.removalId)
+
+    @application.get('/api/submissions/{identity}')
+    async def submission_detail(identity: str, page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100)):
+        row = submissions.get(identity)
+        if not row or identity in submissions.visibility.hidden():
+            raise HTTPException(404, '提交记录不存在。')
+        return submission_views.project(row, detail=True, page=page, page_size=page_size)
 
     @application.delete("/api/submissions/{identity}")
     async def submission_delete(identity: str):
@@ -371,10 +466,12 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
 
     @application.post("/api/slicing/classify/preview")
     async def preview_slice_classification(payload: DirectoryInput):
+        unified_directory_only()
         return slice_classification.preview(payload.directory)
 
     @application.post("/api/slicing/classify/confirm")
     async def confirm_slice_classification(payload: SliceClassifyConfirmInput):
+        unified_directory_only()
         return await slice_classification.confirm(payload.planId, payload.requestId, payload.expectedRevision)
 
     @application.post("/api/slicing/packages/{identity}/confirm")
@@ -402,11 +499,28 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
             path = slicing.package_image(identity, name)
         except ValueError as error:
             raise HTTPException(404, str(error)) from None
-        return FileResponse(path, media_type="image/jpeg", headers={"Cache-Control": "private, no-store"})
+        guard = leases.read(path)
+        guard.__enter__()
+        return FileResponse(path, media_type="image/jpeg", headers={"Cache-Control": "private, no-store"},
+                            background=BackgroundTask(guard.__exit__, None, None, None))
 
     @application.post("/api/slicing/settings")
     async def slicing_settings(payload: SlicingSettingsInput):
         return slicing.update_settings(payload.model_dump())
+
+    @application.post("/api/slicing/process-limit")
+    async def slicing_process_limit(payload: SlicingProcessInput):
+        return slicing.update_process_limit(payload.model_dump())
+
+    @application.post("/api/slicing/organize-output/preview")
+    async def slicing_output_organization_preview(payload: SliceOutputOrganizationPreviewInput):
+        unified_directory_only()
+        return slice_output_organizer.preview(payload.model_dump())
+
+    @application.post("/api/slicing/organize-output/{identity}/confirm")
+    async def slicing_output_organization_confirm(identity: str, payload: SliceOutputOrganizationConfirmInput):
+        unified_directory_only()
+        return await slice_output_organizer.confirm(identity, payload.model_dump())
 
     @application.post("/api/slicing/scan", status_code=202)
     async def slicing_scan(payload: SlicingScanInput):
@@ -414,7 +528,13 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
 
     @application.post("/api/slicing/start", status_code=202)
     async def slicing_start(payload: SlicingStartInput):
-        return await slicing.start(payload.requestId, payload.expectedRevision, payload.mode, payload.itemId)
+        result = await slicing.start(payload.requestId, payload.expectedRevision, payload.mode, payload.itemId)
+        run = result.get('run') or {}
+        submissions.add('slicing', '单条切片' if payload.mode == 'single' else '批量切片',
+                        {'requestId': payload.requestId, 'runId': run.get('id'),
+                         'itemIds': [payload.itemId] if payload.itemId else run.get('items', []),
+                         'message': run.get('message') or '已接受切片操作。'}, request_id=payload.requestId)
+        return result
 
     @application.post("/api/slicing/pause")
     async def slicing_pause():
@@ -504,14 +624,18 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
 
     @application.get("/api/upload-audit/moves")
     async def audit_move_state():
+        if workspace.enabled:
+            return {'plan': None, 'busy': workspace.maintenance, 'workspaceManaged': True, 'directory': str(workspace.root)}
         return {"plan": audit_moves.latest(), "busy": audit_moves.busy}
 
     @application.post("/api/upload-audit/moves/preview")
     async def preview_audit_moves(payload: AuditMovePreviewInput):
+        unified_directory_only()
         return await audit_moves.preview(payload.model_dump())
 
     @application.post("/api/upload-audit/moves/{plan_id}/confirm", status_code=202)
     async def confirm_audit_moves(plan_id: str, payload: AuditMoveConfirmInput):
+        unified_directory_only()
         return audit_moves.start(plan_id, payload.requestId)
 
     @application.post("/api/session/{service}/login")
@@ -722,6 +846,23 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
     async def remove_record(identity: str, payload: RecordRemoveInput):
         return await videos.remove_record(identity, payload.model_dump())
 
+    @application.post('/api/videos/{identity}/hide-record')
+    async def hide_video_record(identity: str, payload: HistoryRemoveInput):
+        result = videos.record_visibility.hide(videos.store, payload.requestId,
+                                               [{'id': identity, 'expectedRevision': payload.expectedRevision}])
+        return {'id': identity, 'recordRemoval': result}
+
+    @application.post('/api/videos/records/restore')
+    async def restore_video_record(payload: RecordRestoreInput):
+        videos.record_visibility.restore(payload.requestId, payload.removalId)
+        return videos.state()
+
+    @application.post('/api/videos/records/remove')
+    async def hide_video_records(payload: SlicingRecordRemoveInput):
+        result = videos.record_visibility.hide(videos.store, payload.requestId,
+                                               [s.model_dump() for s in payload.selections])
+        return {'recordRemoval': result}
+
     @application.post("/api/videos/{identity}/cancel-clear")
     async def cancel_clear(identity: str, payload: HistoryRemoveInput):
         return await videos.cancel_clear(identity, payload.model_dump())
@@ -801,7 +942,7 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
         path = dist / "index.html"
         if not path.exists():
             return JSONResponse({"message": "请先运行 npm run build 构建网页。"}, status_code=503)
-        return FileResponse(path)
+        return FileResponse(path, headers={'Cache-Control': 'no-cache, must-revalidate'})
 
     return application
 

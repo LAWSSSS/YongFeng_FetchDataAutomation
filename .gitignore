@@ -40,6 +40,10 @@ coverage/
 
 # 构建、日志与临时文件
 build/
+/releases/
+*.zip
+*.dmg
+*.app/
 dist/
 *.egg-info/
 logs/

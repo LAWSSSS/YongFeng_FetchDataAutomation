@@ -1,0 +1,12 @@
+.record-delete{display:flex;justify-content:flex-end;min-width:0;margin-top:12px}
+.record-delete-trigger{display:inline-flex;align-items:center;gap:7px;min-height:40px;padding:8px 10px;background:transparent;color:#8c4437;font-size:13px;font-weight:600}
+.record-delete-trigger:hover:not(:disabled){background:#fbefeb;color:#78382e}
+.record-delete-confirm{flex:1;min-width:0;padding:14px 16px;border:1px solid #e7d9cf;border-radius:12px;background:#fffaf6;color:#684630;font-size:13px;line-height:1.6;overflow-wrap:anywhere}
+.record-delete-confirm p{margin:7px 0 0;max-width:70ch}
+.record-delete-confirm .actions{justify-content:flex-end;margin-top:12px}
+.record-delete-confirm button{min-height:40px}
+.record-delete-confirm .danger{background:#984b3c;color:#fff}
+.record-delete-confirm .danger:hover:not(:disabled){background:#7b392d}
+.record-deleted-notice{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;padding:12px 0;color:#315c45;font-size:14px;line-height:1.6}
+.record-deleted-notice .link{min-height:40px}
+@media(max-width:700px){.record-delete-trigger,.record-delete-confirm button{min-height:44px;font-size:14px}.record-delete-confirm .actions button{flex:1;white-space:normal}}
