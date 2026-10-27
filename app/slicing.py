@@ -12,7 +12,6 @@ import signal
 import stat
 import subprocess
 import tempfile
-import sys
 import time
 import unicodedata
 from contextlib import ExitStack, contextmanager
@@ -30,8 +29,7 @@ from .upload_remote import UploadRemote
 from .domain import now_iso
 from .file_leases import FileLeases
 from .slicing_core import build_category_result, category_image_target, sample_points
-from .slicing_remote import (ACTIVE_STATUSES, CUT_TYPES, FAILED_STATUSES, SUCCESS_STATUSES,
-                             SlicingRemote, log_matches_video, parse_config, source_video_ids,
+from .slicing_remote import (CUT_TYPES, SlicingRemote, log_matches_video, parse_config, source_video_ids,
                              target_dataset_id, task_state)
 from .upload_audit import AuditError, VIDEO_EXTENSIONS
 from .videos import Conflict

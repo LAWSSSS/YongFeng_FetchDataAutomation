@@ -1,6 +1,8 @@
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
 import PageBoundary from './PageBoundary';
 import Workspace from './Workspace';
+import DownloadManager from './DownloadManager';
+import type { DownloadWorkers } from './DownloadManager';
 import type { FormEvent } from 'react';
 import { usePolling } from './usePolling';
 import AdmissionSettings from './AdmissionSettings';
@@ -11,11 +13,10 @@ import { InspectionResults, VideoBatches, VideoStatusFilters } from './RecordGro
 import { canDownload, syncVideoSelection, videoStatusOptions } from './record-groups';
 import SubmissionRecords from './SubmissionRecords';
 import RecordDelete from './RecordDelete';
-import { videoRecovery } from './video-recovery';
+import { videoRecovery, versionDownloadable } from './video-recovery';
 import type { CollectionJob, InspectionRecord } from './record-groups';
 
 const Slicing = lazy(() => import('./Slicing'));
-const UploadAudit = lazy(() => import('./UploadAudit'));
 
 type SessionEntry = {connected: boolean; user: string; hasSavedCredentials?: boolean; savedAccount?: string; credentialWarning?: string};
 type Session = { source: SessionEntry; target: SessionEntry; capabilities?: {batchDownload?: boolean} };
@@ -23,7 +24,7 @@ type RecordRow = InspectionRecord;
 type Search = {id: string; status: string; message: string; records: RecordRow[]; scanned: number; total: number; admissionRevision: number};
 type Job = CollectionJob;
 type Version = {revision: number; startTime: string; endTime: string; durationSeconds: number; state: string;
-  platformStatus?: string; taskId?: string; resultId?: string; errorCode?:string; message?: string; filePath?: string; localCleanupState?:string;
+  platformStatus?: string; taskId?: string; resultId?: string; errorCode?:string; message?: string; filePath?: string; sha256?:string; localCleanupState?:string;
   receivedBytes?: number; totalBytes?: number; attempts?: number; downloadRequested?: boolean; writeAttempted?: boolean;
   review?: {code: string; message: string; actual?: {videoName?: string; startTime?: string; endTime?: string; taskStatus?: string} | null}};
 type Video = {id: string; jobId: string; submittedAt?:string; plate: string; name: string; qualityStart: string; qualityEnd: string;
@@ -31,7 +32,7 @@ type Video = {id: string; jobId: string; submittedAt?:string; plate: string; nam
   cleanupPending?: boolean; error?: string;
   deletion?: {state: string; message: string; requestId: string; expectedRevision: number; deleteCloud: boolean; deleteLocalFiles: boolean}};
 type VideoState = {videos: Video[]; directory: string; lastCheck: string; checkError: string;
-  hiddenRecordCount?:number;
+  hiddenRecordCount?:number; downloadWorkers?:DownloadWorkers;
   totalCount: number; filteredCount: number; byJob: Record<string,number>; counts: Record<string,number>};
 type VideoSelection = {id: string; version: number; expectedRevision: number};
 type BulkResult = {outcomes: {id: string; ok: boolean; message?: string}[]};
@@ -124,6 +125,7 @@ function VideoCard({video, directory, onRefresh, selected, onSelect, onRemoved}:
   const [draftRevision, setDraftRevision] = useState(initialDraft.revision);
   const [dirty, setDirty] = useState(initialDraft.dirty);
   const [prepared, setPrepared] = useState<PreparedCorrection | null>(null);
+  const restartRequest = useRef<{version:number;expectedRevision:number;requestId:string}|null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   useEffect(() => {
@@ -187,19 +189,25 @@ function VideoCard({video, directory, onRefresh, selected, onSelect, onRemoved}:
   }
   const saved = video.versions.find(version => version.revision === video.acceptedRevision);
   const historical = video.versions.filter(version => version.revision !== active.revision && version.state !== 'withdrawn');
-  const renderVersion = (version: Version) => <div key={version.revision} className={version.revision === active.revision ? 'version current' : 'version'}>
+  const renderVersion = (version: Version) => <div key={version.revision} className="version-entry"><div className={version.revision === active.revision ? 'version current' : 'version'}>
     <span>第 {version.revision + 1} 版{version.revision === 0 ? ' · 初采' : ' · 手动更正'}</span>
     <strong>{version.startTime} → {version.endTime}</strong><span>{duration(version.durationSeconds)}</span>
     <span>{version.state === 'cloud_deleted' ? '旧版已清理' : version.platformStatus || version.state}</span>
-  </div>;
+    </div>{version.revision !== active.revision && <div className="version-actions">
+      {versionDownloadable(version) && !clearing ? <a className="version-download" download
+        href={`/api/videos/${video.id}/versions/${version.revision}/download`}>下载第 {version.revision + 1} 版</a>
+        : <span className="subtle">{version.state === 'cloud_deleted' ? '此版已清理，无法下载' : '此版结果未确认，暂不能下载'}</span>}
+    </div>}</div>;
   return <article className="video-card">
     <div className="video-head"><div><div className="record-pick"><input type="checkbox" aria-label={`选择采集记录 ${video.name} ${video.qualityStart}`} checked={selected} disabled={clearing || busy} onChange={onSelect} /><h3>{video.name}</h3></div><span className="subtle">质检 {video.qualityStart} → {video.qualityEnd}</span></div>
       <span className={`badge ${active.state}`}>{clearing ? '清理待完成' : active.downloadRequested && active.state === 'ready' ? '等待下载' : active.state === 'waiting' && active.platformStatus === 'READYING' ? '平台排队中' : ({ready:'可查看',saved:'已保存',waiting:'等待平台结果',submitted:'已提交',uncertain:'待核对',downloading:'下载中',publishing:'正在保存',failed:'需处理',attention:'待核对',pending:'排队中',submitting:'提交中'} as Record<string,string>)[active.state] || active.state}</span></div>
     <div className="video-versions">{renderVersion(active)}
-      {!!historical.length && <details className="version-history"><summary>历史版本（{historical.length}）</summary>{historical.map(renderVersion)}</details>}
+      {!!historical.length && <details className="version-history"><summary>历史版本（{historical.length}）</summary>
+        <p className="subtle">历史版本保存到浏览器的下载目录；可在浏览器中选择保存位置，不改变当前更正和下载进度。</p>{historical.map(renderVersion)}</details>}
     </div>
     {active.message && <p className="notice">{active.message}</p>}
     {recovery.failedMedia && <div className="notice"><strong>视频未通过完整性检查</strong><p>可查看当前视频，修改日期、时间或时长后重采，也可按当前区间重新采集。重试下载会复用原平台文件；若原文件损坏，建议重新采集。旧版在新版验证成功前保留。</p></div>}
+    {recovery.checkpointProblem && <div className="notice"><strong>断点校验未通过</strong><p>可重新下载本条当前版本，重新获取完整文件；也可修改时间或按当前区间重新采集。历史版本和更正记录保留。</p></div>}
     {active.state === 'attention' && <div className="notice"><strong>处理方法</strong><p>{({task_missing:'先重新核对这一条；任务仍不存在时，可按保留的更正区间重新采集。',task_identity_changed:'核对平台实际时段。下面的输入保留你的更正；需要修改时可继续更正，也可按保留的区间重采。',result_missing:'先重新核对这一条；也可查看可用旧版。若视频结果仍不存在，手动按当前更正区间重采。',platform_failed:'平台采集失败或终止。确认时段后可手动重采或继续更正。',result_identity_changed:'平台结果ID不同，需要在原平台核对确切视频，程序会保留原绑定。',multiple_results:'原平台返回多个视频，需要核对确切结果，程序不会自动选择。',submission_ambiguous:'提交后出现多个相同任务，需要核对确切任务ID，暂时不要再次提交。'} as Record<string,string>)[active.review?.code || ''] || '先重新核对这一条。异常解除后会恢复可查看状态，更正区间会保留。'}</p>
       {active.review?.actual && <p>平台实际：{active.review.actual.videoName} · {active.review.actual.startTime} → {active.review.actual.endTime} · {active.review.actual.taskStatus}</p>}</div>}
     {video.error && <p className="notice">{video.error}</p>}
@@ -212,10 +220,18 @@ function VideoCard({video, directory, onRefresh, selected, onSelect, onRemoved}:
       {recovery.canRecapture && <button disabled={busy} onClick={() => {if(window.confirm(`按已保存的区间重新采集：${active.startTime} → ${active.endTime}。现有更正和旧版将保留，是否提交？`)) void act('recapture', {version:active.revision,expectedRevision:video.revision,requestId:uid()});}}>按当前区间重新采集</button>}
       {active.revision > 0 && !isCurrentSaved && !['saved','downloading','publishing','withdrawn'].includes(active.state) && <button className="secondary" disabled={busy} onClick={() => {void act('withdraw', {version: active.revision, expectedRevision: video.revision, requestId: uid()});}}>撤回本次更正</button>}
       {active.state === 'failed' && active.downloadRequested && <button disabled={busy} onClick={() => {void act('retry-download', {});}}>重试下载</button>}
+      {recovery.canRestartDownload && <button className="secondary" disabled={busy || !directory} onClick={() => {
+        if (!window.confirm(`重新下载 ${video.name} 第 ${active.revision + 1} 版？只清除这一版的下载断点，重新获取完整视频；其他版本和更正均保留。`)) return;
+        if (!restartRequest.current || restartRequest.current.version !== active.revision || restartRequest.current.expectedRevision !== video.revision) {
+          restartRequest.current = {version:active.revision,expectedRevision:video.revision,requestId:uid()};
+        }
+        void act('restart-download', restartRequest.current);
+      }}>重新下载完整文件</button>}
       {active.downloadRequested && <button className="secondary" disabled={busy} onClick={() => void act('cancel-download', {version:active.revision,expectedRevision:video.revision,requestId:uid()})}>停止本条下载，保留断点</button>}</div>}
     {playingVersion && !clearing && <div className="player"><video controls playsInline preload="metadata" src={`/api/videos/${video.id}/versions/${playingVersion.revision}/stream`} onPlay={() => setReviewed(true)} />
       <p className="subtle">正在查看第{playingVersion.revision+1}版：{playingVersion.startTime} → {playingVersion.endTime}</p>
       {playingVersion.state === 'attention' && <p className="notice">此视频仅供核对，异常解除后才能确认下载。</p>}
+      {playing !== active.revision && versionDownloadable(playingVersion) && <p><a className="version-download" download href={`/api/videos/${video.id}/versions/${playingVersion.revision}/download`}>下载正在查看的第 {playingVersion.revision + 1} 版</a></p>}
       {playing === active.revision && active.state === 'ready' && <><label className="review-check"><input type="checkbox" checked={reviewed} onChange={e => setReviewed(e.target.checked)} />我已查看并确认这一版视频</label><button disabled={!reviewed || !directory || busy} onClick={() => {void act('confirm', {version: active.revision, expectedRevision: video.revision, requestId: uid()});}}>确认这版并下载</button>{!directory && <p className="notice">请连接外置盘后再下载。</p>}</>}</div>}
     {canCorrect && <details className="correction"><summary>继续更正采集日期、时间与时长</summary>
       <form onSubmit={prepare}><p>当前采集：{active.startTime} → {active.endTime} · {duration(active.durationSeconds)}</p>
@@ -236,9 +252,10 @@ function VideoCard({video, directory, onRefresh, selected, onSelect, onRemoved}:
 
 export default function App() {
   const [removedVideo,setRemovedVideo]=useState<{id:string;name:string;removalId:string;restoreRequestId:string}|null>(null);
-  const [tab, setTab] = useState<'collect' | 'videos' | 'audit' | 'slicing'>(() => {
+  const [tab, setTab] = useState<'collect' | 'videos' | 'slicing'>(() => {
     try {const saved=sessionStorage.getItem('simple-active-tab');
-      if (saved === 'audit' || saved === 'slicing') return saved;
+      if (saved === 'audit') return 'videos';
+      if (saved === 'slicing') return saved;
       if (saved === 'videos') return saved;
     } catch { /* The initial page also works when local preferences are unavailable. */ }
     return 'collect';
@@ -336,9 +353,9 @@ export default function App() {
       setShowBulkClear(false);await refresh();
     });
   }
-  return <div className="app-shell"><header className="site-header"><div className="brand"><span className="brand-symbol">映</span><div><strong>简易版质检视频采集</strong><small>采集 · 更正 · 上传 · 切片</small></div></div>
-    <nav><button className={tab === 'collect' ? 'selected' : ''} onClick={() => setTab('collect')}>查询与批量采集</button><button className={tab === 'videos' ? 'selected' : ''} onClick={() => setTab('videos')}>视频查看与更正 <span>{state.totalCount}</span></button><button className={tab === 'audit' ? 'selected' : ''} onClick={() => setTab('audit')}>上传核对与自动上传</button><button className={tab === 'slicing' ? 'selected' : ''} onClick={() => setTab('slicing')}>模型识别与切片</button></nav></header>
-    <main><section className={`hero ${tab === 'slicing' || tab === 'audit' ? 'compact' : ''}`}><div><h1>{tab === 'slicing' ? '按模型识别视频片段' : tab === 'audit' ? '找出还没上传的视频' : tab === 'collect' ? '从质检实绩发起采集' : '亲自决定留下哪一版'}</h1><p>{tab === 'slicing' ? '识别车斗和磁盘吊片段，导出照片并上传到对应图片集。' : tab === 'audit' ? '读取本地目录中的视频文件名，分别核对车斗检测与磁盘吊的导入日志。' : tab === 'collect' ? '初次采集固定为质检开始后 5 分钟，时长 60 分钟。在查询结果中选择后即可采集。' : '平台完成后先在线播放；确认原版或手动更正，最终才下载到你指定的文件夹。'}</p></div><div className="rule-card"><span>{tab === 'slicing' ? '默认模型抽样' : tab === 'audit' ? '共用一份本地清单' : '默认采集规则'}</span><strong>{tab === 'slicing' ? '30 秒 · 150 张' : tab === 'audit' ? '2 个数据集' : '+5 分钟'}</strong><small>{tab === 'slicing' ? '按目标区间自动选择切片间隔' : tab === 'audit' ? '各自读取日志 · 分别显示缺失名单' : '从质检开始时间计算 · 采集 60 分钟'}</small></div></section>
+  return <div className="app-shell"><header className="site-header"><div className="brand"><span className="brand-symbol">映</span><div><strong>简易版质检视频采集</strong><small>采集 · 更正 · 切片</small></div></div>
+    <nav><button className={tab === 'collect' ? 'selected' : ''} onClick={() => setTab('collect')}>查询与批量采集</button><button className={tab === 'videos' ? 'selected' : ''} onClick={() => setTab('videos')}>视频查看与更正 <span>{state.totalCount}</span></button><button className={tab === 'slicing' ? 'selected' : ''} onClick={() => setTab('slicing')}>模型识别与切片</button></nav></header>
+    <main><section className={`hero ${tab === 'slicing' ? 'compact' : ''}`}><div><h1>{tab === 'slicing' ? '按模型识别视频片段' : tab === 'collect' ? '从质检实绩发起采集' : '亲自决定留下哪一版'}</h1><p>{tab === 'slicing' ? '识别车斗和磁盘吊片段，导出照片并上传到对应图片集。' : tab === 'collect' ? '初次采集固定为质检开始后 5 分钟，时长 60 分钟。在查询结果中选择后即可采集。' : '平台完成后先在线播放；确认原版或手动更正，最终才下载到你指定的文件夹。'}</p></div><div className="rule-card"><span>{tab === 'slicing' ? '默认模型抽样' : '默认采集规则'}</span><strong>{tab === 'slicing' ? '30 秒 · 150 张' : '+5 分钟'}</strong><small>{tab === 'slicing' ? '按目标区间自动选择切片间隔' : '从质检开始时间计算 · 采集 60 分钟'}</small></div></section>
     <Workspace onChanged={refresh} />
     {(tab === 'collect' || tab === 'videos') && <div className="connections"><Login service="source" connected={session.source.connected} user={session.source.user}
       savedAccount={session.source.savedAccount} hasSavedCredentials={session.source.hasSavedCredentials} credentialWarning={session.source.credentialWarning} onDone={refresh} />
@@ -347,7 +364,7 @@ export default function App() {
     {error && <p className="error global" role="alert">{error}</p>}{message && <p className="success global" role="status">{message}</p>}
     {bulkErrors.length > 0 && <div className="notice"><strong>这些条目已保留</strong><ul>{bulkErrors.map((item,i) => <li key={i}>{item}</li>)}</ul></div>}
     <PageBoundary key={tab}><Suspense fallback={<section className="panel" role="status">正在打开页面…</section>}>
-    {tab === 'slicing' ? <Slicing onConnect={() => setTab('audit')} /> : tab === 'audit' ? <UploadAudit defaultDirectory={state.directory} /> : tab === 'collect' ? <><section className="panel"><div className="section-title"><div><h2>筛选质检实绩</h2></div><span>按保存的准入条件区分已批准与未批准</span></div>
+    {tab === 'slicing' ? <Slicing /> : tab === 'collect' ? <><section className="panel"><div className="section-title"><div><h2>筛选质检实绩</h2></div><span>按保存的准入条件区分已批准与未批准</span></div>
       <details className="collection-admission"><summary>准入条件 <span>车牌、质检时长与照片要求</span></summary><AdmissionSettings<Search> searchId={search?.status === 'complete' ? search.id : undefined}
         disabled={!!busy || search?.status === 'running'} onBlockedChange={admissionChanged}
         onApplied={result => {if (result.search) setSearch(result.search);setSelected(new Set());}} /></details>
@@ -365,7 +382,13 @@ export default function App() {
         directory={state.directory} onCollect={download=>void submitSelected(download)} />}</section>
       <SubmissionRecords kind="collection" onChanged={() => {void refresh();}} /></>
       : <><section className="panel"><div className="section-title"><div><h2>保存你明确选择的版本</h2></div><button className="secondary" disabled={!session.target.connected || !!busy} onClick={() => {void run('check', async () => {await api('/videos/check', {}); await refresh();});}}>检查平台状态</button></div>
-        <p className="subtle">保存到工作区“采集视频”：{state.directory || '请先启用上方的文件工作区'}。最多同时下载 5 条；断盘时保留断点。可逐条查看后确认，也可批量批准下载。</p>{state.checkError && <p className="notice">{state.checkError}</p>}</section>
+        <p className="subtle">保存到工作区“采集视频”：{state.directory || '请先启用上方的文件工作区'}。断盘时保留断点。可逐条查看后确认，也可批量批准下载。</p>{state.checkError && <p className="notice">{state.checkError}</p>}</section>
+        <DownloadManager workers={state.downloadWorkers} onRefresh={refresh} onSave={async payload=>{
+          const workers=await api<DownloadWorkers>('/videos/download-limit',payload);
+          ++refreshSequence.current;
+          setState(before=>({...before,downloadWorkers:workers}));
+          return workers;
+        }} />
         <section className="panel record-controls"><div className="section-title"><h2>筛选采集记录</h2><span>筛选到 {state.filteredCount} / {state.totalCount} 条</span></div>
           <VideoStatusFilters value={appliedVideoFilters.status} counts={state.counts} total={state.totalCount}
             disabled={!!busy} onChange={filterVideoStatus} />

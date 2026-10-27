@@ -169,8 +169,7 @@ async def test_fixed_external_download_storage_migrates_resumable_parts(app_fact
     legacy_part.parent.mkdir(parents=True)
     legacy_part.write_bytes(b"resumable-partial-video")
 
-    assert videos.download_slots._value == 5
-    assert videos.publish_slots._value == 5
+    assert videos.download_workers() == {"active": 0, "queued": 0, "max": 5, "revision": 0}
     async with app.router.lifespan_context(app):
         migrated = videos.work / identity / "v0.part"
         assert migrated.read_bytes() == b"resumable-partial-video"
@@ -790,13 +789,14 @@ async def test_review_recovers_exact_result_and_missing_result_can_be_recaptured
 
 
 @pytest.mark.asyncio
-async def test_invalid_video_recapture_keeps_versions_and_only_creates_once(app_factory, platform, tmp_path):
+@pytest.mark.parametrize('error_code', ['invalid_video', 'range_invalid', 'object_changed', 'invalid_length'])
+async def test_invalid_video_recapture_keeps_versions_and_only_creates_once(app_factory, platform, tmp_path, error_code):
     app = app_factory()
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1") as client:
             row = await new_video(client, app)
             version = row["versions"][0]
-            version.update(state="failed", errorCode="invalid_video", downloadRequested=True,
+            version.update(state="failed", errorCode=error_code, downloadRequested=True,
                            message="Video tail cannot be decoded.")
             app.state.videos.store.save(row)
             cached = app.state.videos.work / row["id"] / "v0.part"
@@ -1127,8 +1127,11 @@ def test_transfer_write_failure_keeps_source_and_records_stage(tmp_path, monkeyp
 
 
 @pytest.mark.asyncio
-async def test_external_transfers_allow_five_workers_and_queue_the_sixth(app_factory, tmp_path, monkeypatch):
+@pytest.mark.parametrize("limit", [5, 8])
+async def test_external_transfers_respect_configured_limit(app_factory, tmp_path, monkeypatch, limit):
     manager = app_factory().state.videos
+    if limit != 5:
+        manager.update_download_limit({"maxConcurrentDownloads": limit, "expectedRevision": 0, "requestId": "transfer-limit"})
     release = asyncio.Event()
     workers = []
     active = 0
@@ -1172,14 +1175,14 @@ async def test_external_transfers_allow_five_workers_and_queue_the_sixth(app_fac
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", start_worker)
     tasks = [asyncio.create_task(manager.copy_to_final(tmp_path / f"source-{i}.part", tmp_path / f"video-{i}.mp4"))
-             for i in range(6)]
+             for i in range(limit + 1)]
     try:
-        await wait_until(lambda: len(workers) == 5)
-        assert active == 5 and len(workers) == 5
+        await wait_until(lambda: len(workers) == limit)
+        assert active == limit and len(workers) == limit
         assert all(not task.done() for task in tasks)
         release.set()
         await asyncio.wait_for(asyncio.gather(*tasks), timeout=3)
-        assert len(workers) == 6 and peak == 5 and active == 0
+        assert len(workers) == limit + 1 and peak == limit and active == 0
     finally:
         release.set()
         for task in tasks:

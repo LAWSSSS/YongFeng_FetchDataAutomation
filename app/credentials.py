@@ -3,7 +3,6 @@
 import json
 import os
 import tempfile
-from pathlib import Path
 from .runtime import credentials_directory
 
 

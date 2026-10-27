@@ -89,52 +89,10 @@
 .slice-categories .slice-category.needs-review {background:transparent}
 .slice-photos {display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px;margin-top:8px}
 .slice-photos img {width:100%;height:72px;object-fit:cover;background:#e7eee4}
-.slice-classify > summary {font-weight:650;cursor:pointer;}
-.slice-classify[open] > summary {margin-bottom:18px;}
-.slice-classify label {display:grid;gap:8px;max-width:760px;}
-.slice-classify ul {max-height:320px;overflow:auto;padding-inline-start:22px;}
-.slice-classify li {overflow-wrap:anywhere;margin-block:8px;}
 
-.slicing-management {padding:20px 22px}
-.slicing-management .section-title {margin-bottom:16px}
 .slicing-management-grid {display:grid;grid-template-columns:minmax(250px,.8fr) minmax(420px,1.6fr);gap:16px;align-items:start}
-.slice-management-card {min-width:0;padding:18px;border:1px solid #dce6dc;border-radius:10px;background:#fbfcfa}
-.slice-management-card h3,.slice-output-organizer h3 {margin:0 0 8px;font-size:16px;color:#294b35}
-.slice-management-summary {margin:0 0 14px;color:#52675a;font-size:14px;line-height:1.6}
-.slice-process-control {display:flex;align-items:end;gap:12px;flex-wrap:wrap}
-.slice-process-control label,.slice-path-options label {display:grid;gap:6px;min-width:150px;font-size:13px;color:#43574a}
-.slice-process-control input {width:125px;min-height:40px}
-.slice-process-control button,.slice-management-actions button {min-height:40px}
 .slice-independent-queues {display:grid;gap:6px;margin-top:15px;padding:11px 12px;border-radius:8px;background:#f0f5ef;color:#43574a;font-size:13px;line-height:1.5}
 .slice-independent-queues strong {color:#294b35}
-.slice-management-card .wide {display:grid;gap:7px;margin:10px 0;font-size:13px;color:#43574a}
-.slice-management-card textarea,.slice-management-card input {width:100%;min-width:0}
-.slice-management-card textarea {resize:vertical}
 .slice-path-current {margin:10px 0;color:#52675a;font-size:13px;line-height:1.6;overflow-wrap:anywhere}
-.slice-path-current code,.slice-archive-paths code,.slice-organize-plan code {display:block;margin-top:4px;color:#315c45;overflow-wrap:anywhere;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
-.slice-archive-paths {padding:10px 12px;border-radius:8px;background:#f0f5ef}
-.slice-archive-paths p {margin:4px 0 9px;font-size:13px;color:#43574a}
-.slice-archive-paths p:last-child {margin-bottom:4px}
-.slice-path-options {display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px 14px;margin:12px 0}
-.slice-path-options .check-label {display:flex;align-items:center;gap:8px;align-self:end;padding:8px 0}
-.slice-path-options .check-label input {width:auto}
-.slice-management-actions {margin-top:12px}
-.slice-output-organizer {display:grid;grid-template-columns:minmax(250px,1fr) auto;gap:8px 18px;align-items:center;margin-top:16px;padding:18px;border:1px solid #dce6dc;border-radius:10px}
-.slice-output-organizer>div:first-child p {margin:0;color:#52675a;font-size:13px;line-height:1.65}
-.slice-output-organizer>.subtle,.slice-output-organizer>.error,.slice-organize-plan {grid-column:1/-1}
-.slice-organize-plan {padding:12px 14px;border-radius:8px;background:#f4f7f2}
-.slice-organize-plan>p:first-child {margin-top:0;color:#43574a;line-height:1.6}
-.slice-organize-plan ul {max-height:280px;overflow:auto;padding-left:20px;margin-bottom:0}
-.slice-organize-plan li {margin:8px 0;color:#52675a;font-size:13px;line-height:1.55;overflow-wrap:anywhere}
-.slice-organize-plan li code {padding-left:12px}
+.slice-path-current code {display:block;margin-top:4px;color:#315c45;overflow-wrap:anywhere;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
 @media(max-width:900px) {.slicing-management-grid {grid-template-columns:1fr}}
-@media(max-width:700px) {
-  .slicing-management {padding:16px}
-  .slice-management-card {padding:14px}
-  .slice-path-options {grid-template-columns:1fr}
-  .slice-output-organizer {grid-template-columns:1fr;padding:14px}
-  .slice-output-organizer .actions {display:flex;flex-wrap:wrap}
-  .slice-output-organizer .actions button {flex:1}
-  .slice-management-actions {display:flex;flex-wrap:wrap}
-  .slice-management-actions button {flex:1}
-}

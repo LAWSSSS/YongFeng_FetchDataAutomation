@@ -1,6 +1,4 @@
 """Deletion gates. Completion labels alone are never deletion authority."""
-from pathlib import Path
-
 from .audit_moves import checked_path
 from .domain import now_iso
 from .workspace_files import compatible, file_version

@@ -1,0 +1,15 @@
+.slicing-management {padding:20px 22px}
+.slicing-management .section-title {margin-bottom:16px}
+.slice-management-card {min-width:0;padding:18px;border:1px solid #dce6dc;border-radius:10px;background:#fbfcfa}
+.slice-management-card h3 {margin:0 0 8px;font-size:16px;color:#294b35}
+.slice-management-summary {margin:0 0 14px;color:#52675a;font-size:14px;line-height:1.6}
+.slice-process-control {display:flex;align-items:end;gap:12px;flex-wrap:wrap}
+.slice-process-control label {display:grid;gap:6px;min-width:150px;font-size:13px;color:#43574a}
+.slice-process-control input {width:150px;min-height:40px}
+.slice-process-control button {min-height:40px}
+@media(max-width:700px) {
+  .slicing-management {padding:16px}
+  .slice-management-card {padding:14px}
+  .slice-process-control input {font-size:16px}
+  .slice-process-control button {min-height:44px}
+}

@@ -5,6 +5,7 @@ import { physicalCategories, physicalFiles, physicalState, slicePage, sliceTitle
 import DateSection from './DateSection';
 import { groupSubmissionDays, submissionDay, submissionInstant, submissionTime } from './submission-dates';
 import RecordDelete from './RecordDelete';
+import ProcessLimitControl from './ProcessLimitControl';
 import './slicing.css';
 
 type Category = {
@@ -204,7 +205,7 @@ function CategoryCard({item, categoryName, category, packages = [], onUpdated}: 
   </div>;
 }
 
-export default function Slicing({onConnect}: {onConnect: () => void}) {
+export default function Slicing() {
   const [state, setState] = useState<State>(empty);
   const [settings, setSettings] = useState<Settings>(emptySettings);
   const [settingsDirty, setSettingsDirty] = useState(false);
@@ -341,17 +342,13 @@ export default function Slicing({onConnect}: {onConnect: () => void}) {
           <p className="slice-management-summary">{state.localWorkers
             ? `正在运行 ${state.localWorkers.active} 个 · 后台进程 ${state.localWorkers.processes} 个 · 排队 ${state.localWorkers.queued} 个`
             : '当前后台尚未提供进程状态。现有任务会继续运行，后台安全更新后即可在此调整。'}</p>
-          <div className="slice-process-control">
-            <label>同时识别视频数（1–8）<input type="number" min={1} max={8} step={1} value={processDraft}
-              disabled={!managementApiReady} onChange={event=>{setProcessDraft(Number(event.target.value));setProcessDirty(true);}} /></label>
-            <button disabled={!managementApiReady || !processDirty || !Number.isInteger(processDraft) || processDraft < 1 || processDraft > 8 || !!busy}
-              onClick={()=>void run('process-limit',async()=>{
+          <ProcessLimitControl label="同时识别视频数（1–8）" value={processDraft} dirty={processDirty}
+            disabled={!managementApiReady || !!busy} buttonLabel="保存进程数"
+            onChange={value=>{setProcessDraft(value);setProcessDirty(true);}}
+            onSave={()=>void run('process-limit',async()=>{
                 const result=await request<State>('/process-limit',{requestId:uid(),expectedRevision:state.localWorkers?.revision ?? 0,maxLocalSlicingProcesses:processDraft});
                 setProcessDirty(false);return result;
-              },`并行识别数已设为 ${processDraft}。`)}>
-              保存进程数
-            </button>
-          </div>
+              },`并行识别数已设为 ${processDraft}。`)} />
           <div className="slice-independent-queues"><strong>图片上传与导入（独立队列）</strong>{state.packages?.targets.map(target=><span key={target.id}>{target.name} · 上传 {target.uploading} · 导入 {target.importing} · 排队 {target.queued}</span>)}</div>
           <p className="subtle">上传和导入不占用本地识别进程。增加识别进程会提高并行度，也会增加内存和显存占用。</p>
         </section>
@@ -391,7 +388,7 @@ export default function Slicing({onConnect}: {onConnect: () => void}) {
         })}
       </div>
       {(state.busy || state.enabled) && <p className="notice">处理中暂不能保存模型设置。暂停并等待本条停止后，可修改设置；有效观察会继续保留。</p>}
-      <p className="subtle">切片照片按“车斗/磁盘吊 → 视频名_ID → image”集中保存，压缩包与照片同目录。Python 推理环境独立于网站，模型文件不复制或修改。目录和模型参数统一在“进程管理”保存。</p>
+      <p className="subtle">视频、照片和压缩包由“文件工作区”管理。模型参数在此保存，Python 推理环境独立运行。</p>
       <div className="actions"><button disabled={!state.connected || state.busy || state.enabled || !!busy || !settingsDirty} onClick={()=>void run('settings',saveSettings,'模型设置已保存。')}>保存模型设置</button>{settingsDirty && <button className="secondary" onClick={()=>{dirty.current=false;setSettingsDirty(false);setSettings(state.settings);}}>撤销修改</button>}</div>
     </details>
 

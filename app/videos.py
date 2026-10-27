@@ -19,6 +19,7 @@ from urllib.parse import urlsplit, urlunsplit
 import httpx
 
 from .domain import DEFAULT_TARGET, approval_issue, format_time, gather_payload, now_iso, parse_time
+from .download_slots import DownloadSlots
 from .jobs import JobManager
 from .media import (DownloadFailure, download_url, file_digest,
                     prepare_directory, valid_video_header, video_filename)
@@ -31,6 +32,8 @@ RETRY_DELAYS = (2, 5, 10, 20, 30, 60, 60, 60)
 IDLE_POLL_SECONDS = 30
 ACTIVE_POLL_SECONDS = 8
 TERMINAL = {"withdrawn", "cloud_deleted"}
+DEFAULT_DOWNLOAD_LIMIT = 5
+MAX_DOWNLOAD_LIMIT = 8
 
 
 def external_video_directory() -> Path:
@@ -51,6 +54,7 @@ class VideoStore:
         self.db = job_store.db
         self.db.execute("CREATE TABLE IF NOT EXISTS simple_videos (id TEXT PRIMARY KEY, payload TEXT NOT NULL)")
         self.db.execute("CREATE TABLE IF NOT EXISTS simple_settings (id INTEGER PRIMARY KEY, directory TEXT NOT NULL)")
+        self.db.execute("CREATE TABLE IF NOT EXISTS simple_download_settings (id INTEGER PRIMARY KEY, payload TEXT NOT NULL)")
         self.db.commit()
         for row in self.list():
             for version in row["versions"]:
@@ -82,12 +86,23 @@ class VideoStore:
         self.db.execute("INSERT INTO simple_settings VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET directory=excluded.directory", (value,))
         self.db.commit()
 
+    def download_settings(self):
+        row = self.db.execute("SELECT payload FROM simple_download_settings WHERE id=1").fetchone()
+        return json.loads(row[0]) if row else {"maxConcurrentDownloads": DEFAULT_DOWNLOAD_LIMIT,
+                                              "revision": 0, "requests": {}}
+
+    def save_download_settings(self, settings):
+        self.db.execute("INSERT INTO simple_download_settings VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload",
+                        (json.dumps(settings),))
+        self.db.commit()
+
 
 class VideoManager:
     def __init__(self, jobs: JobManager, target: RemoteClient, data_dir: Path,
                  fixed_directory: Path | None = None, require_mounted_external: bool = False,
                  staging_directory: Path | None = None):
         self.jobs, self.target = jobs, target
+        self.cloud_lease_root = data_dir / '.leases' / 'cloud'
         self.store = VideoStore(jobs.store)
         from .record_visibility import RecordVisibility
         self.record_visibility = RecordVisibility(self.store.db, 'collection')
@@ -114,14 +129,18 @@ class VideoManager:
         self.target_config = dict(DEFAULT_TARGET)
         self.check_lock = asyncio.Lock()
         self.row_locks: dict[str, asyncio.Lock] = {}
-        self.download_slots = asyncio.Semaphore(5)
-        self.publish_slots = asyncio.Semaphore(5)
+        self.download_settings = self.store.download_settings()
+        # Both stages share the scheduler's configured pipeline limit. Resizing
+        # the stage gates keeps already admitted transfers and their checkpoints.
+        self.download_slots = DownloadSlots(self.download_settings["maxConcurrentDownloads"])
+        self.publish_slots = DownloadSlots(self.download_settings["maxConcurrentDownloads"])
         self.running: dict[str, asyncio.Task] = {}
         self.loop_task: asyncio.Task | None = None
         self.storage_check_task: asyncio.Task | None = None
         self.wake = asyncio.Event()
         self.last_check = ""
         self.check_error = ""
+        self.stopping = False
 
     def rebase_mounted_external_paths(self):
         if not self.fixed_directory or not self.require_mounted_external:
@@ -176,6 +195,7 @@ class VideoManager:
         return self.row_locks.setdefault(identity, asyncio.Lock())
 
     async def start(self):
+        self.stopping = False
         if self.fixed_directory:
             if self.require_mounted_external:
                 # Do not probe the mount or free space: try the real copy directly.
@@ -195,6 +215,7 @@ class VideoManager:
         self.loop_task = asyncio.create_task(self.loop())
 
     async def shutdown(self):
+        self.stopping = True
         if self.loop_task:
             self.loop_task.cancel()
             await asyncio.gather(self.loop_task, return_exceptions=True)
@@ -218,7 +239,62 @@ class VideoManager:
                 "counts": {kind: sum(record_status(row) == kind for row in rows)
                            for kind in ("ready", "waiting", "review", "download", "saved", "deleting")},
                 "lastCheck": self.last_check, "checkError": self.storage_error or self.check_error,
-                "hiddenRecordCount": len(hidden)}
+                "hiddenRecordCount": len(hidden), "downloadWorkers": self.download_workers()}
+
+    def download_candidate(self, row):
+        if row.get("deletedAt") or row.get("deletion", {}).get("state") in ("pending", "error"):
+            return False
+        active = self.version(row, row.get("activeRevision"))
+        return bool(active and active.get("downloadRequested") and active["state"] in ("ready", "publishing")
+                    and self.store.directory())
+
+    def active_downloads(self):
+        return {identity for identity, task in self.running.items()
+                if not task.done() and task.get_name() == "publish-video"}
+
+    def download_workers(self):
+        active = self.active_downloads()
+        queued = sum(self.download_candidate(row) and row["id"] not in active for row in self.store.list())
+        return {"active": len(active), "queued": queued,
+                "max": self.download_settings["maxConcurrentDownloads"],
+                "revision": self.download_settings["revision"]}
+
+    def update_download_limit(self, data):
+        settings = self.download_settings
+        limit = data["maxConcurrentDownloads"]
+        if type(limit) is not int or not 1 <= limit <= MAX_DOWNLOAD_LIMIT:
+            raise ValueError("同时下载数量须为1到8的整数。")
+        requests = settings["requests"]
+        if data["requestId"] in requests:
+            if requests[data["requestId"]] != limit:
+                raise Conflict("这个请求编号已用于其他下载设置。")
+            return self.download_workers()
+        if data["expectedRevision"] != settings["revision"]:
+            raise Conflict("下载设置已在其他页面修改，请刷新后重试。")
+        updated = {"maxConcurrentDownloads": limit,
+                   "revision": settings["revision"] + (limit != settings["maxConcurrentDownloads"]),
+                   "requests": dict(list((requests | {data["requestId"]: limit}).items())[-1000:])}
+        self.store.save_download_settings(updated)
+        self.download_settings = updated
+        self.download_slots.set_limit(limit)
+        self.publish_slots.set_limit(limit)
+        self.schedule_downloads()
+        self.wake.set()
+        return self.download_workers()
+
+    def schedule_downloads(self, *, ready_only=False, exclude=None):
+        if self.stopping:
+            return
+        # Admit in record creation order; queued rows keep their current revision
+        # and checkpoint and do not acquire a row lock until a slot is available.
+        for row in reversed(self.store.list()):
+            if row["id"] == exclude or not self.download_candidate(row):
+                continue
+            active = self.version(row, row["activeRevision"])
+            if ready_only and (active["state"] != "ready" or active.get("publishing")):
+                continue
+            if self.target.connected or active.get("publishing"):
+                self.schedule(row)
 
     def configure_directory(self, value):
         if getattr(self, 'workspace', None) and self.workspace.enabled:
@@ -337,10 +413,7 @@ class VideoManager:
     async def loop(self):
         while True:
             self.wake.clear()
-            for row in self.store.list():
-                active = self.version(row, row.get("activeRevision"))
-                if active and active.get("downloadRequested") and active.get("publishing"):
-                    self.schedule(row)  # Completed local files do not require a platform connection.
+            self.schedule_downloads()  # Local publication can continue without a platform connection.
             if self.fixed_directory and not self.storage_ready and not self.require_mounted_external:
                 if not self.storage_check_task or self.storage_check_task.done():
                     self.storage_error = self.storage_error or "外置盘不可用；视频会先下载到本机暂存。"
@@ -521,6 +594,8 @@ class VideoManager:
                 return row
 
     def schedule(self, row):
+        if self.stopping:
+            return
         if getattr(self, 'workspace', None) and self.workspace.blocked:
             return
         if row.get("deletedAt"):
@@ -539,7 +614,9 @@ class VideoManager:
         active = next((v for v in row["versions"] if v["revision"] == row["activeRevision"]), None)
         if not active:
             return
-        if active.get("downloadRequested") and active["state"] in ("ready", "publishing") and self.store.directory():
+        if self.download_candidate(row):
+            if len(self.active_downloads()) >= self.download_settings["maxConcurrentDownloads"]:
+                return
             task = asyncio.create_task(self.publish(identity, active["revision"]), name="publish-video")
         elif row.get("cleanupPending") and self.target.connected and self.storage_ready:
             task = asyncio.create_task(self.finish_cleanup(identity))
@@ -552,6 +629,13 @@ class VideoManager:
         def finished(done, key=identity):
             if self.running.get(key) is done:
                 self.running.pop(key, None)
+            if done.get_name() == "publish-video" and not self.stopping:
+                # Refill real queued downloads immediately. Interrupted transfers
+                # retry on the regular poll, avoiding a tight retry loop offline.
+                row = self.store.get(key)
+                active = self.version(row, row.get("activeRevision")) if row else None
+                if not active or not active.get("downloadRequested") or active["state"] in ("saved", "failed"):
+                    self.schedule_downloads(ready_only=True, exclude=key)
         task.add_done_callback(finished)
 
     async def bound_result(self, version):
@@ -565,6 +649,9 @@ class VideoManager:
     def version(self, row, revision):
         return next((v for v in row["versions"] if v["revision"] == revision), None)
 
+    def cloud_lease_key(self, task_id):
+        return self.cloud_lease_root / hashlib.sha256(str(task_id).encode()).hexdigest()
+
     @staticmethod
     def require_editable(row):
         if row.get("deletion", {}).get("state") in ("pending", "error"):
@@ -572,7 +659,8 @@ class VideoManager:
 
     @staticmethod
     def repairable_media_failure(version):
-        return (version.get("state") == "failed" and version.get("errorCode") in ("invalid_video", "media_incomplete")
+        return (version.get("state") == "failed" and version.get("errorCode") in (
+                    "invalid_video", "media_incomplete", "range_invalid", "object_changed", "invalid_length")
                 and bool(version.get("taskId")) and bool(version.get("resultId")))
 
     async def correct(self, identity, payload):
@@ -749,6 +837,57 @@ class VideoManager:
             version["state"] = "ready"
             version.pop("message", None)
             self.store.save(row)
+            self.schedule(row)
+            return row
+
+    async def restart_download(self, identity, payload):
+        """Explicitly discard only this version's checkpoint, with replay protection."""
+        if self.row_lock(identity).locked():
+            current = self.store.get(identity)
+            operation = (current or {}).get("requests", {}).get(payload["requestId"], {})
+            if (current and not current.get("deletedAt") and operation.get("kind") == "restart-download"
+                    and operation.get("state") == "complete" and operation.get("version") == payload["version"]
+                    and operation.get("expectedRevision") == payload["expectedRevision"]):
+                return current
+            raise Conflict("本条仍在下载或保存，请先停止本条下载后再重新下载。")
+        async with self.row_lock(identity):
+            row = self.store.get(identity)
+            if not row or row.get("deletedAt"):
+                raise ValueError("视频记录不存在。")
+            existing = row["requests"].get(payload["requestId"])
+            signature = {"kind": "restart-download", "version": payload["version"],
+                         "expectedRevision": payload["expectedRevision"]}
+            if existing:
+                if any(existing.get(key) != value for key, value in signature.items()):
+                    raise Conflict("请求ID已用于其他操作。")
+                if existing.get("state") == "complete":
+                    return row
+            if row["revision"] != payload["expectedRevision"] or row["activeRevision"] != payload["version"]:
+                raise Conflict("当前版本已变化，未清除其他版本的断点。")
+            self.require_editable(row)
+            version = self.version(row, payload["version"])
+            if not version or version["state"] not in ("failed", "ready") or version.get("publishing") or version.get("transferWorkerPid"):
+                raise ValueError("当前版本不能重新下载，已保留保存进度。")
+            if not self.store.directory():
+                raise ValueError("请先设置保存目录。")
+            if getattr(self, 'workspace', None) and self.workspace.enabled:
+                self.workspace.require_root()
+            await self.bound_result(version)
+            part = self.work / row["id"] / f"v{version['revision']}.part"
+            if (part.is_symlink() or part.parent.is_symlink()
+                    or not part.resolve().is_relative_to(self.work.resolve())):
+                raise ValueError("断点路径异常，未清除任何文件。")
+            guard = self.file_leases.write(part) if getattr(self, "file_leases", None) else nullcontext()
+            with guard:
+                row["requests"][payload["requestId"]] = {**signature, "state": "pending"}
+                self.store.save(row)
+                await self.file_operation(part.unlink, True)
+                for key in ("etag", "totalBytes", "receivedBytes", "attempts", "errorCode", "message"):
+                    version.pop(key, None)
+                version.update(state="ready", downloadRequested=True,
+                               outputDirectory=version.get("outputDirectory") or self.store.directory())
+                row["requests"][payload["requestId"]]["state"] = "complete"
+                self.store.save(row)
             self.schedule(row)
             return row
 
@@ -1149,9 +1288,19 @@ class VideoManager:
                         raise DownloadFailure("媒体链接或服务器暂时不可用，稍后续传。", "temporary_media", retryable=True)
                     if response.status_code == 416:
                         match = re.fullmatch(r"bytes \*/(\d+)", response.headers.get("content-range", ""))
-                        if (offset and match and int(match[1]) == offset
-                                and version.get("totalBytes") == offset
-                                and (not version.get("etag") or response.headers.get("etag") in (None, version["etag"]))):
+                        complete = bool(offset and match and int(match[1]) == offset
+                                        and version.get("totalBytes") == offset
+                                        and response.headers.get("etag") == version.get("etag"))
+                        # Some proxies omit Content-Range/ETag on 416. Confirm the
+                        # length and strong file version using a single-byte probe.
+                        if not complete and offset and version.get("totalBytes") == offset and version.get("etag"):
+                            async with self.target.client.stream("GET", url, headers={
+                                    "Accept-Encoding": "identity", "Range": "bytes=0-0",
+                                    "If-Range": version["etag"]}, timeout=httpx.Timeout(30, connect=15)) as probe:
+                                bounds = re.fullmatch(r"bytes 0-0/(\d+)", probe.headers.get("content-range", ""))
+                                complete = bool(probe.status_code == 206 and bounds and int(bounds[1]) == offset
+                                                and probe.headers.get("etag") == version["etag"])
+                        if complete:
                             await self.ffprobe(part)
                             return part, result, await asyncio.to_thread(file_digest, part), offset
                         raise DownloadFailure("断点位置与平台文件不一致，已保留断点。", "range_invalid")
@@ -1374,6 +1523,12 @@ class VideoManager:
         self.store.save(row)
 
     async def cleanup_cloud(self, row, version, protected, allow_incomplete=False):
+        guard = (self.file_leases.write(self.cloud_lease_key(version.get("taskId")))
+                 if getattr(self, "file_leases", None) else nullcontext())
+        with guard:
+            return await self._cleanup_cloud(row, version, protected, allow_incomplete)
+
+    async def _cleanup_cloud(self, row, version, protected, allow_incomplete=False):
         parent_id = version.get("taskId")
         if not parent_id or parent_id in protected:
             raise ValueError("旧任务ID无效或指向保留版本，已阻止删除。")

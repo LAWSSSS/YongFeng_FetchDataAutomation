@@ -1,9 +1,7 @@
 """Durable, target-independent upload and import queues for the manual app."""
 import asyncio
 import base64
-import hashlib
 import json
-import os
 import re
 import shutil
 import subprocess
@@ -16,7 +14,7 @@ from uuid import uuid4
 from .audit_moves import checked_path, source_fingerprint
 from .domain import now_iso
 from .file_leases import FileLeases
-from .upload_audit import AuditError, DATASETS, VIDEO_EXTENSIONS, name_key, scan_directory
+from .upload_audit import AuditError, DATASETS, name_key
 from .upload_remote import UploadRemote, source_keys, video_names
 from .videos import Conflict
 from . import runtime

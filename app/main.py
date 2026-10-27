@@ -5,7 +5,9 @@ import mimetypes
 import os
 import re
 from contextlib import asynccontextmanager
+from contextlib import ExitStack
 from pathlib import Path
+from urllib.parse import quote
 from uuid import uuid4
 
 import httpx
@@ -16,15 +18,15 @@ from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from .domain import DEFAULT_TARGET, SOURCE_URL, TARGET_URL, apply_admission, build_tasks, date_windows, now_iso
+from .domain import SOURCE_URL, TARGET_URL, apply_admission, build_tasks, date_windows, now_iso
 from .admission import AdmissionSettings
 from . import credentials
 from .jobs import JobManager
-from .media import download_url
+from .media import download_url, file_digest, video_filename
 from .models import (BulkVideoInput, CollectionRule, CorrectionInput, DirectoryInput, HistoryRemoveInput,
                      LoginInput, PreviewInput, RecordRemoveInput, SearchInput, SubmitInput, VersionActionInput,
                      UploadAuditInput, UploadAuditLoginInput, AuditMovePreviewInput, AuditMoveConfirmInput)
-from .models import AdmissionSettingsInput, UploadScanInput
+from .models import AdmissionSettingsInput, UploadScanInput, VideoDownloadLimitInput
 from .models import FileCleanupInput
 from .models import SliceClassifyConfirmInput
 from .slice_classify import SliceClassification
@@ -53,6 +55,31 @@ from .models import WorkspacePreviewInput, WorkspaceActionInput
 from . import runtime
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+class DownloadReadLease:
+    def __init__(self, *args, release, close_stream=None, **kwargs):
+        self.release_read = release
+        self.close_stream = close_stream
+        super().__init__(*args, **kwargs)
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            try:
+                if self.close_stream:
+                    await self.close_stream()
+            finally:
+                self.release_read()
+
+
+class DownloadFileResponse(DownloadReadLease, FileResponse):
+    pass
+
+
+class DownloadStreamResponse(DownloadReadLease, StreamingResponse):
+    pass
 
 
 def state_response(payload, request):
@@ -810,6 +837,10 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
                               for version in row.get("versions", [])]} for row in result["videos"]]}
         return state_response(result, request)
 
+    @application.post("/api/videos/download-limit")
+    async def video_download_limit(payload: VideoDownloadLimitInput):
+        return videos.update_download_limit(payload.model_dump())
+
     @application.post("/api/videos/bulk-confirm", status_code=202)
     async def bulk_confirm(payload: BulkVideoInput):
         return await videos.bulk_action("confirm", payload.model_dump())
@@ -882,6 +913,47 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
     @application.post("/api/videos/{identity}/retry-download", status_code=202)
     async def retry_download(identity: str):
         return await videos.retry_download(identity)
+
+    @application.post("/api/videos/{identity}/restart-download", status_code=202)
+    async def restart_download(identity: str, payload: VersionActionInput):
+        return await videos.restart_download(identity, payload.model_dump())
+
+    @application.api_route("/api/videos/{identity}/versions/{revision}/download", methods=["GET", "HEAD"])
+    async def download_version(identity: str, revision: int, request: Request):
+        row = videos.store.get(identity)
+        if not row or row.get("deletedAt"):
+            raise HTTPException(404, "视频记录不存在。")
+        videos.require_editable(row)
+        version = videos.version(row, revision)
+        if not version or version["state"] in ("withdrawn", "submitting", "uncertain", "waiting", "submitted"):
+            raise HTTPException(404, "这个版本尚无可下载的视频。")
+        guards = ExitStack()
+        try:
+            path = Path(version["filePath"]) if version.get("filePath") else None
+            if path and path.is_file() and not path.is_symlink() and version.get("sha256"):
+                guards.enter_context(leases.read(path))
+                digest = await asyncio.to_thread(file_digest, path)
+                if digest != version["sha256"]:
+                    raise ValueError("登记的本地视频已变化，未下载其他文件。")
+                filename = f"{path.stem}_v{revision + 1}{path.suffix}"
+                return DownloadFileResponse(path, filename=filename, media_type="video/mp4", release=guards.close,
+                                            headers={"Cache-Control": "no-store"})
+            if version["state"] == "cloud_deleted":
+                raise HTTPException(404, "这个版本已清理，无法重新下载；其他版本和更正保留。")
+            if not version.get("taskId") or not version.get("resultId"):
+                raise HTTPException(404, "这个版本的结果尚未确认，请先核对。")
+            guards.enter_context(leases.read(videos.cloud_lease_key(version["taskId"])))
+            response = await stream_video(identity, revision, request)
+            name = video_filename({"videoName": row["name"], "startTime": version["startTime"]},
+                                  {"id": version["resultId"], "url": "https://media.invalid/video.mp4"})
+            filename = f"{Path(name).stem}_v{revision + 1}.mp4"
+            headers = dict(response.headers)
+            headers["Content-Disposition"] = f"attachment; filename=video_v{revision + 1}.mp4; filename*=UTF-8''{quote(filename, safe='')}"
+            return DownloadStreamResponse(response.body_iterator, status_code=response.status_code, headers=headers,
+                                          close_stream=response.background, release=guards.close)
+        except BaseException:
+            guards.close()
+            raise
 
     @application.api_route("/api/videos/{identity}/versions/{revision}/stream", methods=["GET", "HEAD"])
     async def stream_video(identity: str, revision: int, request: Request):

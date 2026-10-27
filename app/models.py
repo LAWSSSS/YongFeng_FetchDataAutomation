@@ -56,6 +56,14 @@ class SubmitInput(BaseModel):
     downloadAfterCollection: bool = False
 
 
+class VideoDownloadLimitInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expectedRevision: int = Field(ge=0, strict=True)
+    requestId: str = Field(pattern=r"^[A-Za-z0-9_-]{1,100}$")
+    maxConcurrentDownloads: int = Field(ge=1, le=8, strict=True)
+
+
 class CorrectionInput(BaseModel):
     startTime: str = Field(min_length=19, max_length=35)
     durationSeconds: int = Field(ge=60, le=7200)

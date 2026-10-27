@@ -1,7 +1,6 @@
 """Allowlisted Athena video-cut adapter; kept separate from import-log audit."""
 from __future__ import annotations
 
-import asyncio
 import json
 import re
 
