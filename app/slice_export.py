@@ -1,5 +1,6 @@
 """Turn recognized intervals into one JPEG archive per category."""
 import hashlib
+import json
 import re
 import subprocess
 import zipfile
@@ -77,15 +78,32 @@ def slice_timestamps(intervals, seconds):
     return points
 
 
-def photo_names(video_name, count):
+def photo_export_identity(item, category, positions, frames):
+    """Stable export identity, independent of paths, queue edits and retries."""
+    if len(positions) != len(frames):
+        raise ValueError("照片与实际抽帧位置不一致。")
+    source = {key: item.get(key) for key in ('sourceIdentity', 'sourceDatasetId', 'sourceVideoId',
+                                             'mediaId', 'mediaGeneration', 'collectionRevision')}
+    source.update(version=item.get('observationVersion') or item.get('fileVersion'), category=category,
+                  positions=positions)
+    digest = hashlib.sha256(json.dumps(source, sort_keys=True, separators=(',', ':'), ensure_ascii=False).encode())
+    for frame in frames:
+        digest.update(len(frame).to_bytes(8, 'big'))
+        digest.update(frame)
+    return digest.hexdigest()
+
+
+def photo_names(video_name, count, *, identity=None):
     match = _NAME.match(Path(video_name or "").name)
     if match:
         plate, year, month, day, hour, minute, second = match.groups()
         base = f"{plate}_{year}{month}{day}_{hour}{minute}{second}"
     else:
         base = Path(video_name or "image").stem or "image"
-    base = re.sub(r'[\\/:*?"<>|]+', "_", base)[:80]
-    return [f"{base}_{index:03d}.jpg" for index in range(1, count + 1)]
+    base = re.sub(r'[\x00-\x1f\x7f\\/:*?"<>|]+', "_", base)[:60].strip(' .') or 'image'
+    base = base.encode()[:180].decode(errors='ignore').rstrip(' .') or 'image'
+    token = hashlib.sha256(str(identity if identity is not None else video_name or 'image').encode()).hexdigest()[:24]
+    return [f"{base}_v{token}_{index:03d}.jpg" for index in range(1, count + 1)]
 
 
 def package_identity(source_dataset, video_id, category):
@@ -93,16 +111,22 @@ def package_identity(source_dataset, video_id, category):
     return hashlib.sha256(text.encode()).hexdigest()[:24]
 
 
-def read_jpeg(path, ffmpeg, timestamp):
+def read_jpeg(path, ffmpeg, timestamp, timeout=60):
     command = [ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-ss", f"{timestamp:.3f}",
                "-i", str(path), "-frames:v", "1", "-q:v", "3", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"]
     try:
-        result = subprocess.run(command, capture_output=True, timeout=60, check=False)
+        result = subprocess.run(command, capture_output=True, timeout=timeout, check=False)
     except subprocess.TimeoutExpired as error:
-        raise RuntimeError("frame_extract_failed") from error
+        raise RuntimeError("frame_timeout") from error
+    except OSError as error:
+        raise RuntimeError("frame_tool_error") from error
     data = result.stdout
     if result.returncode or not data.startswith(b"\xff\xd8") or not data.endswith(b"\xff\xd9"):
-        raise RuntimeError("frame_extract_failed")
+        stderr = result.stderr.decode(errors="replace").lower()
+        if any(message in stderr for message in ("input/output error", "permission denied", "device not configured",
+                "no such file or directory", "read error", "i/o error", "error opening input")):
+            raise RuntimeError("frame_io_error")
+        raise RuntimeError("decode_unavailable")
     return data
 
 
@@ -113,7 +137,9 @@ def write_image_archive(destination, names, frames):
     temporary = destination.with_suffix(destination.suffix + ".partial")
     if temporary.exists():
         temporary.unlink()
-    with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+    # JPEG is already compressed; storing it avoids another CPU pass with
+    # negligible size savings and is supported by the platform importer.
+    with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_STORED) as archive:
         for name, blob in zip(names, frames):
             if not blob.startswith(b"\xff\xd8"):
                 raise ValueError("切片照片不是 JPEG。")

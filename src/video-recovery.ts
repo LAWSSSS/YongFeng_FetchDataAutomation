@@ -1,5 +1,9 @@
 type RecoverableVersion = {state:string;taskId?:string;resultId?:string;errorCode?:string;
-  filePath?:string;sha256?:string;localCleanupState?:string;review?:{code:string}};
+  filePath?:string;sha256?:string;localCleanupState?:string;review?:{code:string};recovery?:{state:string;resultVerified?:boolean}};
+
+export function partialComplete(version:RecoverableVersion) {
+  return version.recovery?.state==='partial_complete'&&version.recovery.resultVerified===true;
+}
 
 export function videoRecovery(version: RecoverableVersion) {
   const failedMedia = version.state === 'failed' && !!version.taskId && !!version.resultId

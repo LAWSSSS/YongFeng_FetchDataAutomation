@@ -3,18 +3,11 @@ import type { FormEvent } from 'react';
 import { admissionDraft, admissionSummary, defaultAdmission, parseAdmissionDraft } from './admission';
 import type { AdmissionDraft, AdmissionRule } from './admission';
 import './admission.css';
+import {localJson} from './local-api';
 
 type Saved = {rule: AdmissionRule; revision: number; summary: string};
 async function settingsRequest<T>(body?: object): Promise<T> {
-  let response: Response;
-  try {
-    response = await fetch('/api/settings/admission', body === undefined ? undefined : {
-      method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),
-    });
-  } catch {throw new Error('本地程序暂时无法连接，填写的准入条件已保留，请稍后重试。');}
-  const result = await response.json();
-  if (!response.ok) throw new Error(result.message || '准入条件未保存，请检查输入后重试。');
-  return result;
+  return localJson<T>('/api/settings/admission',body);
 }
 
 export default function AdmissionSettings<T>({searchId, disabled, onBlockedChange, onApplied}: {
@@ -57,7 +50,18 @@ export default function AdmissionSettings<T>({searchId, disabled, onBlockedChang
       const result = await settingsRequest<Saved & {search:T | null}>({rule,expectedRevision:saved.revision,searchId});
       setSaved(result);setDraft(admissionDraft(result.rule));onApplied(result);
       setNotice(result.search ? '条件已保存，当前结果已重新区分已批准和未批准，请重新选择采集记录。' : '条件已保存，后续查询和采集将使用此条件。');
-    } catch (failure) {setError((failure as Error).message);}
+    } catch (failure) {
+      setError((failure as Error).message);
+      // Reconcile an unknown response without discarding the user's draft.
+      try {
+        const latest=await settingsRequest<Saved>();setSaved(latest);
+        const desired=parseAdmissionDraft(draft);
+        if(JSON.stringify(latest.rule)===JSON.stringify(desired)){
+          const search=searchId?await localJson<T>(`/api/search/${encodeURIComponent(searchId)}`):null;
+          onApplied({search});setError('');setNotice('条件已保存，已核对后端结果。');
+        }
+      } catch { /* Keep the original error and editable draft until reachable. */ }
+    }
     finally {setSaving(false);}
   }
   return <form className="admission-form" onSubmit={event => void save(event)} aria-label="采集准入条件设置">

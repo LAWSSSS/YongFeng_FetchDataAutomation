@@ -52,6 +52,10 @@ class SharedSlicingAnalysis:
         peers = work.get('_analysisPeers')
         if not peers:
             stored = self.store.get('items', work['id']) if work.get('id') else None
+            if stored and stored.get('superseded'):
+                return
+            if stored and 'collectionRecoveryPaused' in stored:
+                work['collectionRecoveryPaused'] = stored['collectionRecoveryPaused']
             revision_after_outcome(stored, work, outcome_changed(stored, work))
             self.store.save('items', work)
             return
@@ -70,7 +74,9 @@ class SharedSlicingAnalysis:
         peers = {applicable_category(first['sourceDatasetId']): first}
         for candidate in candidates:
             category = applicable_category(candidate['sourceDatasetId'])
-            if (category not in peers and candidate.get('path') == first['path']
+            same_source = (candidate.get('mediaId') == first.get('mediaId') and first.get('mediaId')
+                           and candidate.get('mediaGeneration') == first.get('mediaGeneration')) or candidate.get('path') == first['path']
+            if (category not in peers and same_source
                     and candidate.get('fileVersion') == first['fileVersion']
                     and candidate.get('state') == 'pending'):
                 peers[category] = candidate
@@ -85,8 +91,10 @@ class SharedSlicingAnalysis:
         affected = tuple(peers)
         guard = ExitStack()
         try:
+            if getattr(self, 'control', None):
+                self.control.claim(work)
             guard.enter_context(self._read_lease(work["path"]))
-            if source_version(work['path']) != work['fileVersion']:
+            if await asyncio.to_thread(source_version, work['path']) != work['fileVersion']:
                 raise ValueError('source_changed')
             metadata = work.get('metadata') or await asyncio.to_thread(ffprobe_file, work['path'], self.store.settings['frameToolPath'])
             work['metadata'] = metadata

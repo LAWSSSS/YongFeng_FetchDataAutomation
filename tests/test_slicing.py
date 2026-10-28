@@ -22,6 +22,38 @@ def test_sampling_always_includes_both_edges_and_deduplicates():
     assert sample_points(4, 30, 25) == [0.0, 3.96]
 
 
+def test_concurrent_local_recoveries_promote_single_run_and_stay_scoped(tmp_path, monkeypatch):
+    app = create_app(data_dir=tmp_path / "recovery-batch-data")
+    manager = app.state.slicing
+    manager.auth.access = "test-token"
+    manager.store.settings.update(targetDatasetIds={"27912": "900", "27944": "901"})
+    manager.store.save_settings()
+    monkeypatch.setattr(manager, "_wake_scheduler", lambda: None)
+
+    recoveries = []
+    for index in range(3):
+        path = tmp_path / f"recovery-{index}.mp4"
+        path.write_bytes(f"source-{index}".encode())
+        version = source_version(path)
+        item = manager.queue_collection_recovery(
+            video_id=f"video-{index}", revision=1, path=path, file_version=version,
+            metadata={"duration": 120, "frameRate": 25, "width": 3840, "height": 2160},
+            name=path.name, request_id=f"recovery-request-{index}")
+        recoveries.append(item["id"])
+
+    run = manager.run
+    assert run["localRecoveryOnly"] is True
+    assert run["singleMode"] is False
+    assert "singleItemId" not in run
+    assert run["items"] == recoveries
+    assert run["itemCount"] == 3
+
+    unrelated = {"id": "unrelated-old-attention", "state": "attention", "categories": {}}
+    manager.store.save("items", unrelated)
+    scoped = manager._scope_run_items(manager.store.list("items"))
+    assert [row["id"] for row in scoped] == recoveries
+
+
 def test_adjacent_positive_samples_expand_and_merge_at_video_edges():
     observations = [
         {"time": 0, "label": "target"}, {"time": 30, "label": "target"},
@@ -41,24 +73,43 @@ def test_partial_recovery_keeps_good_fragments_away_from_undecodable_points():
 
 
 def test_salvage_frame_sampling_skips_bad_positions_without_shifting_timestamps(tmp_path, monkeypatch):
+    from types import SimpleNamespace
     source = tmp_path / "source.mp4"; source.write_bytes(b"source")
     ffmpeg = tmp_path / "ffmpeg"; ffmpeg.write_text("stub"); ffmpeg.chmod(0o755)
 
-    def fake_jpeg_frames(command):
-        if "-ss" in command:
-            timestamp = float(command[command.index("-ss") + 1])
-            if timestamp == 30:
-                raise FrameExtractionError(timestamp=timestamp)
-            yield b"\xff\xd8frame\xff\xd9"
-        else:
-            raise FrameExtractionError("media_incomplete")
+    def fake_run(command, **_kwargs):
+        timestamp = float(command[command.index("-ss") + 1])
+        if timestamp in {30, 60.96}:
+            return SimpleNamespace(returncode=1, stdout=b"", stderr=b"Error while decoding")
+        return SimpleNamespace(returncode=0, stdout=b"\xff\xd8frame\xff\xd9", stderr=b"")
 
-    monkeypatch.setattr("app.slicing_worker.jpeg_frames", fake_jpeg_frames)
+    monkeypatch.setattr("app.slicing_worker.subprocess.run", fake_run)
     result = list(extract_requested_frames(str(source), str(ffmpeg),
         {"duration": 61, "frameRate": 25}, {"bed": [0, 30, 60, 60.96]}, skip_undecodable=True))
     assert [timestamp for timestamp, _ in result] == [0, 30, 60, 60.96]
     assert result[1][1] is None and result[3][1] is None
     assert result[0][1] is not None and result[2][1] is not None
+
+
+@pytest.mark.parametrize("failure", ["timeout", "io", "tool"])
+def test_salvage_sampling_keeps_operational_failures_as_errors(tmp_path, monkeypatch, failure):
+    from types import SimpleNamespace
+    source = tmp_path / "source.mp4"; source.write_bytes(b"source")
+    ffmpeg = tmp_path / "ffmpeg"; ffmpeg.write_text("stub"); ffmpeg.chmod(0o755)
+
+    def fail(_command, **_kwargs):
+        if failure == "timeout":
+            raise subprocess.TimeoutExpired("ffmpeg", 30)
+        if failure == "tool":
+            raise OSError("missing tool")
+        return SimpleNamespace(returncode=1, stdout=b"", stderr=b"Input/output error")
+
+    monkeypatch.setattr("app.slicing_worker.subprocess.run", fail)
+    with pytest.raises(FrameExtractionError) as error:
+        list(extract_requested_frames(str(source), str(ffmpeg), {"duration": 10, "frameRate": 25},
+                                      {"bed": [0]}, skip_undecodable=True))
+    assert error.value.code == {"timeout": "frame_timeout", "io": "frame_io_error",
+                                "tool": "frame_tool_error"}[failure]
 
 
 def test_interval_counts_include_each_segment_start_and_target_around_150():

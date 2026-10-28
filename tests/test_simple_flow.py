@@ -155,6 +155,14 @@ async def wait_until(predicate, seconds=3):
     raise AssertionError("operation did not finish")
 
 
+async def wait_video_operation(app, response):
+    operation_id = response.json().get("operationId")
+    assert operation_id, response.text
+    await wait_until(lambda: (app.state.videos.store.get_operation(operation_id) or {}).get("state")
+                     in {"complete", "attention", "conflict"}, seconds=5)
+    return app.state.videos.store.get_operation(operation_id)
+
+
 @pytest.mark.asyncio
 async def test_fixed_external_download_storage_migrates_resumable_parts(app_factory, tmp_path):
     external = tmp_path / "external" / "视频"
@@ -439,13 +447,16 @@ async def test_capture_preview_correction_withdraw_and_final_replacement(app_fac
                        "expectedRevision": 0, "requestId": "correction-1"}
             correction = await client.post(f'/api/videos/{original["id"]}/corrections', json=payload)
             assert correction.status_code == 202
-            assert (await client.post(f'/api/videos/{original["id"]}/corrections', json=payload)).json()["revision"] == 1
+            await wait_video_operation(app, correction)
+            replay = await client.post(f'/api/videos/{original["id"]}/corrections', json=payload)
+            assert replay.status_code == 202 and replay.json()["operationId"] == correction.json()["operationId"]
+            assert app.state.videos.store.get(original["id"])["revision"] == 1
             assert (await client.post(f'/api/videos/{original["id"]}/corrections', json={**payload,
                 "requestId": "stale"})).status_code == 409
             await app.state.videos.check_once()
             draft = app.state.videos.store.get(original["id"])
             candidate_id = draft["versions"][-1]["taskId"]
-            assert draft["versions"][-1]["state"] == "ready"
+            assert draft["versions"][-1]["state"] == "ready", draft["versions"][-1]
             assert old_file.is_file() and original_id in platform.parents
             withdrawn = await client.post(f'/api/videos/{original["id"]}/withdraw', json={
                 "version": 1, "expectedRevision": 1, "requestId": "withdraw-1"})
@@ -455,6 +466,7 @@ async def test_capture_preview_correction_withdraw_and_final_replacement(app_fac
             second = await client.post(f'/api/videos/{original["id"]}/corrections', json={
                 **payload, "expectedRevision": 2, "requestId": "correction-2"})
             assert second.status_code == 202
+            await wait_video_operation(app, second)
             await app.state.videos.check_once()
             row = app.state.videos.store.get(original["id"])
             assert row["activeRevision"] == 3
@@ -542,11 +554,12 @@ async def test_failed_cloud_cleanup_keeps_bound_old_task_and_new_final(app_facto
                 "startTime": "2026-09-30 02:10:00", "durationSeconds": 3000,
                 "expectedRevision": 0, "requestId": "change"})
             assert changed.status_code == 202
+            await wait_video_operation(app, changed)
             await app.state.videos.check_once()
             platform.deny_object_delete = True
             response = await client.post(f'/api/videos/{row["id"]}/confirm', json={
                 "version": 1, "expectedRevision": 1, "requestId": "confirm"})
-            assert response.status_code == 202
+            assert response.status_code == 202, response.text
             await wait_until(lambda: not app.state.videos.running)
             pending = app.state.videos.store.get(row["id"])
             assert pending["acceptedRevision"] == 1 and pending["cleanupPending"]
@@ -588,10 +601,13 @@ async def test_correction_write_response_lost_reconciles_once(app_factory, platf
                     "expectedRevision": 0, "requestId": "same-request"}
             result = await client.post(f'/api/videos/{row["id"]}/corrections', json=body)
             assert result.status_code == 202
-            version = result.json()["versions"][-1]
+            await wait_video_operation(app, result)
+            current = app.state.videos.store.get(row["id"])
+            version = current["versions"][-1]
             assert version["taskId"] in platform.parents
             replay = await client.post(f'/api/videos/{row["id"]}/corrections', json=body)
-            assert replay.status_code == 202 and replay.json()["revision"] == 1
+            assert replay.status_code == 202 and replay.json()["operationId"] == result.json()["operationId"]
+            assert current["revision"] == 1
             assert platform.batch_sizes == [1, 1] and len(platform.parents) == 2
 
 
@@ -640,6 +656,9 @@ async def test_bad_new_media_preserves_previous_local_and_cloud(app_factory, pla
             await client.post(f'/api/videos/{row["id"]}/corrections', json={
                 "startTime": "2026-09-30 02:20:00", "durationSeconds": 1800,
                 "expectedRevision": 0, "requestId": "correction"})
+            correction_op = app.state.videos.store.list_operations(row["id"])[0]
+            await wait_until(lambda: (app.state.videos.store.get_operation(correction_op["id"]) or {}).get("state")
+                             in {"complete", "attention", "conflict"}, seconds=5)
             await app.state.videos.check_once()
             async def invalid(_path):
                 raise DownloadFailure("文件无法播放。", "invalid_video")
@@ -649,7 +668,7 @@ async def test_bad_new_media_preserves_previous_local_and_cloud(app_factory, pla
             await wait_until(lambda: not app.state.videos.running)
             failed = app.state.videos.store.get(row["id"])
             assert failed["acceptedRevision"] == 0
-            assert failed["versions"][1]["state"] == "failed"
+            assert failed["versions"][1]["state"] == "failed", failed["versions"][1]
             assert old_path.is_file() and old_id in platform.parents
 
 
@@ -693,7 +712,8 @@ async def test_withdraw_collecting_correction_keeps_original(app_factory, platfo
                 "startTime": "2026-09-30 02:30:00", "durationSeconds": 1200,
                 "expectedRevision": 0, "requestId": "correction"})
             assert reply.status_code == 202
-            candidate = reply.json()["versions"][-1]["taskId"]
+            await wait_video_operation(app, reply)
+            candidate = app.state.videos.store.get(row["id"])["versions"][-1]["taskId"]
             assert platform.parents[candidate]["taskStatus"] == "RUNNING"
             # This candidate has no finished result and may be removed by its exact task ID.
             withdrawn = await client.post(f'/api/videos/{row["id"]}/withdraw', json={
@@ -715,9 +735,12 @@ async def test_continuous_corrections_and_withdraw_restore_previous_version(app_
                            "expectedRevision": revision, "requestId": f"continuous-{revision}"}
                 changed = await client.post(f'/api/videos/{row["id"]}/corrections', json=payload)
                 assert changed.status_code == 202, changed.text
-                assert changed.json()["activeRevision"] == revision + 1
-                assert changed.json()["versions"][-1]["previousActiveRevision"] == revision
-                assert (await client.post(f'/api/videos/{row["id"]}/corrections', json=payload)).status_code == 202
+                await wait_video_operation(app, changed)
+                current = app.state.videos.store.get(row["id"])
+                assert current["activeRevision"] == revision + 1
+                assert current["versions"][-1]["previousActiveRevision"] == revision
+                replay = await client.post(f'/api/videos/{row["id"]}/corrections', json=payload)
+                assert replay.status_code == 202 and replay.json()["operationId"] == changed.json()["operationId"]
             assert len(platform.parents) == 4 and platform.batch_sizes == [1, 1, 1, 1]
             before = app.state.videos.store.get(row["id"])
             previous_id = before["versions"][2]["taskId"]
@@ -743,6 +766,9 @@ async def test_cleanup_of_accepted_version_does_not_delete_later_correction(app_
             await client.post(f'/api/videos/{row["id"]}/corrections', json={
                 "startTime": "2026-09-30 02:10:00", "durationSeconds": 1800,
                 "expectedRevision": 0, "requestId": "first"})
+            first_operation = app.state.videos.store.list_operations(row["id"])[0]
+            await wait_until(lambda: (app.state.videos.store.get_operation(first_operation["id"]) or {}).get("state")
+                             in {"complete", "attention", "conflict"}, seconds=5)
             await app.state.videos.check_once()
             platform.deny_object_delete = True
             await client.post(f'/api/videos/{row["id"]}/confirm', json={
@@ -753,7 +779,8 @@ async def test_cleanup_of_accepted_version_does_not_delete_later_correction(app_
                 "startTime": "2026-09-30 02:20:00", "durationSeconds": 1800,
                 "expectedRevision": 1, "requestId": "second"})
             assert later.status_code == 202
-            new_id = later.json()["versions"][-1]["taskId"]
+            await wait_video_operation(app, later)
+            new_id = app.state.videos.store.get(row["id"])["versions"][-1]["taskId"]
             platform.deny_object_delete = False
             await app.state.videos.finish_cleanup(row["id"])
             latest = app.state.videos.store.get(row["id"])
@@ -772,17 +799,25 @@ async def test_review_recovers_exact_result_and_missing_result_can_be_recaptured
             snapshot = {key: version[key] for key in ("taskId", "resultId", "startTime", "endTime")}
             version.update(state="attention", message="绑定任务不存在或身份改变，请在平台核对。")
             app.state.videos.store.save(row)
-            recovered = await client.post(f'/api/videos/{row["id"]}/check', json={})
-            assert recovered.json()["versions"][0]["state"] == "ready"
-            assert {key: recovered.json()["versions"][0][key] for key in snapshot} == snapshot
+            payload = {"expectedRevision": 0, "requestId": "review-exact-result"}
+            recovered = await client.post(f'/api/videos/{row["id"]}/check', json=payload)
+            assert recovered.status_code == 202
+            await wait_video_operation(app, recovered)
+            current = app.state.videos.store.get(row["id"])
+            assert current["versions"][0]["state"] == "ready"
+            assert {key: current["versions"][0][key] for key in snapshot} == snapshot
             platform.results[version["taskId"]] = []
-            missing = await client.post(f'/api/videos/{row["id"]}/check', json={})
-            assert missing.json()["versions"][0]["review"]["code"] == "result_missing"
+            missing = await client.post(f'/api/videos/{row["id"]}/check', json={
+                "expectedRevision": 0, "requestId": "review-missing-result"})
+            await wait_video_operation(app, missing)
+            assert app.state.videos.store.get(row["id"])["versions"][0]["review"]["code"] == "result_missing"
             payload = {"version": 0, "expectedRevision": 0, "requestId": "recapture-missing"}
             recaptured = await client.post(f'/api/videos/{row["id"]}/recapture', json=payload)
             assert recaptured.status_code == 202, recaptured.text
-            assert recaptured.json()["versions"][-1]["startTime"] == snapshot["startTime"]
-            assert recaptured.json()["versions"][0]["resultId"] == snapshot["resultId"]
+            await wait_video_operation(app, recaptured)
+            current = app.state.videos.store.get(row["id"])
+            assert current["versions"][-1]["startTime"] == snapshot["startTime"]
+            assert current["versions"][0]["resultId"] == snapshot["resultId"]
             assert len(platform.parents) == 2
             assert (await client.post(f'/api/videos/{row["id"]}/recapture', json=payload)).status_code == 202
             assert len(platform.parents) == 2 and platform.batch_sizes == [1, 1]
@@ -805,7 +840,8 @@ async def test_invalid_video_recapture_keeps_versions_and_only_creates_once(app_
             payload = {"version": 0, "expectedRevision": 0, "requestId": "repair-incomplete-video"}
             result = await client.post(f'/api/videos/{row["id"]}/recapture', json=payload)
             assert result.status_code == 202, result.text
-            current = result.json()
+            await wait_video_operation(app, result)
+            current = app.state.videos.store.get(row["id"])
             assert current["activeRevision"] == 1
             assert current["versions"][1]["startTime"] == version["startTime"]
             assert current["versions"][1]["durationSeconds"] == version["durationSeconds"]
@@ -868,6 +904,9 @@ async def test_remove_protects_corrections_including_withdrawn_and_stale_request
             await client.post(f'/api/videos/{row["id"]}/corrections', json={
                 "startTime": "2026-09-30 02:10:00", "durationSeconds": 1800,
                 "expectedRevision": 0, "requestId": "corrected"})
+            correction_operation = app.state.videos.store.list_operations(row["id"])[0]
+            await wait_until(lambda: (app.state.videos.store.get_operation(correction_operation["id"]) or {}).get("state")
+                             in {"complete", "attention", "conflict"}, seconds=5)
             stale = await client.post(f'/api/videos/{row["id"]}/remove-uncorrected', json={
                 "expectedRevision": 0, "requestId": "stale-delete"})
             assert stale.status_code == 409
@@ -890,6 +929,9 @@ async def test_clear_withdrawn_record_verifies_cloud_files_and_never_resurrects(
             await client.post(f'/api/videos/{row["id"]}/corrections', json={
                 "startTime": "2026-09-30 02:10:00", "durationSeconds": 2400,
                 "expectedRevision": 0, "requestId": "correction"})
+            correction_operation = app.state.videos.store.list_operations(row["id"])[0]
+            await wait_until(lambda: (app.state.videos.store.get_operation(correction_operation["id"]) or {}).get("state")
+                             in {"complete", "attention", "conflict"}, seconds=5)
             await app.state.videos.check_once()
             await client.post(f'/api/videos/{row["id"]}/withdraw', json={
                 "version": 1, "expectedRevision": 1, "requestId": "withdraw"})
@@ -903,7 +945,7 @@ async def test_clear_withdrawn_record_verifies_cloud_files_and_never_resurrects(
             other = tmp_path / "leave-other-file.mp4"; other.write_bytes(b"keep")
             payload = {"expectedRevision": 2, "requestId": "remove-withdrawn", "deleteCloud": True, "deleteLocalFiles": True}
             response = await client.post(f'/api/videos/{row["id"]}/remove-record', json=payload)
-            assert response.status_code == 202
+            assert response.status_code == 202, response.text
             await wait_until(lambda: not app.state.videos.running)
             deleted = app.state.videos.store.get(row["id"])
             assert deleted["deletion"]["state"] == "complete" and deleted["deletedAt"]
@@ -966,6 +1008,9 @@ async def test_clear_local_scope_and_stale_revision_preserve_corrections(app_fac
             await client.post(f'/api/videos/{row["id"]}/corrections', json={
                 "startTime": "2026-09-30 02:11:11", "durationSeconds": 2100,
                 "expectedRevision": 0, "requestId": "preserve"})
+            correction_operation = app.state.videos.store.list_operations(row["id"])[0]
+            await wait_until(lambda: (app.state.videos.store.get_operation(correction_operation["id"]) or {}).get("state")
+                             in {"complete", "attention", "conflict"}, seconds=5)
             stale = await client.post(f'/api/videos/{row["id"]}/remove-record', json={
                 "expectedRevision": 0, "requestId": "stale-clear", "deleteCloud": True, "deleteLocalFiles": True})
             assert stale.status_code == 409 and len(platform.parents) == 2
@@ -1035,8 +1080,106 @@ async def test_polling_skips_long_download_lock_without_blocking_other_rows(app_
             row = await new_video(client, app)
             async with app.state.videos.row_lock(row["id"]):
                 await asyncio.wait_for(app.state.videos.check_once(), timeout=.5)
-                response = await client.post(f'/api/videos/{row["id"]}/check', json={})
-                assert response.status_code == 409
+                response = await asyncio.wait_for(client.post(f'/api/videos/{row["id"]}/check', json={
+                    "expectedRevision": 0, "requestId": "quick-single-check"}), timeout=.5)
+                assert response.status_code == 202
+                operation_id = response.json()["operationId"]
+                assert app.state.videos.store.get_operation(operation_id)["state"] in {"queued", "running"}
+            await wait_until(lambda: (app.state.videos.store.get_operation(operation_id) or {}).get("state")
+                             == "complete", seconds=5)
+
+
+@pytest.mark.asyncio
+async def test_queued_video_operations_are_idempotent_and_reject_reused_ids_with_new_content(app_factory, platform):
+    app = app_factory()
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1") as client:
+            row = await new_video(client, app)
+            body = {"startTime": "2026-09-30 02:10:00", "durationSeconds": 1800,
+                    "expectedRevision": 0, "requestId": "same-operation"}
+            first = await client.post(f'/api/videos/{row["id"]}/corrections', json=body)
+            replay = await client.post(f'/api/videos/{row["id"]}/corrections', json=body)
+            assert first.status_code == replay.status_code == 202
+            assert replay.json()["operationId"] == first.json()["operationId"]
+            changed = await client.post(f'/api/videos/{row["id"]}/corrections', json={
+                **body, "startTime": "2026-09-30 02:20:00"})
+            assert changed.status_code == 409
+            operation = await wait_video_operation(app, first)
+            assert operation["state"] == "complete"
+            current = app.state.videos.store.get(row["id"])
+            assert current["revision"] == 1 and len(current["versions"]) == 2
+            assert len(platform.parents) == 2 and platform.batch_sizes == [1, 1]
+
+
+@pytest.mark.asyncio
+async def test_partial_recovery_reuses_verified_cache_without_creating_a_platform_video(
+        app_factory, platform, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    class RecoveryStore:
+        def __init__(self, frame_tool):
+            self.settings = {"frameToolPath": str(frame_tool)}
+            self.items = {}
+
+        def get(self, table, identity):
+            return self.items.get(identity) if table == "items" else None
+
+    class RecoverySlicing:
+        def __init__(self, frame_tool):
+            self.auth = SimpleNamespace(connected=True)
+            self.store = RecoveryStore(frame_tool)
+            self.packages = SimpleNamespace(store=RecoveryStore(frame_tool))
+
+        def queue_collection_recovery(self, **values):
+            identity = "local-recovery-item"
+            self.store.items[identity] = {"id": identity, "state": "complete", "progress": 100,
+                "collectionRecovery": True, "sourceVideoId": "", "sourceType": "local_collection_recovery",
+                "collectionVideoId": values['video_id'], "collectionRevision": values['revision'],
+                "fileVersion": values['file_version'],
+                "categories": {name: {"state": "complete", "packageId": name, "observations": 8, "skippedSamples": 1}
+                               for name in ('bed', 'magnet')}}
+            for name in ('bed', 'magnet'):
+                self.packages.store.items[name] = {'id': name, 'itemId': identity, 'category': name, 'state': 'complete',
+                    'verifiedJobId': 'job-'+name, 'imageCount': 1, 'actualImages': 1, 'outputImageIds': ['image-'+name],
+                    'videoFileVersion': values['file_version']}
+            self.values = values
+            return self.store.items[identity]
+
+    app = app_factory()
+    frame_tool = tmp_path / "ffmpeg"
+    frame_tool.write_text("test stub")
+    frame_tool.chmod(0o755)
+    monkeypatch.setattr("app.slicing.ffprobe_file", lambda *_args: {"duration": 60, "frameRate": 25})
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1") as client:
+            row = await new_video(client, app)
+            manager = app.state.videos
+            slicing = RecoverySlicing(frame_tool)
+            manager.slicing = slicing
+            saved_row = manager.store.get(row["id"])
+            version = saved_row["versions"][0]
+            version.update(state="failed", errorCode="invalid_video", downloadRequested=True,
+                etag='"v1"', totalBytes=len(platform.media), receivedBytes=len(platform.media))
+            manager.store.save(saved_row)
+            cache = manager.work / row["id"] / "v0.part"
+            cache.parent.mkdir(parents=True)
+            cache.write_bytes(platform.media)
+
+            response = await client.post(f'/api/videos/{row["id"]}/recover-decodable', json={
+                "expectedRevision": 0, "requestId": "partial-recovery-1"})
+            assert response.status_code == 202
+            operation = await wait_video_operation(app, response)
+            assert operation["state"] == "complete"
+            current = manager.store.get(row["id"])
+            recovery = current["versions"][0]["recovery"]
+            assert recovery["state"] == "partial_complete"
+            assert recovery["successfulSamples"] == 16 and recovery["skippedSamples"] == 2
+            assert current["versions"][0]["taskId"] == row["versions"][0]["taskId"]
+            assert current["versions"][0]["resultId"] == row["versions"][0]["resultId"]
+            assert not cache.exists() and Path(recovery["filePath"]).is_file()
+            assert slicing.values["video_id"] == row["id"]
+            assert slicing.values["path"] == Path(recovery["filePath"])
+            assert len(platform.parents) == 1 and platform.batch_sizes == [1]
 
 
 @pytest.mark.asyncio
@@ -1093,6 +1236,38 @@ def test_local_to_external_copy_skips_post_copy_validation_and_removes_source(tm
     assert media.copy_to_destination(source, destination)
     assert destination.read_bytes() == b"video-data"
     assert not source.exists()
+
+
+def test_recovery_cache_publication_trusts_verified_transfer_without_second_full_read(tmp_path, monkeypatch):
+    import os
+    import app.videos as videos
+
+    root = tmp_path / "cache"
+    root.mkdir()
+    source = root / "complete.part"
+    destination = tmp_path / "managed" / "published.mp4"
+    destination.parent.mkdir()
+    source.write_bytes(b"\x00\x00\x00\x18ftypmp42" + b"video-payload")
+    real_digest = videos.file_digest
+    digest_calls = []
+
+    def count_digest(path):
+        digest_calls.append(Path(path))
+        return real_digest(path)
+
+    def same_volume_move(src, dst, expected_digest):
+        os.replace(src, dst)
+        return expected_digest
+
+    monkeypatch.setattr(videos, "file_digest", count_digest)
+    monkeypatch.setattr(videos, "publish_file", same_volume_move)
+    identity, digest = videos.inspect_recovery_cache(
+        source, root, source.stat().st_size, source.stat().st_size)
+    videos.publish_recovery_cache(source, destination, identity, digest)
+
+    assert destination.read_bytes().startswith(b"\x00\x00\x00\x18ftypmp42")
+    assert not source.exists()
+    assert digest_calls == [source]
 
 
 def test_local_to_external_copy_conflict_keeps_local_source(tmp_path):

@@ -5,6 +5,12 @@
 .workspace-heading p { margin: 6px 0 0; color: #526159; overflow-wrap: anywhere; }
 .workspace-status { font-size: .875rem; color: #526159; }
 .workspace-body { margin-top: 24px; }
+.workspace-operation { margin-top:16px;padding:12px 0;border-top:1px solid #dce5df;color:#365744; }
+.workspace-operation p { margin:0;line-height:1.6; }
+.workspace-operation small { display:block;margin-top:6px;overflow-wrap:anywhere; }
+.workspace-operation progress { width:100%;margin-top:10px;accent-color:#315c45; }
+.workspace-location-settings>summary { cursor:pointer;font-weight:600;color:#365744; }
+.workspace-location-settings .workspace-location { margin-top:14px; }
 .workspace-location { display: flex; align-items: flex-end; gap: 12px; }
 .workspace-location label { flex: 1; min-width: 0; display: flex; flex-direction: column; align-items: stretch; gap: 8px; }
 .workspace-location input { width: 100%; min-width: 0; }

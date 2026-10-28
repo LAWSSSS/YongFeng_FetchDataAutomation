@@ -397,7 +397,7 @@ async def test_move_and_registered_delete_protect_only_actively_read_file(harnes
     items=add(manager,tmp_path/'v',2)
     worker.gates[items[0]['name']]=asyncio.Event()
     await manager.tick(); await settle(manager)
-    with pytest.raises(ValueError,match='正在上传'):
+    with pytest.raises(ValueError,match='正在使用'):
         with manager.leases.write(items[0]['path']):pass
     with manager.leases.write(items[1]['path']):pass
     destination=tmp_path/'moved.mp4'
@@ -491,7 +491,7 @@ async def test_registered_record_delete_is_deferred_before_cloud_or_file_mutatio
     await app.state.videos.remove_record(row['id'],request)
     await asyncio.gather(*app.state.videos.running.values())
     stored=app.state.videos.store.get(row['id'])
-    assert stored['deletion']['state']=='error' and '正在上传' in stored['deletion']['message']
+    assert stored['deletion']['state']=='error' and '正在使用' in stored['deletion']['message']
     assert not stored.get('deletedAt') and Path(item['path']).is_file()
 
 

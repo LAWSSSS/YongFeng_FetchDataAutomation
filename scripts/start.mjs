@@ -31,6 +31,23 @@ if (!existsSync(build) || newest(path.join(root, 'src')) > statSync(build).mtime
     const result = spawnSync(process.platform === 'win32' ? 'npm.cmd' : 'npm', ['run', 'build'], { stdio: 'inherit', shell: process.platform === 'win32' });
     if (result.status) process.exit(result.status);
 }
+if (process.platform === 'darwin') {
+    const result = spawnSync(python, [path.join(root, 'scripts/local_service.py'), 'start'], { stdio: 'inherit', cwd: root });
+    if (result.status) process.exit(result.status);
+    for (let attempt = 0; attempt < 120; attempt++) {
+        try {
+            const response = await fetch(`${appUrl}/api/health`, { signal: AbortSignal.timeout(1200) });
+            if (response.ok && (await response.json()).app === 'inspection-video-gather-simple') {
+                console.log(`程序已启动：${appUrl}。关闭本终端后任务继续运行；停止请双击“停止简易版.command”。`);
+                openBrowser();
+                process.exit(0);
+            }
+        } catch { /* 等待已保存连接和队列恢复。 */ }
+        await new Promise(resolve => setTimeout(resolve, 500));
+    }
+    console.error('后台服务仍在启动，请稍后打开网页，或查看 data/local-service.log。');
+    process.exit(1);
+}
 const server = spawn(python, ['-m', 'app.main'], { stdio: 'inherit', cwd: root });
 server.on('exit', code => process.exit(code || 0));
 for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => server.kill(signal));
@@ -38,7 +55,7 @@ for (let attempt = 0; attempt < 50; attempt++) {
     await new Promise(resolve => setTimeout(resolve, 200));
     if (server.exitCode !== null) break;
     try {
-        if ((await fetch(`${appUrl}/api/health`)).ok) {
+        if ((await fetch(`${appUrl}/api/health`, { signal: AbortSignal.timeout(1200) })).ok) {
             console.log(`\n简易版质检视频采集已启动：${appUrl}\n关闭本终端或按 Ctrl+C 可停止本地程序。`);
             openBrowser();
             break;

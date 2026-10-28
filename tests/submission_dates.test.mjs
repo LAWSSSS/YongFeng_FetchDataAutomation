@@ -5,6 +5,12 @@ import { collectionAction,initialCapture } from '../src/collection-actions.ts';
 import { groupVideos } from '../src/record-groups.ts';
 import { physicalFiles } from '../src/slicing-view.ts';
 
+test('stable identity groups moved aliases but keeps correction generations separate',()=>{
+  const item=(id,path,generation)=>({id,path,name:'same.mp4',mediaId:'collection:one',mediaGeneration:generation,collectionRevision:generation,sourceDatasetId:'27912',sourceVideoId:id,state:'pending',categories:{}});
+  assert.equal(physicalFiles([item('a','/old.mp4',0),item('b','/moved.mp4',0)]).length,1);
+  assert.equal(physicalFiles([item('a','/old.mp4',0),item('new','/old.mp4',1)]).length,2);
+});
+
 test('submission days use Beijing midnight and explicit unknowns, including naive server times',()=>{
   assert.equal(submissionDay('2026-10-25T16:00:00Z'),'2026-10-26');
   assert.equal(submissionDay('2026-10-25T15:59:59Z'),'2026-10-25');

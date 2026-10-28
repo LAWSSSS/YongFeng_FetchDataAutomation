@@ -7,7 +7,8 @@ import asyncio
 import json
 import sqlite3
 import time
-from contextlib import AsyncExitStack
+import zipfile
+from contextlib import ExitStack
 from pathlib import Path
 from uuid import uuid4
 
@@ -16,12 +17,15 @@ from .audit_moves import (checked_path, copy_verified, finish_source, move_direc
                           source_fingerprint)
 from .domain import now_iso
 from .videos import Conflict
+from . import file_locations
+from .workspace_scheduler import WorkspaceScheduler
 from .workspace_files import (BRANCHES, OUTPUT_BRANCHES, VIDEO_BRANCHES, birth_ns,
                               choose_root, compatible, content_id, create_root,
-                              file_version, folder_name, read_marker, scan_managed)
+                              file_version, folder_name, read_marker, scan_managed,
+                              reconnected_version)
 
 
-class WorkspaceManager:
+class WorkspaceManager(WorkspaceScheduler):
     def __init__(self, store, data_dir, videos, uploads, slicing, audit, moves, files, leases):
         self.db, self.data_dir = store.db, Path(data_dir)
         self.videos, self.uploads, self.slicing = videos, uploads, slicing
@@ -35,22 +39,75 @@ class WorkspaceManager:
         self.created_times = {}
         self.session_checked = set()
         self.maintenance = False
+        self.activity = {'stage': 'idle', 'message': '等待整理。', 'currentName': ''}
+        self.waiting_paths = set()
+        self.event_loop = None
+        self.cleanup_task = None
+        self.cleanup_pending = set()
+        self.cleanup_active = set()
+        self.cleanup_deferred = set()
+        self.cleanup_next = {}
+        self.discovery_waiting = set()
+        self.discovery_errors = {}
         for table in ('settings', 'assets', 'plans', 'moves', 'requests', 'retentions'):
             self.db.execute(f'CREATE TABLE IF NOT EXISTS simple_workspace_{table} (id TEXT PRIMARY KEY, payload TEXT NOT NULL)')
         self.db.execute("CREATE INDEX IF NOT EXISTS workspace_move_plan ON simple_workspace_moves(json_extract(payload, '$.planId'))")
         self.db.execute("CREATE INDEX IF NOT EXISTS workspace_slice_path ON simple_slicing_items(json_extract(payload, '$.path'))")
         self.db.execute("CREATE INDEX IF NOT EXISTS workspace_package_item ON simple_slice_package_items(json_extract(payload, '$.itemId'))")
         self.db.commit()
+        # Existing completed journals remain the authority after an upgrade.
+        if not self.db.execute('SELECT 1 FROM simple_file_locations LIMIT 1').fetchone():
+            for entry in self.rows('moves'):
+                if entry.get('state') == 'complete':
+                    file_locations.remember(self.db, entry)
         self.config = self.get('settings', 'config') or {'id': 'config', 'revision': 0,
                          'workspaceId': uuid4().hex, 'enabled': False, 'root': '', 'parent': ''}
         self.save('settings', self.config)
         self.retained_sources = self.rows('retentions')
+        self._restore_locations()
         for manager in (videos, uploads, slicing, slicing.packages, audit, files):
             manager.workspace = self
         self.leases.subscribe_moves(self.moved)
+        self.leases.subscribe_release(self._released)
         self.created_times = {a['path']: a.get('originalCreatedNs') for a in self.rows('assets')}
         if self.enabled:
             self.derive_config()
+
+    def _restore_locations(self):
+        # A crash can occur after publication but before path callbacks. Apply
+        # that exact receipt before discovery, preserving the original folder.
+        for asset in self.rows('assets'):
+            target, version = file_locations.resolve(self.db, asset['path'], asset.get('fileVersion'))
+            if target != asset['path'] or version != asset.get('fileVersion'):
+                if target != asset['path']:
+                    asset.setdefault('pathHistory', []).append(asset['path'])
+                asset.update(path=target, fileVersion=version)
+                self.save('assets', asset)
+        for row in self.videos.store.list(include_deleted=True):
+            before = json.dumps(row, sort_keys=True)
+            file_locations.video(self.db, row)
+            if json.dumps(row, sort_keys=True) != before:
+                self.videos.store.save(row)
+        for store in (self.uploads.store, self.slicing.store, self.slicing.packages.store):
+            for row in store.list('items'):
+                before = json.dumps(row, sort_keys=True)
+                if store is self.slicing.packages.store:
+                    file_locations.package(self.db, row)
+                else:
+                    file_locations.field(self.db, row, 'path', 'fileVersion')
+                if json.dumps(row, sort_keys=True) != before:
+                    store.save('items', row)
+
+    def _released(self, path):
+        if self.stopping:
+            return
+        if path not in self.waiting_paths:
+            return
+        self.waiting_paths.discard(path)
+        if self.event_loop and not self.event_loop.is_closed():
+            self.event_loop.call_soon_threadsafe(self.wake.set)
+        else:
+            self.wake.set()
 
     def rows(self, table):
         assert table in {'settings', 'assets', 'plans', 'moves', 'requests', 'retentions'}
@@ -128,13 +185,18 @@ class WorkspaceManager:
                              'files': len(paths), 'bytes': sum(paths.values())})
         plans = self.rows('plans')
         plan = plans[-1] if plans else None
+        last_action = next((r for r in reversed(self.rows('requests')) if r.get('kind') == 'reconcile'), None)
+        if last_action and last_action.get('canonicalId'):
+            last_action = self.get('requests', last_action['canonicalId']) or last_action
         public_assets = [{k: a.get(k) for k in ('id', 'name', 'path', 'folder', 'stage', 'status', 'message', 'retention',
-                            'originalCreatedNs', 'categories')} | {'cleanup': {k: (a.get('cleanup') or {}).get(k)
+                            'originalCreatedNs', 'categories', 'organization')} | {'cleanup': {k: (a.get('cleanup') or {}).get(k)
                             for k in ('state', 'message', 'completedAt')}} for a in assets]
         return {'enabled': self.enabled, 'revision': self.config['revision'], 'parent': self.config.get('parent', ''),
                 'root': self.config.get('root', ''), 'online': self.online, 'maintenance': self.maintenance,
                 'branches': branches, 'assets': public_assets, 'totalBytes': sum(b['bytes'] for b in branches),
                 'migration': self.public_plan(plan), 'lastCheck': self.last_check,
+                'lastAction': {k: last_action.get(k) for k in ('id', 'state', 'stage', 'message', 'total', 'finished', 'waiting', 'failed', 'movedFiles', 'currentName', 'updatedAt')} if last_action else None,
+                'activity': dict(self.activity),
                 'preservedUploadedAt': self.config.get('preservedUploadedAt'),
                 'counts': {s: sum(a.get('status') == s for a in assets) for s in ('managed', 'waiting', 'attention', 'cleaned', 'preserved')}}
 
@@ -233,37 +295,85 @@ class WorkspaceManager:
                 add(row.get('path'), 'slicing', row['id'], row.get('fileVersion'))
         return refs
 
-    async def discover(self):
+    async def discover(self, only=None):
         refs = self.references()
         known = {a['path']: a for a in self.rows('assets')}
+        selected = self.get('assets', only) if only else None
+        if only:
+            refs = {key: value for key, value in refs.items() if selected and key == selected['path']}
+        preserved_paths = {p for p, a in known.items() if self.is_preserved(a)}
+        marker = read_marker(self.root) if self.enabled else None
+        owned_root = bool(marker and marker['id'] == self.config['workspaceId'])
+        self.discovery_waiting.clear()
         def inspect():
             inspected = []
             for raw, links in refs.items():
-                if raw in known and known[raw].get('cleanup', {}).get('state') == 'complete':
+                if raw in preserved_paths or (raw in known and known[raw].get('cleanup', {}).get('state') == 'complete'):
+                    continue
+                if self.leases.busy(raw):
+                    inspected.append((raw, None, '', '文件正在使用，释放后继续整理。'))
                     continue
                 try:
                     version = file_version(raw, edge=True)
+                    saved = (known.get(raw) or {}).get('fileVersion')
+                    reconnect = (owned_root and Path(raw).is_relative_to(self.root)
+                                 and reconnected_version(version, saved))
                     # Contradictory bindings may not be silently replaced with today's bytes.
-                    if any(link.get('version') and not compatible(version, link['version']) for link in links):
+                    if ((saved and not compatible(version, saved) and not reconnect)
+                            or any(link.get('version') and not compatible(version, link['version'])
+                                   and not (reconnect and compatible(saved, link['version'])) for link in links)):
                         inspected.append((raw, None, '', '文件版本与绑定记录不同，原位保留。'))
                     else:
                         inspected.append((raw, version, birth_ns(raw), ''))
                 except (OSError, ValueError):
-                    inspected.append((raw, None, '', '文件当前不可读；保留已有记录，等待原磁盘或人工核对。'))
+                    previous = known.get(raw) or {}
+                    acknowledged = any(e.get('path') == raw and e.get('state') in {'deleting', 'deleted'}
+                        and compatible(previous.get('fileVersion') or {}, e.get('expected'))
+                        for e in previous.get('cleanup', {}).get('manifest', []))
+                    missing = False
+                    if acknowledged:
+                        try:
+                            checked_path(raw).lstat()
+                        except FileNotFoundError:
+                            missing = True
+                        except (OSError, ValueError):
+                            pass
+                    inspected.append((raw, None, '', '' if missing else
+                                      '文件当前不可读；保留已有记录，等待原磁盘或人工核对。'))
             return inspected
         inspected = await asyncio.to_thread(inspect)
+        self.discovery_errors = {path:error for path, _version, _created, error in inspected if error}
+        reconnected = False
         for path, version, created, error in inspected:
             row = known.get(path)
+            if row and version and reconnected_version(version, row.get('fileVersion')):
+                file_locations.remember(self.db, {'source':path, 'destination':path,
+                    'expected':row['fileVersion'], 'destinationVersion':version})
+                row['fileVersion'] = version
+                reconnected = True
+            if error == '文件正在使用，释放后继续整理。':
+                self.waiting_paths.add(str(path))
+                if not row:
+                    self.discovery_waiting.add(str(path))
             if not row:
                 # Missing history is retained in its existing module, never recreated.
                 if not version:
                     continue
                 identity = content_id(Path(path).name, version)
+                existing = self.get('assets', identity)
+                if existing:
+                    target, observed = file_locations.resolve(self.db, existing['path'], existing.get('fileVersion'))
+                    if target == path and compatible(observed, version):
+                        row = existing
+                        row.update(path=path, fileVersion=version)
+                    else:
+                        import hashlib
+                        identity = hashlib.sha256((identity + path).encode()).hexdigest()[:24]
                 used = {a['folder'] for a in self.rows('assets')}
                 folder = folder_name(Path(path).name)
                 if folder in used:
                     folder += '_' + identity[:8]
-                row = {'id': identity, 'path': path, 'name': Path(path).name, 'folder': folder,
+                row = row or {'id': identity, 'path': path, 'name': Path(path).name, 'folder': folder,
                        'fileVersion': version, 'originalFileVersion': version, 'originalCreatedNs': created,
                        'status': 'managed', 'createdAt': now_iso()}
             if error:
@@ -272,12 +382,21 @@ class WorkspaceManager:
                 if not recovering:
                     row.update(status='attention', message=error)
             else:
-                row.update(links=refs[path], status='managed', message='')
+                row['links'] = refs[path]
+                if not row.get('originalCreatedNs') and created:
+                    row['originalCreatedNs'] = created
+                if row.get('organization', {}).get('state') != 'attention' and row.get('archiveRetry', {}).get('state') != 'queued':
+                    row.update(status='managed', message='')
+            if error == '文件正在使用，释放后继续整理。':
+                row.update(status='waiting', message=error)
+                self.waiting_paths.add(str(path))
             if self.is_preserved(row):
                 row.update(retention={'preserve': True, 'since': self.config.get('preservedUploadedAt'),
                                       'reason': '已上传历史视频，保留原位。'},
                            status='preserved', message='已上传历史视频，跳过整理和本地清理。')
             self.save('assets', row)
+        if reconnected:
+            self._restore_locations()
         self.created_times = {a['path']: a.get('originalCreatedNs') for a in self.rows('assets')}
         return self.rows('assets')
 
@@ -288,15 +407,17 @@ class WorkspaceManager:
     def outcomes(self, asset):
         groups = {'bed': [], 'magnet': []}
         for item in self.linked(asset):
-            name = 'bed' if str(item.get('sourceDatasetId')) == '27912' else 'magnet'
-            category = item.get('categories', {}).get(name, {})
-            state = category.get('state')
-            # These are definite decoder outcomes only after the recovery path ran.
-            irreversible = (item.get('partialRecovery') and
-                            (category.get('errorCode') or item.get('errorCode')) in
-                            {'no_decodable_samples', 'no_cuttable_fragments'})
-            outcome = 'uncuttable' if irreversible else state
-            groups[name].append(outcome)
+            if item.get('superseded'):
+                continue
+            for name in groups:
+                category = item.get('categories', {}).get(name, {})
+                state = category.get('state')
+                if not state or state == 'not_applicable':
+                    continue
+                irreversible = (item.get('partialRecovery') and
+                                (category.get('errorCode') or item.get('errorCode')) in
+                                {'no_decodable_samples', 'no_cuttable_fragments'})
+                groups[name].append('uncuttable' if irreversible else state)
         return {k: (v[0] if v and len(set(v)) == 1 else 'pending') for k, v in groups.items()}
 
     def stage(self, asset):
@@ -394,6 +515,14 @@ class WorkspaceManager:
                 raise Conflict('工作区正在整理，请等待完成。')
             root = await asyncio.to_thread(choose_root, parent, self.config['workspaceId'], self.config.get('root'))
             await self.discover()
+            for asset in self.rows('assets'):
+                if self.is_preserved(asset) or asset.get('cleanup', {}).get('state') == 'complete':
+                    continue
+                try:
+                    await self.refresh_archive_photos(asset)
+                except (OSError, ValueError, zipfile.BadZipFile):
+                    asset.update(status='attention', message='照片与已核验压缩包暂不能确认一致，原位保留。')
+                    self.save('assets', asset)
             plan = {'id': uuid4().hex, 'root': str(root), 'parent': str(root.parent), 'revision': revision,
                     'state': 'preview', 'createdAt': now_iso(),
                     'message': '仅整理程序已绑定的文件；未知文件保持原位。'}
@@ -596,6 +725,7 @@ class WorkspaceManager:
                     entry['destinationVersion'] = await io(publish_copied, entry)
                     self.save('moves', entry)
             await io(finish_source, entry)
+            file_locations.remember(self.db, entry)
             entry['category'] = 'workspace'
             if entry['kind'] == 'video':
                 self.moves.update_bindings(entry)
@@ -682,8 +812,82 @@ class WorkspaceManager:
         preview = await self.preview(plan['parent'], revision, request_id + '-preview')
         return await self.apply(preview['id'], revision, request_id)
 
+    def request_archive_retry(self, identity, request_id):
+        asset = self.get('assets', identity)
+        if not asset:
+            raise ValueError('工作区文件记录不存在。')
+        prior = self.get('requests', request_id)
+        if prior:
+            if prior.get('kind') != 'archive-retry' or prior.get('assetId') != identity:
+                raise Conflict('请求编号已用于其他操作。')
+            return
+        if self.maintenance:
+            raise Conflict('工作区正在整理，请完成后重试。')
+        if self.is_preserved(asset):
+            raise ValueError('已上传历史视频按你的设置保留原位，不参与归档。')
+        if asset.get('cleanup', {}).get('state') == 'complete':
+            raise ValueError('本地文件已清理，历史记录保留，无需归档。')
+        asset.update(status='waiting', message='归档已排队，文件使用结束后自动处理。',
+                     archiveRetry={'state': 'queued', 'requestId': request_id})
+        package_ids = {p['id'] for p in self.packages(asset)}
+        self.session_checked = {key for key in self.session_checked if not (
+            isinstance(key, tuple) and len(key) > 1 and key[0] == 'archive-photos' and key[1] in package_ids)}
+        self.save('assets', asset)
+        self.save('requests', {'id': request_id, 'kind': 'archive-retry', 'assetId': identity, 'state': 'queued'})
+        self.wake.set()
+
+    async def refresh_archive_photos(self, asset):
+        from .workspace_archive import refresh_photo_versions
+        for package in self.packages(asset):
+            if (package.get('state') != 'complete' or not package.get('verifiedJobId')
+                    or package.get('actualImages') != package.get('imageCount')
+                    or package.get('cleanupState') == 'complete' or package.get('localCleanupState') == 'complete'):
+                continue
+            cache_key = ('archive-photos', package['id'], package.get('revision'))
+            if cache_key in self.session_checked:
+                continue
+            with ExitStack() as guards:
+                guards.enter_context(self.leases.read(package['path']))
+                for name in package.get('images', []):
+                    guards.enter_context(self.leases.read(package.get('imagePaths', {}).get(name, str(Path(package['imageDir']) / name))))
+                changes = await self.videos.file_operation(refresh_photo_versions, package)
+            if changes:
+                current = self.slicing.packages.store.get('items', package['id'])
+                if current['revision'] != package['revision']:
+                    raise Conflict('照片包记录已更新，稍后继续归档。')
+                current.setdefault('imageVersions', {}).update(changes)
+                current['photoMetadataVerifiedAt'] = now_iso()
+                self.slicing.packages.store.save('items', current)
+                cache_key = ('archive-photos', current['id'], current.get('revision'))
+            self.session_checked.add(cache_key)
+
+    def request_reconcile(self, revision, request_id):
+        previous = self.get('requests', request_id)
+        if previous:
+            if previous.get('kind') != 'reconcile':
+                raise Conflict('请求编号已用于其他操作。')
+            return self.state()
+        if revision != self.config['revision']:
+            raise Conflict('工作区已更新，请刷新后重试。')
+        if not self.enabled or self.maintenance:
+            raise Conflict('请先等待工作区启用和整理完成。')
+        active = next((r for r in reversed(self.rows('requests')) if r.get('kind') == 'reconcile'
+                       and r.get('state') in {'queued', 'running', 'waiting'} and not r.get('canonicalId')), None)
+        if active:
+            self.save('requests', {'id': request_id, 'kind': 'reconcile', 'state': 'queued', 'canonicalId': active['id']})
+            self.wake.set()
+            return self.state()
+        for asset in self.rows('assets'):
+            if asset.get('status') == 'attention' and not self.is_preserved(asset) and asset.get('cleanup', {}).get('state') != 'complete':
+                self.request_archive_retry(asset['id'], request_id + '-' + asset['id'])
+        self.save('requests', {'id': request_id, 'kind': 'reconcile', 'state': 'queued',
+                              'message': '文件核对已排队，后台逐条整理。'})
+        self.wake.set()
+        return self.state()
+
     async def startup(self):
         self.stopping = False
+        self.event_loop = asyncio.get_running_loop()
         unfinished = next((p for p in reversed(self.rows('plans')) if p['state'] in {'moving', 'waiting'}), None)
         if unfinished:
             self.maintenance = True
@@ -692,80 +896,33 @@ class WorkspaceManager:
 
     async def shutdown(self):
         self.stopping = True
-        for task in (self.loop_task, self.task):
+        for task in (self.loop_task, self.task, self.cleanup_task):
             if task and not task.done():
                 task.cancel()
-        await asyncio.gather(*(t for t in (self.loop_task, self.task) if t), return_exceptions=True)
+        await asyncio.gather(*(t for t in (self.loop_task, self.task, self.cleanup_task) if t), return_exceptions=True)
 
     async def loop(self):
         while not self.stopping:
-            try:
-                if self.enabled and not self.maintenance:
-                    await self.reconcile()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                # Disk disappearance must not stop unrelated cloud polling.
-                self.online = False
+            # Consume notifications before doing work. A click or file release
+            # during this pass must survive and trigger the next pass.
             self.wake.clear()
             try:
-                await asyncio.wait_for(self.wake.wait(), timeout=30)
+                if self.enabled and not self.maintenance:
+                    await self.reconcile(background_cleanup=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                message = '等待原磁盘恢复，整理请求已保留。' if not self.online else '整理暂未完成，进度已保留，将继续重试。'
+                self._activity('waiting', message)
+                for request in self.rows('requests'):
+                    if request.get('kind') == 'reconcile' and request.get('state') in {'queued', 'running', 'waiting'} and not request.get('canonicalId'):
+                        request.update(state='waiting', stage='waiting', message=message, failureType=type(error).__name__)
+                        self.save('requests', request)
+            try:
+                pending = any(a.get('status') == 'waiting' for a in self._targets())
+                await asyncio.wait_for(self.wake.wait(), timeout=5 if pending else 30)
             except asyncio.TimeoutError:
                 pass
-
-    async def reconcile(self, only=None, cleanup=True):
-        if not self.enabled or self.maintenance:
-            return self.state()
-        async with self.lock, AsyncExitStack() as locks:
-            # Cloud checks keep row snapshots across awaits. Drain those before
-            # relocating paths, so their saves cannot resurrect an old location.
-            for lock in (self.uploads.tick_lock, self.slicing.tick_lock, self.slicing.packages.tick_lock):
-                await locks.enter_async_context(lock)
-            for lock in list(self.videos.row_locks.values()):
-                await locks.enter_async_context(lock)
-            self.require_root()
-            for journal in self.rows('moves'):
-                if journal['state'] == 'moving' and not self.leases.busy(journal['source']):
-                    try:
-                        await self.process_move(journal)
-                    except (OSError, ValueError):
-                        pass
-            await self.discover()
-            for asset in self.rows('assets'):
-                if self.is_preserved(asset):
-                    continue
-                if self.config.get('pilotAssetId') and asset['id'] != self.config['pilotAssetId']:
-                    continue
-                if only and asset['id'] != only:
-                    continue
-                if asset.get('cleanup', {}).get('state') == 'complete' or asset.get('status') == 'attention':
-                    continue
-                asset.update(stage=self.stage(asset), categories=self.outcomes(asset))
-                self.save('assets', asset)
-                candidates = self.plan_assets(self.root, only=asset['id'], checkpoints=False)
-                for entry in candidates:
-                    if self.leases.busy(entry['source']) or self.leases.busy(entry['destination']):
-                        asset.update(status='waiting', message='文件使用中，释放后整理。')
-                        break
-                    # Continue an unfinished journal for exactly this pair.
-                    old = next((j for j in reversed(self.rows('moves')) if j['source'] == entry['source']
-                                and j['destination'] == entry['destination'] and j['state'] != 'complete'), None)
-                    try:
-                        await self.process_move(old or entry)
-                    except (OSError, ValueError):
-                        asset.update(status='attention', message='整理遇到文件冲突或版本变化，原位保留。')
-                        break
-                else:
-                    asset = self.get('assets', asset['id'])
-                    asset.update(status='managed', message='')
-                current = self.get('assets', asset['id'])
-                # A move callback may have refreshed identity; don't overwrite it.
-                current.update(status=asset['status'], message=asset['message'], stage=asset['stage'], categories=asset['categories'])
-                self.save('assets', current)
-                if cleanup and current['status'] == 'managed':
-                    await self.cleanup(current)
-            self.last_check = now_iso()
-        return self.state()
 
     def cleanup_eligibility(self, asset):
         from .workspace_cleanup import eligibility

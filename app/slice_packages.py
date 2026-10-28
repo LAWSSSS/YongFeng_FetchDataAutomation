@@ -1,16 +1,19 @@
 """Upload one slice archive per category, then import one package at a time."""
 import asyncio
 import json
+import zipfile
+from contextlib import ExitStack
 from pathlib import Path
 
 from .audit_moves import checked_path, source_fingerprint
 from .domain import now_iso
-from .file_leases import FileLeases
+from .file_leases import FileLeases, finish_io
 from .package_archive import legacy_layout, repair_archive
 from .upload_audit import AuditError, name_key, is_import_job
 from .upload_remote import source_keys
 from .uploads import CHECK_SECONDS, MESSAGES, PAUSE_CODES, ProcessWorker, RETRY_DELAYS, STALL_SECONDS, safe_message
 from .videos import Conflict
+from . import file_locations
 
 PACKAGE_TARGETS = (
     {"id": "27892", "category": "bed", "name": "车斗切片照片"},
@@ -26,6 +29,7 @@ def image_prefix(item):
 class SlicePackageStore:
     def __init__(self, db):
         self.db = db
+        file_locations.initialize(db)
         for name in ("items", "batches"):
             db.execute(f"CREATE TABLE IF NOT EXISTS simple_slice_package_{name} (id TEXT PRIMARY KEY, payload TEXT NOT NULL)")
         db.commit()
@@ -33,7 +37,17 @@ class SlicePackageStore:
     def save(self, kind, value):
         if kind not in {"items", "batches"}:
             raise ValueError("记录类型无效。")
+        if kind == 'items':
+            file_locations.package(self.db, value)
         previous = self.get(kind, value["id"])
+        file_locations.keep_cleanup(previous, value)
+        if previous and previous.get("superseded"):
+            value["superseded"] = True
+            for key in ("jobId", "verifiedJobId", "outputImageIds"):
+                if previous.get(key) and not value.get(key):
+                    value[key] = previous[key]
+            if not value.get("jobId") and value.get("state") not in {"submitting", "importing", "complete"}:
+                value["state"] = "superseded"
         value["revision"] = int((previous or {}).get("revision", 0)) + 1
         value["updatedAt"] = now_iso()
         self.db.execute(
@@ -55,14 +69,14 @@ class SlicePackageStore:
     def find(self, source_dataset, video_id, category):
         for item in self.list("items"):
             if (item.get("sourceDatasetId") == source_dataset and str(item.get("sourceVideoId")) == str(video_id)
-                    and item.get("category") == category and item.get("state") != "dismissed"):
+                    and item.get("category") == category and item.get("state") != "dismissed" and not item.get("superseded")):
                 return item
         return None
 
     def find_video(self, path, version, category):
         matches = [item for item in self.list("items") if item.get("videoPath") == path
                    and item.get("videoFileVersion") == version and item.get("category") == category
-                   and item.get("state") != "dismissed"]
+                   and item.get("state") != "dismissed" and not item.get("superseded")]
         if len(matches) > 1:
             raise ValueError("同一视频存在多个切片包，请先核对已有记录。")
         return matches[0] if matches else None
@@ -130,7 +144,7 @@ class SlicePackageManager:
         fields = {"id", "revision", "dataset", "category", "sourceDatasetId", "sourceVideoId", "itemId",
                   "videoPath", "path", "imageDir", "name", "state", "message", "errorCode", "images",
                   "imageCount", "actualImages", "bytes", "size", "retries", "jobId", "cleanupState",
-                  "cleanupMessage", "createdAt", "updatedAt"}
+                  "cleanupMessage", "createdAt", "updatedAt", "superseded", "localCleanupState"}
         public = [{key: value for key, value in item.items() if key in fields} for item in items]
         for target in targets:
             target["items"] = [item for item in public if item.get("dataset") == target["id"]]
@@ -138,8 +152,16 @@ class SlicePackageManager:
                 "busy": bool(self.running) or self.tick_lock.locked()}
 
     def remember(self, record):
-        existing = (self.store.find_video(record.get("videoPath"), record.get("videoFileVersion"), record["category"])
-                    or self.store.find(record["sourceDatasetId"], record["sourceVideoId"], record["category"]))
+        if getattr(self, "control", None) and not self.control.package_allowed(record):
+            record.update(superseded=True, state="superseded", message="旧版照片已保留，不再上传。")
+        if record.get("sourceIdentity"):
+            existing = next((item for item in self.store.list("items")
+                if item.get("sourceIdentity") == record["sourceIdentity"]
+                and item.get("category") == record["category"] and item.get("state") != "dismissed"), None)
+        else:
+            existing = self.store.find_video(record.get("videoPath"), record.get("videoFileVersion"), record["category"])
+            if not existing:
+                existing = self.store.find(record["sourceDatasetId"], record["sourceVideoId"], record["category"])
         if existing:
             return existing
         self.store.save("items", record)
@@ -236,7 +258,8 @@ class SlicePackageManager:
                                     for item in self.store.list("items") if item.get("dataset") == dataset)
         if not busy:
             ready = next((item for item in self.store.list("items")
-                          if item.get("dataset") == dataset and item.get("state") == "uploaded"), None)
+                          if item.get("dataset") == dataset and item.get("state") == "uploaded"
+                          and (not getattr(self, "control", None) or self.control.package_allowed(item))), None)
             if ready:
                 await self.submit_one(ready, jobs)
         now = self.clock()
@@ -244,6 +267,8 @@ class SlicePackageManager:
             if self.paused:
                 return
             if item.get("dataset") != dataset or item.get("state") != "queued" or item["id"] in self.running:
+                continue
+            if getattr(self, "control", None) and not self.control.package_allowed(item):
                 continue
             if item.get("nextAttempt", 0) > now:
                 continue
@@ -261,6 +286,8 @@ class SlicePackageManager:
 
     async def upload_one(self, identity):
         item = self.store.get("items", identity)
+        if getattr(self, "control", None) and not self.control.package_allowed(item):
+            return
         try:
             operation = "cleanup" if item.get("cleanupNeeded") else "upload"
             with self.leases.read(item["path"]):
@@ -416,6 +443,9 @@ class SlicePackageManager:
         # Old images with the same names are not proof of this import. Keep a
         # pre-submit inventory when possible; network failures happen pre-write.
         images = await self.remote.images(item["dataset"], prefix=image_prefix(item))
+        current = self.store.get("items", item["id"])
+        if getattr(self, "control", None) and not self.control.package_allowed(current):
+            return
         if self.paused:
             return
         item.update(state="submitting", beforeJobs=[str(job.get("id")) for job in jobs], keys=keys,
@@ -447,7 +477,23 @@ class SlicePackageManager:
             item.update(state="attention", errorCode="import_uncertain", message="无法唯一确认这个压缩包的导入任务。")
             self._save(item)
 
+    def _verification_current(self, item):
+        # Every stored edit increments revision. An old network response may
+        # reconcile its own history, but must never overwrite a newer edit.
+        current = self.store.get('items', item['id'])
+        return bool(current and current['revision'] == item.get('revision'))
+
     async def verify(self, item, job):
+        if not self._verification_current(item):
+            return
+        from .package_import_reuse import reuse_image_ids
+        try:
+            reused_ids = reuse_image_ids(item, lambda path, version: file_locations.resolve(self.store.db, path, version))
+        except (TypeError, ValueError):
+            item.update(state='attention', errorCode='reuse_receipt_invalid', actualImages=0,
+                        message='照片复用凭证不完整或版本不同，保留文件待核对。')
+            self._save(item)
+            return
         expected_keys = frozenset(item.get("keys") or [(item.get("object") or {}).get("key")])
         bound = job.get("dataset")
         bound = bound.get("id") if isinstance(bound, dict) else bound
@@ -461,6 +507,8 @@ class SlicePackageManager:
             self._save(item)
             return
         images = await self.remote.images(item["dataset"], prefix=image_prefix(item))
+        if not self._verification_current(item):
+            return
         expected = {name_key(name) for name in item.get("images") or []}
         found = {}
         for image in images:
@@ -475,6 +523,8 @@ class SlicePackageManager:
             else:
                 owned = isinstance(item.get("beforeImageIds"), list) and str(image["id"]) not in item["beforeImageIds"]
             if owned:
+                if reused_ids is not None and str(image['id']) != reused_ids.get(key):
+                    continue
                 found.setdefault(key, []).append(str(image["id"]))
         if expected and len(expected) == item.get("imageCount") and all(len(found.get(name, [])) == 1 for name in expected):
             item.update(state="complete", message="图片已逐张核验。", errorCode="", actualImages=len(expected),
@@ -482,13 +532,44 @@ class SlicePackageManager:
             self._save(item)
             self.delete_if_both_complete(item)
             return
+        if await self.reuse_identical_import(item):
+            return
+        current = self.store.get('items', item['id'])
+        if (not self._verification_current(item) or current.get('superseded')
+                or (getattr(self, 'control', None) and not self.control.package_allowed(current))):
+            return
         wrong_layout = legacy_layout(item)
         item.update(state="attention", errorCode="archive_layout" if wrong_layout else "verification", actualImages=sum(len(v) == 1 for v in found.values()),
                     message="压缩包目录格式有误，原片保留；可修复格式后重传。" if wrong_layout else
                     f"导入已结束，明确关联 {sum(len(v) == 1 for v in found.values())}/{len(expected)} 张；原片保留，可重新核对。")
         self._save(item)
 
+    async def reuse_identical_import(self, item):
+        from .package_import_reuse import reuse_candidates, identical_photos, prepare_import_reuse
+        try:
+            candidates = reuse_candidates(item, self.store.list('items'))
+            if len(candidates) != 1:
+                return False
+            peer = candidates[0]
+            with ExitStack() as guards:
+                for path in sorted({item['path'], peer['path']}):
+                    guards.enter_context(self.leases.read(path))
+                equality = await finish_io(identical_photos, item, peer)
+            current = self.store.get('items', item['id'])
+            source = self.store.get('items', peer['id'])
+            if (not equality or not current or not source or current['revision'] != item['revision']
+                    or source['revision'] != peer['revision'] or current.get('superseded')
+                    or (getattr(self, 'control', None) and not self.control.package_allowed(current))):
+                return False
+            self._save(prepare_import_reuse(current, source, equality))
+            self.wake.set()
+            return True
+        except (OSError, TypeError, ValueError, zipfile.BadZipFile):
+            return False
+
     def delete_if_both_complete(self, item):
+        if item.get("superseded"):
+            return
         if getattr(self, 'workspace', None) and self.workspace.enabled:
             self.workspace.wake.set()
             return

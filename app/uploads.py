@@ -18,6 +18,7 @@ from .upload_audit import AuditError, DATASETS, name_key
 from .upload_remote import UploadRemote, source_keys, video_names
 from .videos import Conflict
 from . import runtime
+from . import file_locations
 
 CHECK_SECONDS = 30
 ACTIVE_POLL_SECONDS = 8
@@ -78,6 +79,7 @@ def inspect_video(path, expected):
 class UploadStore:
     def __init__(self, db):
         self.db = db
+        file_locations.initialize(db)
         for table in ("simple_upload_items", "simple_upload_batches", "simple_upload_requests"):
             db.execute(f"CREATE TABLE IF NOT EXISTS {table} (id TEXT PRIMARY KEY, payload TEXT NOT NULL)")
         db.execute("CREATE TABLE IF NOT EXISTS simple_upload_settings (id INTEGER PRIMARY KEY CHECK(id=1), payload TEXT NOT NULL)")
@@ -93,6 +95,9 @@ class UploadStore:
 
     def save(self, kind, value):
         assert kind in ("items", "batches", "requests")
+        if kind == 'items':
+            file_locations.field(self.db, value, 'path', 'fileVersion')
+            file_locations.keep_cleanup(self.get(kind, value['id']), value)
         value["updatedAt"] = now_iso()
         self.db.execute(f"INSERT INTO simple_upload_{kind} VALUES(?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload",
             (value["id"], json.dumps(value, ensure_ascii=False)))

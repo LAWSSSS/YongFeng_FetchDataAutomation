@@ -91,6 +91,7 @@ async def test_remove_card_is_atomic_idempotent_and_keeps_all_processing_evidenc
     for category in ('bed', 'magnet'): seed_slice(app, path, category)
     store = app.state.slicing.store
     store.save('observations', {'id': 'observation', 'label': 'target', 'time': 30})
+    app.state.media_control.refresh()
     before = copy.deepcopy(store.list('items'))
     payload = {'requestId': 'remove-pair', 'selections': [{'id': r['id'], 'expectedRevision': r['revision']} for r in before]}
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://127.0.0.1') as client:
@@ -161,9 +162,15 @@ async def test_new_slice_submission_records_single_selection_and_request_replay(
         return {'run': {'id': 'run', 'items': ['bed', 'magnet'], 'message': '单条已启动'}}
     monkeypatch.setattr(app.state.slicing, 'start', start)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://127.0.0.1') as client:
-        payload = {'requestId': 'single-click', 'expectedRevision': 0, 'mode': 'single', 'itemId': 'bed'}
-        assert (await client.post('/api/slicing/start', json=payload)).status_code == 202
-        assert (await client.post('/api/slicing/start', json=payload)).status_code == 202
+        group=(await client.get('/api/video-processing')).json()['groups']
+        # Finished local-only history stays in the slicing records. Its durable
+        # control identity still exists for a versioned, explicit command.
+        app.state.media_control.refresh()
+        item=app.state.slicing.store.get('items','bed')
+        payload = {'requestId': 'single-click', 'expectedRevision': 3, 'generation':0, 'action': 'start', 'itemId': 'bed'}
+        url='/api/video-processing/'+item['mediaId']+'/actions'
+        assert (await client.post(url, json=payload)).status_code == 200
+        assert (await client.post(url, json=payload)).status_code == 200
         receipts = (await client.get('/api/submissions?kind=slicing')).json()
         assert len(receipts) == 1 and receipts[0]['title'] == '单条切片'
         detail = (await client.get('/api/submissions/' + receipts[0]['id'])).json()
@@ -264,6 +271,7 @@ async def test_merged_slice_date_removal_and_restore_are_atomic_without_changing
     item = seed_slice(app, path)
     log = SubmissionLog(app.state.store.db)
     row = log.add('slicing', '全部切片', {'itemIds': [item['id']]}, submitted_at='2026-10-25T16:00:00Z')
+    app.state.media_control.refresh()
     before = copy.deepcopy(app.state.slicing.store.list('items'))
     body = {'requestId': 'merged-remove', 'selections': [{'id': item['id'], 'expectedRevision': 3}],
             'receipts': [{'id': row['id'], 'expectedRevision': 0}]}

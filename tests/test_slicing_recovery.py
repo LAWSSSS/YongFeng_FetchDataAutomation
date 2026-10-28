@@ -78,7 +78,7 @@ async def test_idle_retry_really_starts_only_that_video_and_replays_safely(tmp_p
     item = item_fixture(tmp_path); other = item_fixture(tmp_path, "other", "pending")
     manager.store.save("items", item); manager.store.save("items", other)
     manager.store.save("observations", {"id": "valid-observation", "itemId": item["id"], "time": 0})
-    with pytest.raises(ValueError, match="上次单条试切已结束"):
+    with pytest.raises(ValueError, match="上次单条处理已结束.*视频查看与更正"):
         manager.run["singleItemId"] = item["id"]; manager.store.save("runs", manager.run)
         manager.resume("cannot-resume-attention")
     state = manager.retry(item["id"], 3, "retry-once")

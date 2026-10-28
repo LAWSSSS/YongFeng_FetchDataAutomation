@@ -6,6 +6,7 @@ import math
 import os
 import subprocess
 import sys
+import hashlib
 from pathlib import Path
 
 from .media_validation import MediaValidationError, verify_video_tail
@@ -14,6 +15,7 @@ from .media_validation import MediaValidationError, verify_video_tail
 class FrameExtractionError(RuntimeError):
     def __init__(self, code="frame_extract_failed", timestamp=None):
         super().__init__(code)
+        self.code = code
         self.timestamp = timestamp
 
 
@@ -88,6 +90,30 @@ def probe(path, ffprobe):
             "frameRate": frame_rate if math.isfinite(frame_rate) and frame_rate > 0 else 25.0}
 
 
+def verify_file_version(path, expected, *, check_edges=True):
+    if not expected:
+        return
+    try:
+        info = os.stat(path, follow_symlinks=False)
+        if (info.st_size, info.st_mtime_ns, info.st_ino, info.st_dev) != (
+                expected.get("size"), expected.get("modifiedNs"), expected.get("inode"), expected.get("device")):
+            raise FrameExtractionError("source_changed")
+        if not check_edges:
+            return
+        digest = hashlib.sha256()
+        with open(path, "rb") as stream:
+            digest.update(stream.read(65536))
+            if info.st_size > 65536:
+                stream.seek(max(0, info.st_size - 65536))
+                digest.update(stream.read(65536))
+        if digest.hexdigest() != expected.get("edgeHash"):
+            raise FrameExtractionError("source_changed")
+    except FrameExtractionError:
+        raise
+    except OSError:
+        raise FrameExtractionError("frame_io_error") from None
+
+
 def extract_requested_frames(path, ffmpeg, metadata, points, *, skip_undecodable=False):
     """Yield requested JPEGs one at a time; never materialize them on disk."""
     if not os.path.isfile(path) or not os.access(path, os.R_OK):
@@ -96,6 +122,40 @@ def extract_requested_frames(path, ffmpeg, metadata, points, *, skip_undecodable
         raise RuntimeError("frame_tool_missing")
     all_points = sorted(set(round(float(value), 6) for values in points.values() for value in values))
     duration, frame_rate = float(metadata["duration"]), float(metadata.get("frameRate") or 25)
+    if skip_undecodable:
+        expected = metadata.get("_expectedFileVersion")
+        verify_file_version(path, expected)
+        io_markers = ("input/output error", "permission denied", "device not configured", "no such file or directory",
+                      "read error", "i/o error", "error opening input")
+        for timestamp in all_points:
+            verify_file_version(path, expected, check_edges=False)
+            command = [ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-threads", "2",
+                       "-ss", f"{timestamp:.6f}", "-i", path, "-map", "0:v:0", "-an", "-sn",
+                       "-frames:v", "1", "-threads", "2", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"]
+            image_bytes = None
+            for attempt in range(2):
+                try:
+                    result = subprocess.run(command, capture_output=True, timeout=30, check=False)
+                except subprocess.TimeoutExpired:
+                    raise FrameExtractionError("frame_timeout", timestamp=timestamp) from None
+                except OSError:
+                    raise FrameExtractionError("frame_tool_error", timestamp=timestamp) from None
+                stderr = result.stderr.decode(errors="replace").lower()
+                if any(marker in stderr for marker in io_markers):
+                    raise FrameExtractionError("frame_io_error", timestamp=timestamp) from None
+                candidate = result.stdout
+                if (result.returncode == 0 and candidate.startswith(b"\xff\xd8")
+                        and candidate.endswith(b"\xff\xd9")):
+                    image_bytes = candidate
+                    break
+            verify_file_version(path, expected, check_edges=False)
+            if image_bytes is None:
+                yield timestamp, None
+                continue
+            yield timestamp, image_bytes
+            del image_bytes
+        verify_file_version(path, expected)
+        return
     regular_by_category = {
         category: sorted(set(value for value in values if abs(value - round(value)) < 1e-6
                             and value < duration - 1.0 / frame_rate / 2))
@@ -109,9 +169,8 @@ def extract_requested_frames(path, ffmpeg, metadata, points, *, skip_undecodable
         min(second - first for first, second in zip(regular, regular[1:])) >= 5 or
         any(len({round(b - a, 6) for a, b in zip(values, values[1:])}) > 1
             for values in regular_by_category.values()))
-    # In salvage mode, decode each requested position independently so a bad
-    # packet cannot shift timestamps assigned to later frames.
-    sparse = sparse or bool(skip_undecodable)
+    # Sparse sample plans are decoded independently to keep timestamps attached
+    # to their requested positions.
     if sparse:
         for timestamp in regular:
             command = [ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-threads", "2",
@@ -124,14 +183,8 @@ def extract_requested_frames(path, ffmpeg, metadata, points, *, skip_undecodable
                         raise RuntimeError("frame_extract_failed")
                     image_bytes = decoded
             except FrameExtractionError:
-                if not skip_undecodable:
-                    raise FrameExtractionError(timestamp=timestamp) from None
-                yield timestamp, None
-                continue
+                raise FrameExtractionError(timestamp=timestamp) from None
             if image_bytes is None or not image_bytes.startswith(b"\xff\xd8") or not image_bytes.endswith(b"\xff\xd9"):
-                if skip_undecodable:
-                    yield timestamp, None
-                    continue
                 raise FrameExtractionError(timestamp=timestamp)
             yield timestamp, image_bytes
             del image_bytes
@@ -199,12 +252,8 @@ def extract_requested_frames(path, ffmpeg, metadata, points, *, skip_undecodable
                     del image_bytes
                 image_bytes = extra
         except FrameExtractionError:
-            if not skip_undecodable:
-                raise FrameExtractionError("media_incomplete", timestamp=timestamp) from None
+            raise FrameExtractionError("media_incomplete", timestamp=timestamp) from None
         if image_bytes is None:
-            if skip_undecodable:
-                yield timestamp, None
-                continue
             raise FrameExtractionError("media_incomplete", timestamp=timestamp)
         yield timestamp, image_bytes
         del image_bytes
@@ -302,6 +351,7 @@ def process(request):
         return
     ffprobe = str(Path(ffmpeg).with_name("ffprobe"))
     metadata = probe(path, ffprobe)
+    metadata["_expectedFileVersion"] = request.get("expectedFileVersion")
     settings = request["settings"]
     points = request["points"]
     categories = {category: sorted(set(round(float(value), 6) for value in values))
@@ -360,7 +410,9 @@ def process(request):
                 observations += 1
             del image_bytes
     except RuntimeError as error:
-        code = str(error) if str(error) in {"local_video_missing", "frame_tool_missing", "media_incomplete"} else "frame_extract_failed"
+        allowed = {"local_video_missing", "frame_tool_missing", "media_incomplete", "frame_timeout",
+                   "frame_tool_error", "frame_io_error", "source_changed"}
+        code = str(error) if str(error) in allowed else "frame_extract_failed"
         emit({"event": "error", "category": "both", "code": code, "stage": "sampling",
               "time": getattr(error, "timestamp", None)})
         return
@@ -375,8 +427,8 @@ def main():
         request = json.loads(line)
         process(request)
     except Exception as error:
-        code = str(error) if str(error) in {"video_probe_failed", "frame_extract_failed",
-                                             "local_video_missing", "frame_tool_missing"} else "worker_failed"
+        code = str(error) if str(error) in {"video_probe_failed", "frame_extract_failed", "frame_timeout",
+            "frame_tool_error", "frame_io_error", "source_changed", "local_video_missing", "frame_tool_missing"} else "worker_failed"
         emit({"event": "error", "category": "both", "code": code})
 
 

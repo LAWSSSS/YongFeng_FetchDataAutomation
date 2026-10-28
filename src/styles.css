@@ -30,3 +30,4 @@ button:focus-visible,summary:focus-visible,select:focus-visible{outline:2px soli
 }
 .job-list>div{flex-wrap:wrap}
 .job-list>div .table-scroll{flex:1 0 100%;margin-top:8px}
+.more-video-actions,.correction{border-top:1px solid #e8eee6;margin-top:14px;padding-top:12px}.more-video-actions>summary{cursor:pointer;color:#58715f;font-size:12px;font-weight:600}.recovery-progress{display:grid;gap:6px;margin:12px 0;padding:13px 15px;border:1px solid #d7e6d7;border-radius:10px;background:#f1f8f1;color:#315c45;font-size:12px}.recovery-progress p{margin:0;line-height:1.55}.recovery-progress>span{color:#718276;font-size:11px}.recovery-progress.needs-review{background:#fff8ef;border-color:#ecddc8;color:#825f34}.primary-video-actions{margin-top:13px}

@@ -33,10 +33,17 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.hypothesis/
+.tox/
+.nox/
 .coverage
 .coverage.*
 htmlcov/
 coverage/
+test-results/
+playwright-report/
+blob-report/
+*.tsbuildinfo
 
 # 构建、日志与临时文件
 build/
@@ -50,6 +57,9 @@ logs/
 *.log
 tmp/
 temp/
+*.tmp
+*.part
+*.bak
 
 # 本地数据与采集结果，仅跟踪目录占位文件
 /data/*

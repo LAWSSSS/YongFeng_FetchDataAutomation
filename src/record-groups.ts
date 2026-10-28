@@ -1,3 +1,5 @@
+import {partialComplete} from './video-recovery.ts';
+
 export type InspectionRecord = {
   id: string; plate: string; checkStartTime: string; checkCompleteTime: string;
   photoCount: number; inspectionDurationSeconds: number | null; issue?: string;
@@ -10,12 +12,12 @@ export type CollectionJob = {
 
 export type BatchVideo = {
   id: string; jobId: string; submittedAt?:string; activeRevision: number; revision: number;
-  versions: {revision: number; state: string; downloadRequested?: boolean}[];
+  versions: {revision: number; state: string; downloadRequested?: boolean;recovery?:{state:string;resultVerified?:boolean}}[];
   deletion?: {state: string};
 };
 
 export const categoryLabels = {
-  ready: '可查看', waiting: '等待平台结果', download: '下载中', saved: '已保存', review: '待核对', deleting: '清理中',
+  ready: '可查看', waiting: '等待平台结果', download: '下载中', saved: '已保存', complete:'已完成', review: '待核对', deleting: '清理中',
 };
 export type VideoCategory = keyof typeof categoryLabels;
 export const videoStatusOptions: {value: 'all' | VideoCategory; label: string}[] = [
@@ -36,15 +38,17 @@ export function syncVideoSelection<T extends {id: string; revision: number; acti
   for (const [id, chosen] of selection) {
     const video = videos.find(row => row.id === id);
     if (!video) continue;
-    if (video.activeRevision !== chosen.version) {
+    if (video.activeRevision !== chosen.version || video.revision !== chosen.expectedRevision) {
       next.delete(id);
-      changed = true;
-    } else if (video.revision !== chosen.expectedRevision) {
-      next.set(id, {...chosen, expectedRevision: video.revision});
       changed = true;
     }
   }
   return changed ? next : selection;
+}
+
+export function selectVideoScope<T extends BatchVideo>(videos:T[],scope:string) {
+  return videos.filter(video=>!['pending','error'].includes(video.deletion?.state||'') &&
+    (scope==='downloadable'?canDownload(video):scope==='partial'?completedPartialVideo(video):scope==='all'));
 }
 
 export function splitInspections(records: InspectionRecord[]) {
@@ -54,10 +58,16 @@ export function splitInspections(records: InspectionRecord[]) {
 export function videoCategory(video: BatchVideo): VideoCategory {
   if (['pending', 'error'].includes(video.deletion?.state || '')) return 'deleting';
   const active = video.versions.find(version => version.revision === video.activeRevision);
+  if(active&&partialComplete(active))return 'saved';
   if (!active || ['attention', 'failed', 'uncertain'].includes(active.state)) return 'review';
   if (active.state === 'saved') return 'saved';
   if (active.downloadRequested || ['downloading', 'publishing'].includes(active.state)) return 'download';
   return active.state === 'ready' ? 'ready' : 'waiting';
+}
+
+export function completedPartialVideo(video: BatchVideo) {
+  const active = video.versions.find(v=>v.revision===video.activeRevision);
+  return !['pending','error'].includes(video.deletion?.state||'') && !!active && partialComplete(active);
 }
 
 export function canDownload(video: BatchVideo) {

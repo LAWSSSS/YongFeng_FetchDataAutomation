@@ -221,6 +221,121 @@ async def test_local_slicing_uses_configured_parallel_workers_for_distinct_files
 
 
 @pytest.mark.asyncio
+async def test_local_recovery_batch_does_not_touch_unrelated_waiting_history(tmp_path, monkeypatch):
+    app = create_app(data_dir=tmp_path)
+    manager = app.state.slicing
+    manager.auth.access = "test-token"
+    selected_path = tmp_path / "selected.mp4"
+    selected_path.write_bytes(b"selected recovery media")
+    selected_version = source_version(selected_path)
+    manager.run = {"id": "recovery-run", "state": "running", "localRecoveryOnly": True,
+                   "singleMode": False, "items": ["selected"]}
+    manager.store.save("items", {"id": "selected", "path": str(selected_path),
+        "fileVersion": selected_version, "state": "waiting_connection", "sourceDatasetId": "27912",
+        "categories": {"bed": {"state": "pending"}}})
+    manager.store.save("items", {"id": "unrelated", "path": str(tmp_path / "not-mounted.mp4"),
+        "state": "waiting_connection", "sourceDatasetId": "27944",
+        "categories": {"magnet": {"state": "waiting", "taskId": "old-task"}}})
+
+    manager.remote.job = lambda _identity: pytest.fail("recovery polling touched an unrelated historical task")
+    manager.remote.jobs = lambda *_args: pytest.fail("recovery polling loaded unrelated task history")
+    original_source_version = source_version
+    checked_paths = []
+
+    def track_version(path):
+        checked_paths.append(str(path))
+        return original_source_version(path)
+
+    monkeypatch.setattr("app.slicing.source_version", track_version)
+    await manager._restore_waiting_files()
+    await manager._reconcile_waiting()
+
+    assert checked_paths == [str(selected_path)]
+    assert manager.store.get("items", "selected")["state"] == "pending"
+    assert manager.store.get("items", "unrelated")["state"] == "waiting_connection"
+    assert manager._poll_timeout() == 30
+    await close_app(app)
+
+
+@pytest.mark.asyncio
+async def test_slow_photo_export_does_not_block_the_next_video_analysis(tmp_path, monkeypatch):
+    app = create_app(data_dir=tmp_path)
+    manager = app.state.slicing
+    manager.auth.access = "test-token"
+    manager.run = {"id": "parallel-export", "state": "running"}
+    manager.store.settings.update(enabled=True, sharedSampling=False)
+    manager.files = None
+    manager.store.save("items", {"id": "export", "state": "platform_processing", "path": "/export.mp4",
+        "categories": {"bed": {"state": "ready", "intervals": [{"start": 0, "end": 1}]}}})
+    manager.store.save("items", {"id": "next", "state": "pending", "path": "/next.mp4",
+        "sourceDatasetId": "27912", "categories": {"bed": {"state": "pending"}}})
+    release, analyzed = asyncio.Event(), asyncio.Event()
+
+    async def export(_item):
+        await release.wait()
+
+    async def analyze(_item):
+        analyzed.set()
+        await release.wait()
+
+    monkeypatch.setattr(manager, "_export_ready", export)
+    monkeypatch.setattr(manager, "process_with_recovery", analyze)
+    await asyncio.wait_for(manager._tick(), .5)
+    await asyncio.wait_for(analyzed.wait(), .5)
+    assert len(manager.export_tasks) == len(manager.analysis_tasks) == 1
+    release.set()
+    await asyncio.gather(*list(manager.export_tasks.values()), *list(manager.analysis_tasks.values()))
+    await close_app(app)
+
+
+@pytest.mark.asyncio
+async def test_paused_recovery_survives_stale_progress_and_is_not_restarted(tmp_path):
+    app = create_app(data_dir=tmp_path)
+    manager = app.state.slicing
+    manager.auth.access = "test-token"
+    manager.files = None
+    manager.run = {"id": "paused-run", "state": "running", "localRecoveryOnly": True, "items": ["paused"]}
+    manager.store.settings["enabled"] = True
+    item = {"id": "paused", "path": "/paused.mp4", "state": "pending", "sourceDatasetId": "27912",
+            "collectionRecovery": True, "collectionRecoveryPaused": True,
+            "categories": {"bed": {"state": "pending"}}}
+    manager.store.save("items", item)
+    stale = {**item, "collectionRecoveryPaused": False, "analysisDone": 2}
+    manager._save_analysis_item(stale)
+    assert manager.store.get("items", "paused")["collectionRecoveryPaused"] is True
+    await manager._tick()
+    assert not manager.analysis_tasks and not manager.export_tasks
+    assert manager.run["state"] == "paused" and manager.store.settings["enabled"] is False
+    await close_app(app)
+
+
+def test_partial_sampling_reads_edges_at_boundaries_not_for_each_frame(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from app import slicing_worker as worker
+
+    path, ffmpeg = tmp_path / "video.mp4", tmp_path / "ffmpeg"
+    path.write_bytes(b"stable source")
+    ffmpeg.write_text("fake tool")
+    ffmpeg.chmod(0o755)
+    expected = source_version(path)
+    checks = []
+    original = worker.verify_file_version
+
+    def track(path, version, *, check_edges=True):
+        checks.append(check_edges)
+        return original(path, version, check_edges=check_edges)
+
+    monkeypatch.setattr(worker, "verify_file_version", track)
+    monkeypatch.setattr(worker.subprocess, "run", lambda *_a, **_kw:
+                        SimpleNamespace(returncode=0, stdout=b"\xff\xd8\xff\xd9", stderr=b""))
+    rows = list(worker.extract_requested_frames(str(path), str(ffmpeg),
+        {"duration": 61, "frameRate": 25, "_expectedFileVersion": expected},
+        {"bed": [0, 30, 60], "magnet": [0, 30, 60]}, skip_undecodable=True))
+    assert [time for time, _ in rows] == [0, 30, 60]
+    assert checks.count(True) == 2 and checks.count(False) == 6
+
+
+@pytest.mark.asyncio
 async def test_cancelled_worker_requeues_only_its_physical_video_peers(tmp_path):
     app = create_app(data_dir=tmp_path)
     manager = app.state.slicing

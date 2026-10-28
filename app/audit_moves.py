@@ -15,6 +15,7 @@ from .domain import now_iso
 from .media import file_digest, publish_with_reservation, transfer_reservation_identity
 from .upload_audit import AUDIT_POLICY_VERSION
 from .videos import Conflict
+from . import file_locations
 
 MOVE_RULE_VERSION = 4
 
@@ -300,15 +301,22 @@ class AuditMoveManager:
 
     def bindings(self, source):
         return [row for row in self.videos.store.list(include_deleted=True)
-                if any(v.get("filePath") == source for v in row["versions"])]
+                if any(v.get("filePath") == source or (v.get("recovery") or {}).get("filePath") == source
+                       or (v.get("recovery") or {}).get("destination") == source for v in row["versions"])]
 
     def update_bindings(self, item):
+        file_locations.remember(self.videos.store.db, item)
         if getattr(self, "file_leases", None):
             self.file_leases.notify_move(item["source"], item["destination"], item["destinationVersion"])
         for row in self.bindings(item["source"]):
             for version in row["versions"]:
                 if version.get("filePath") == item["source"]:
-                    version.update(filePath=item["destination"], classifiedAt=now_iso())
+                    fingerprint = {**(version.get("fileVersion") or {}), **item["destinationVersion"]}
+                    version.update(filePath=item["destination"], fileVersion=fingerprint, classifiedAt=now_iso())
+                recovery = version.get("recovery") or {}
+                if item["source"] in {recovery.get("filePath"), recovery.get("destination")}:
+                    recovery.update(filePath=item["destination"], destination=item["destination"],
+                                    fileVersion={**(recovery.get("fileVersion") or {}), **item["destinationVersion"]})
             self.videos.store.save(row)
         report = self.audit.saved.get("report")
         if report:

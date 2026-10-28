@@ -82,6 +82,14 @@ def compatible(actual, expected):
                                   if k in {'device', 'inode', 'size', 'modifiedNs', 'edgeHash'})
 
 
+def reconnected_version(actual, expected):
+    """A remount may change st_dev, never inode, bytes, time or content hash."""
+    keys = {'device', 'inode', 'size', 'modifiedNs', 'edgeHash'}
+    return (keys.issubset(actual or {}) and keys.issubset(expected or {})
+            and bool(expected['edgeHash']) and actual['device'] != expected['device']
+            and all(actual[k] == expected[k] for k in keys - {'device'}))
+
+
 def file_version(path, edge=False):
     if edge:
         from .slicing import source_version

@@ -64,6 +64,12 @@ def run():
                                   'state': 'complete', 'message': '示例批次已结束。'})
         slices.store.settings['latestRunId'] = 'fixture-run'
         slices.store.save_settings()
+        if os.environ.get('RECORD_UI_PARTIAL'):
+            from tests.test_archive_completion import seed
+            partial = root / 'partial'
+            partial.mkdir()
+            seed(app, partial, 'c' * 24)
+            app.state.videos.reconcile_recovery_results()
         log = SubmissionLog(app.state.store.db)
         for record in (job, extra, earlier):
             log.add('collection', '采集提交', {'jobId': record['id']}, submitted_at=record['createdAt'])
@@ -75,6 +81,8 @@ def run():
             # UI-only fake platform; never logs in or accesses external data.
             if request.url.path == '/api/session':
                 return JSONResponse({'source': {'connected': True, 'user': '测试'}, 'target': {'connected': True, 'user': '测试'}, 'capabilities': {'batchDownload': False}})
+            if request.url.path == '/api/jobs' and request.method == 'GET' and os.environ.get('RECORD_UI_JOBS_FAILURE'):
+                return JSONResponse({'message':'测试：提交记录暂时不可读'},status_code=503)
             if request.url.path == '/api/search' and request.method == 'POST':
                 return JSONResponse({'id':'fixture-search','status':'complete','message':'找到 2 条实绩。','records':[
                     {'id':item['recordId'],'plate':item['plate'],'checkStartTime':item['checkStartTime'],'checkCompleteTime':item['checkCompleteTime'],

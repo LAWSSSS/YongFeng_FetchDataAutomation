@@ -38,7 +38,17 @@ class FileIndex:
         self.db.commit()
 
     def refresh(self):
-        known = {row['path']: row for row in self.rows('files')}
+        rows = self.rows('files')
+        known = {}
+        unified = bool(getattr(self, 'workspace', None) and self.workspace.enabled)
+        for row in rows:
+            if row.get('aliasOf'):
+                continue
+            if row['path'] not in known:
+                known[row['path']] = row
+            elif unified:
+                row.update(aliasOf=known[row['path']]['id'], links={'slicing': [], 'uploads': [], 'collection': []})
+                self.save('files', row)
         references = {}
         for item in self.slicing.store.list('items'):
             if item.get('path'):
@@ -48,14 +58,21 @@ class FileIndex:
                 references.setdefault(item['path'], {'slicing': [], 'uploads': [], 'collection': []})['uploads'].append(item['id'])
         for item in self.videos.store.list(include_deleted=True):
             for version in item.get('versions', []):
-                if version.get('filePath'):
-                    references.setdefault(version['filePath'], {'slicing': [], 'uploads': [], 'collection': []})['collection'].append(
+                for path in {version.get('filePath'), version.get('recovery', {}).get('filePath') or version.get('recovery', {}).get('destination')} - {None, ''}:
+                    references.setdefault(path, {'slicing': [], 'uploads': [], 'collection': []})['collection'].append(
                         {'id': item['id'], 'revision': version.get('revision')})
         for path, links in references.items():
             row = known.get(path) or {'id': uuid4().hex, 'path': path, 'archiveState': 'not_ready'}
             if row.get('links') != links or path not in known:
                 row['links'] = links
                 self.save('files', row)
+        if unified:
+            for row in rows:
+                if row['path'] not in references and any(row.get('links', {}).values()):
+                    # Keep journals/history, but old locations are not active
+                    # controls for the new file after a verified move.
+                    row.update(indexState='historical', links={'slicing': [], 'uploads': [], 'collection': []})
+                    self.save('files', row)
         return self.rows('files')
 
     def moved(self, source, destination, version):
@@ -75,11 +92,13 @@ class FileIndex:
 
     def state(self):
         if getattr(self, 'workspace', None) and self.workspace.enabled:
-            known = {row['path']: row['id'] for row in self.rows('files')}
+            known = {row['path']: row['id'] for row in self.rows('files') if not row.get('aliasOf')}
             public = []
             for asset in self.workspace.rows('assets'):
-                state = ('preserved' if self.workspace.is_preserved(asset) else
+                state = ('complete' if asset.get('cleanup', {}).get('state') == 'complete' else
+                         'preserved' if self.workspace.is_preserved(asset) else
                          'attention' if asset.get('status') == 'attention' else
+                         'waiting' if asset.get('status') == 'waiting' else
                          'complete' if asset.get('stage') == '已切片' and
                          Path(asset['path']).is_relative_to(self.workspace.root) else 'waiting')
                 public.append({'id': known.get(asset['path'], asset['id']), 'path': asset['path'],
@@ -130,6 +149,17 @@ class FileIndex:
         if not parts:
             parts = [source.name]
         return root / settings['archiveEmptyDirectory'] / Path(*parts)
+
+    def archive_count(self, state, item_id=None):
+        if getattr(self, 'workspace', None) and self.workspace.enabled:
+            return sum(asset.get('status') == state and not self.workspace.is_preserved(asset)
+                       and asset.get('cleanup', {}).get('state') != 'complete'
+                       and self.workspace.stage(asset) == '已切片'
+                       and (not item_id or any(i['id'] == item_id for i in self.workspace.linked(asset)))
+                       for asset in self.workspace.rows('assets'))
+        return sum(row.get('archiveState') == state and bool(self.eligible(row))
+                   and (not item_id or item_id in row.get('links', {}).get('slicing', []))
+                   for row in self.rows('files'))
 
     def eligible(self, row):
         items = [self.slicing.store.get('items', identity) for identity in row.get('links', {}).get('slicing', [])]
@@ -278,7 +308,15 @@ class FileIndex:
             journal.update(state='complete', completedAt=now_iso())
             self.save('file_moves', journal)
 
-    async def retry(self, identity):
+    async def retry(self, identity, request_id=None):
+        if getattr(self, 'workspace', None) and self.workspace.enabled:
+            self.refresh()
+            row = next((row for row in self.rows('files') if row['id'] == identity), None)
+            asset = self.workspace.asset_for(row['path']) if row else self.workspace.get('assets', identity)
+            if not asset:
+                raise ValueError('文件与工作区记录未关联，请重新核对文件。')
+            self.workspace.request_archive_retry(asset['id'], request_id or uuid4().hex)
+            return self.state()
         row = next((row for row in self.rows('files') if row['id'] == identity), None)
         if not row:
             raise ValueError('文件记录不存在。')
@@ -294,7 +332,15 @@ class FileIndex:
             asset = self.workspace.asset_for(row['path']) if row else None
             if not asset:
                 raise ValueError('请在工作区重新核对文件。')
+            if asset.get('cleanup', {}).get('state') == 'complete':
+                return self.state()
+            eligible, reason = self.workspace.cleanup_eligibility(asset)
+            if not eligible:
+                raise ValueError(reason or '清理凭证尚不完整，文件继续保留。')
             await self.workspace.reconcile(only=asset['id'])
+            current = self.workspace.get('assets', asset['id'])
+            if current.get('cleanup', {}).get('state') != 'complete':
+                raise ValueError(current.get('cleanup', {}).get('message') or current.get('message') or '文件仍在使用或等待平台核验，清理尚未执行。')
             return self.state()
         row = next((row for row in self.rows('files') if row['id'] == identity), None)
         if not row:
@@ -431,6 +477,9 @@ class FileIndex:
         return self.state()
 
     async def reconcile(self):
+        if getattr(self, 'workspace', None) and self.workspace.enabled:
+            self.workspace.wake.set()
+            return self.state()
         await self.slicing._recover_moved_sources()
         self.refresh()
         return self.state()

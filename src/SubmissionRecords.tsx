@@ -4,6 +4,7 @@ import RecordDelete from './RecordDelete';
 import { groupSubmissionDays, submissionTime } from './submission-dates';
 import { usePolling } from './usePolling';
 import './submission-records.css';
+import {localJson} from './local-api';
 
 type Item={id?:string;deletionKey:string;revision:number;videoName?:string;startTime?:string;endTime?:string;status?:string;camera?:string;reason?:string;message?:string;taskId?:string};
 type Receipt={id:string;title:string;submittedAt:string;revision:number;status?:string;submitted?:number;total?:number;
@@ -11,12 +12,7 @@ type Receipt={id:string;title:string;submittedAt:string;revision:number;status?:
 type Removal={id:string;name:string;scope:'records'|'items';restoreRequestId:string};
 const statusText:Record<string,string>={running:'处理中',complete:'已结束',attention:'待核对',recorded:'已记录',stopped:'已停止',submitted:'已提交',pending:'待处理',submitting:'提交中',uncertain:'待核对',duplicate:'已有任务',failed:'失败'};
 async function load<T>(path:string,body?:object):Promise<T>{
-  let response:Response;
-  try{response=await fetch(`/api/submissions${path}`,body===undefined?undefined:{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});}
-  catch{throw new Error('本地程序暂时无法连接，请重试。');}
-  const value=await response.json().catch(()=>({}));
-  if(!response.ok)throw new Error(value.message||value.detail||'提交记录暂时无法读取。');
-  return value as T;
+  return localJson<T>(`/api/submissions${path}`,body);
 }
 
 function ReceiptDetails({row,revision,onRemove}:{row:Receipt;revision:number;onRemove:(item:Item,requestId:string)=>Promise<void>}){

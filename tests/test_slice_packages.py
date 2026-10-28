@@ -95,6 +95,41 @@ def manager(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_export_shutdown_registers_finished_output_before_releasing_the_source(manager, tmp_path, monkeypatch):
+    import asyncio
+    import threading
+    from tests.test_slicing_performance import close_app
+
+    app, slicing = manager
+    item = ready_item(tmp_path)
+    slicing.store.save("items", item)
+    entered, release = threading.Event(), threading.Event()
+    publish = slicing._publish_export_files
+
+    def slow_publish(*args):
+        entered.set()
+        assert release.wait(5)
+        return publish(*args)
+
+    monkeypatch.setattr(slicing, "_publish_export_files", slow_publish)
+    task = asyncio.create_task(slicing._export_category(slicing.store.get("items", item["id"]), "bed"))
+    assert await asyncio.to_thread(entered.wait, 5)
+    task.cancel()
+    await asyncio.sleep(0)
+    assert slicing.leases.busy(item["path"])
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    records = slicing.packages.store.list("items")
+    assert len(records) == 1 and records[0]["state"] == "queued"
+    assert slicing.store.get("items", item["id"])["categories"]["bed"]["packageId"] == records[0]["id"]
+    assert not slicing.leases.busy(item["path"])
+    with zipfile.ZipFile(records[0]["path"]) as archive:
+        assert all(entry.compress_type == zipfile.ZIP_STORED for entry in archive.infolist())
+    await close_app(app)
+
+
+@pytest.mark.asyncio
 async def test_one_video_runs_bed_and_magnet_in_the_same_pass(manager, monkeypatch):
     app, slicing = manager
     calls = []
@@ -169,8 +204,33 @@ def test_photos_and_video_stay_until_both_categories_are_imported(tmp_path):
 
 def test_timestamps_follow_the_inclusive_interval_grid():
     assert slice_timestamps([{"start": 0, "end": 10}], 5) == [0, 5, 10]
-    assert photo_names("鲁A12345_20261005050441_abc.mp4", 2) == [
-        "鲁A12345_20261005_050441_001.jpg", "鲁A12345_20261005_050441_002.jpg"]
+    names = photo_names("鲁A12345_20261005050441_abc.mp4", 2)
+    assert all(name.startswith("鲁A12345_20261005_050441_v") for name in names)
+    assert [name.rsplit('_', 1)[-1] for name in names] == ["001.jpg", "002.jpg"]
+
+
+@pytest.mark.asyncio
+async def test_corrected_export_isolated_from_old_photo_names_and_archive(manager, tmp_path):
+    from tests.test_slicing_performance import close_app
+    app, slicing = manager
+    exported = []
+    for revision in (4, 5):
+        folder = tmp_path / f'v{revision}'
+        folder.mkdir()
+        item = ready_item(folder, identity=str(revision))
+        item.update(sourceIdentity=f"collection:{'a' * 24}:v{revision}:version-{revision}",
+                    collectionRecovery=True, collectionRevision=revision)
+        slicing.store.save('items', item)
+        await slicing._export_category(slicing.store.get('items', item['id']), 'bed')
+        saved = slicing.store.get('items', item['id'])
+        package = slicing.packages.store.get('items', saved['categories']['bed']['packageId'])
+        assert package['exportIdentity']
+        exported.append((package, Path(package['path']).read_bytes()))
+    (old, old_bytes), (new, _) = exported
+    assert old['id'] != new['id'] and set(old['images']).isdisjoint(new['images'])
+    assert slicing.packages.store.get('items', old['id'])['images'] == old['images']
+    assert Path(old['path']).read_bytes() == old_bytes
+    await close_app(app)
 
 
 @pytest.mark.asyncio

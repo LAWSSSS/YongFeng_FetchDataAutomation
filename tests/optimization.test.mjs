@@ -20,6 +20,13 @@ test('video cards show plate and date without losing VIRTUAL identity or restore
   assert.equal(sliceTitle('my-source.mp4').title,'my-source');
 });
 
+test('continue is unavailable when only completed or manual-review records remain',()=>{
+  const state={enabled:false,busy:false,run:{state:'attention'},items:[{id:'done',state:'complete'},{id:'manual',state:'attention'}]};
+  assert.equal(slicingControls(state).canResume,false);
+  assert.equal(slicingControls({...state,resumeAvailable:true}).canResume,true);
+  assert.equal(slicingControls({...state,items:[{id:'pending',state:'pending'}]}).canResume,true);
+});
+
 function timers() {
   const scheduled = new Map();let next=0;
   return {scheduled,setTimer(callback,delay){const id=++next;scheduled.set(id,{callback,delay});return id;},

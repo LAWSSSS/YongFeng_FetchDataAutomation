@@ -4,6 +4,7 @@ import hashlib
 import mimetypes
 import os
 import re
+import zipfile
 from contextlib import asynccontextmanager
 from contextlib import ExitStack
 from pathlib import Path
@@ -51,6 +52,8 @@ from .file_leases import FileLeases
 from .uploads import UploadManager
 from .slicing import SlicingManager, source_version
 from .workspace import WorkspaceManager
+from .media_control import MediaControl
+from .package_gallery import PackageGallery
 from .models import WorkspacePreviewInput, WorkspaceActionInput
 from . import runtime
 
@@ -119,6 +122,7 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
     uploads = UploadManager(store, upload_audit, leases, remote=upload_remote, worker=upload_worker,
                             file_check=upload_file_check)
     slicing = SlicingManager(store, upload_audit.client, data_dir, leases, remote=slicing_remote)
+    videos.slicing = slicing
     slice_classification = SliceClassification(slicing.packages)
     files = FileIndex(store, videos, uploads, slicing, audit_moves, leases)
     slice_output_organizer = SliceOutputOrganizer(slicing)
@@ -127,6 +131,11 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
     slicing.output_organizer = slice_output_organizer
     files.refresh()
     workspace = WorkspaceManager(store, data_dir, videos, uploads, slicing, upload_audit, audit_moves, files, leases)
+    media_control = MediaControl(store.db, videos, slicing, leases)
+    media_control.submissions = submissions
+    videos.control = slicing.control = slicing.packages.control = media_control
+    slicing.on_recovery_change = videos.reconcile_recovery_results
+    gallery = PackageGallery(slicing.packages, leases)
     submission_views = SubmissionViews(store, slicing, submissions)
     slicing.submission_views = submission_views
     searches: dict[str, dict] = {}
@@ -160,6 +169,7 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        await gallery.start()
         await restore_saved_credentials()
         await workspace.startup()
         await videos.start()
@@ -174,6 +184,7 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
             task.cancel()
         if search_tasks:
             await asyncio.gather(*search_tasks, return_exceptions=True)
+        await gallery.shutdown()
         await original_restore.shutdown()
         await workspace.shutdown()
         await slicing.shutdown()
@@ -200,6 +211,8 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
     application.state.files = files
     application.state.slice_output_organizer = slice_output_organizer
     application.state.workspace = workspace
+    application.state.media_control = media_control
+    application.state.package_gallery = gallery
     application.add_middleware(TrustedHostMiddleware, allowed_hosts=["localhost", "127.0.0.1", "[::1]"])
 
     @application.middleware("http")
@@ -294,9 +307,7 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
 
     @application.post('/api/workspace/reconcile')
     async def workspace_reconcile(payload: WorkspaceActionInput):
-        if payload.expectedRevision != workspace.config['revision']:
-            raise Conflict('工作区已更新，请刷新后重试。')
-        return await workspace.reconcile()
+        return workspace.request_reconcile(payload.expectedRevision, payload.requestId)
 
     def unified_directory_only():
         if workspace.enabled or workspace.maintenance:
@@ -489,7 +500,17 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
 
     @application.post("/api/files/{identity}/cleanup-confirmed")
     async def cleanup_confirmed_files(identity: str, payload: FileCleanupInput):
-        return await files.cleanup_confirmed(identity, payload.requestId)
+        file = next((row for row in files.rows("files") if row["id"] == identity), {})
+        linked = file.get("links", {}).get("slicing", [])
+        return video_control_entry(linked[0] if linked else None)
+
+    def video_control_entry(item_id=None):
+        media_control.refresh()
+        item = slicing.store.get("items", item_id) if item_id else None
+        return JSONResponse({"message": "单视频操作已移到“视频查看与更正”。",
+                             "processingEntry": media_control.processing_entry(item),
+                             "videoId": (item or {}).get("collectionVideoId"),
+                             "mediaId": (item or {}).get("mediaId")}, status_code=409)
 
     @application.post("/api/slicing/classify/preview")
     async def preview_slice_classification(payload: DirectoryInput):
@@ -503,7 +524,8 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
 
     @application.post("/api/slicing/packages/{identity}/confirm")
     async def confirm_slice_package(identity: str):
-        return slicing.confirm_package(identity)
+        package = slicing.packages.store.get("items", identity) or {}
+        return video_control_entry(package.get("itemId"))
 
     @application.post("/api/slicing/packages/pause")
     async def pause_slice_package_uploads():
@@ -517,19 +539,58 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
 
     @application.post("/api/slicing/packages/{identity}/retry")
     async def retry_slice_package(identity: str, payload: SlicingItemActionInput):
-        return await slicing.retry_package(identity, payload.model_dump())
+        package = slicing.packages.store.get("items", identity) or {}
+        return video_control_entry(package.get("itemId"))
 
     @application.get("/api/slicing/packages/{identity}/images/{name}")
-    async def slice_package_image(identity: str, name: str):
-        from fastapi.responses import FileResponse
+    async def slice_package_image(identity: str, name: str, session: str | None = None, thumbnail: bool = False):
         try:
-            path = slicing.package_image(identity, name)
+            data = await asyncio.to_thread(gallery.read, identity, name, session, thumbnail)
+        except (OSError, zipfile.BadZipFile):
+            raise HTTPException(409, "本地照片或压缩包暂不可读取，请核对文件和磁盘。") from None
         except ValueError as error:
             raise HTTPException(404, str(error)) from None
-        guard = leases.read(path)
-        guard.__enter__()
-        return FileResponse(path, media_type="image/jpeg", headers={"Cache-Control": "private, no-store"},
-                            background=BackgroundTask(guard.__exit__, None, None, None))
+        return Response(data, media_type="image/jpeg", headers={"Cache-Control": "private, no-store"})
+
+    @application.post("/api/slicing/packages/{identity}/view")
+    async def open_package_view(identity: str, payload: dict):
+        if payload.get("sessionId") is not None and (not isinstance(payload["sessionId"], str) or
+                not re.fullmatch(r"[a-f0-9]{32}", payload["sessionId"])):
+            raise HTTPException(422, "照片查看会话无效。")
+        try:
+            return await gallery.view(identity, payload.get("sessionId"))
+        except (OSError, zipfile.BadZipFile):
+            raise HTTPException(409, "本地照片包暂不可读取，请核对文件和磁盘。") from None
+
+    @application.post("/api/slicing/packages/{identity}/view/close")
+    async def close_package_view(identity: str, payload: dict):
+        key = payload.get("sessionId")
+        if isinstance(key, str) and key in gallery.sessions and gallery.sessions[key]["package"]["id"] == identity:
+            gallery.close(key)
+        return {"ok": True}
+
+    @application.get("/api/slicing/packages/{identity}/contents")
+    async def package_contents(identity: str, session: str, page: int = Query(1, ge=1)):
+        return gallery.contents(identity, session, page)
+
+    @application.api_route("/api/slicing/packages/{identity}/download", methods=["GET", "HEAD"])
+    async def package_download(identity: str, session: str):
+        path, guard = await gallery.download(identity, session)
+        package = gallery.package(identity)
+        name = Path(package.get("videoPath") or package.get("name") or "照片包").stem
+        return DownloadFileResponse(path, filename=f"{name}_{package.get('category')}_{identity[:8]}.zip",
+                                    media_type="application/zip", release=guard.close)
+
+    @application.get("/api/video-processing")
+    async def processing_state(request: Request):
+        return state_response(media_control.state(), request)
+
+    @application.post("/api/video-processing/{identity}/actions")
+    async def processing_action(identity: str, payload: dict):
+        if (not isinstance(payload.get("requestId"), str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", payload["requestId"])
+                or type(payload.get("generation")) is not int or type(payload.get("expectedRevision")) is not int):
+            raise HTTPException(422, "请刷新后重新操作。")
+        return await media_control.action(identity, payload)
 
     @application.post("/api/slicing/settings")
     async def slicing_settings(payload: SlicingSettingsInput):
@@ -555,6 +616,8 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
 
     @application.post("/api/slicing/start", status_code=202)
     async def slicing_start(payload: SlicingStartInput):
+        if payload.mode != "all":
+            return video_control_entry(payload.itemId)
         result = await slicing.start(payload.requestId, payload.expectedRevision, payload.mode, payload.itemId)
         run = result.get('run') or {}
         submissions.add('slicing', '单条切片' if payload.mode == 'single' else '批量切片',
@@ -573,23 +636,23 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
 
     @application.post("/api/slicing/recover-decodable-all", status_code=202)
     async def slicing_recover_decodable_all(payload: SlicingItemActionInput):
-        return slicing.recover_decodable_all(payload.expectedRevision, payload.requestId)
+        return video_control_entry()
 
     @application.post("/api/slicing/{identity}/retry", status_code=202)
     async def slicing_retry(identity: str, payload: SlicingItemActionInput):
-        return slicing.retry(identity, payload.expectedRevision, payload.requestId)
+        return video_control_entry(identity)
 
     @application.post("/api/slicing/{identity}/recover-decodable", status_code=202)
     async def slicing_recover_decodable(identity: str, payload: SlicingItemActionInput):
-        return slicing.retry(identity, payload.expectedRevision, payload.requestId, recover_decodable=True)
+        return video_control_entry(identity)
 
     @application.post("/api/slicing/{identity}/bind")
     async def slicing_bind(identity: str, payload: SlicingBindInput):
-        return await slicing.bind(identity, payload.model_dump())
+        return video_control_entry(identity)
 
     @application.post("/api/slicing/{identity}/review")
     async def slicing_review(identity: str, payload: SlicingReviewInput):
-        return await slicing.review(identity, payload.model_dump())
+        return video_control_entry(identity)
 
     @application.api_route("/api/slicing/{identity}/stream", methods=["GET", "HEAD"])
     async def slicing_stream(identity: str, request: Request):
@@ -849,6 +912,10 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
     async def bulk_remove(payload: BulkVideoInput):
         return await videos.bulk_action("remove", payload.model_dump())
 
+    @application.post('/api/videos/bulk-classify-saved')
+    async def bulk_classify_saved(payload: BulkVideoInput):
+        return await videos.bulk_action('classify-saved', payload.model_dump())
+
     @application.post("/api/videos/check")
     async def check_videos():
         return await videos.check_once()
@@ -861,9 +928,28 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
     async def correct(identity: str, payload: CorrectionInput):
         return await videos.correct(identity, payload.model_dump())
 
-    @application.post("/api/videos/{identity}/check")
-    async def check_video(identity: str):
-        return await videos.check_video(identity)
+    @application.post("/api/videos/{identity}/check", status_code=202)
+    async def check_video(identity: str, payload: SlicingItemActionInput):
+        return await videos.check_video(identity, payload.model_dump())
+
+    @application.post("/api/videos/{identity}/recover-decodable", status_code=202)
+    async def recover_decodable_video(identity: str, payload: SlicingItemActionInput):
+        return await videos.recover_decodable(identity, payload.model_dump())
+
+    @application.post("/api/videos/{identity}/recover-decodable/pause")
+    async def pause_decodable_recovery(identity: str, payload: VersionActionInput):
+        return await videos.pause_recovery(identity, payload.model_dump())
+
+    @application.post("/api/videos/{identity}/recover-decodable/resume", status_code=202)
+    async def resume_decodable_recovery(identity: str, payload: VersionActionInput):
+        return await videos.resume_recovery(identity, payload.model_dump())
+
+    @application.get("/api/video-operations/{operation_id}")
+    async def video_operation_state(operation_id: str):
+        try:
+            return videos.operation_state(operation_id)
+        except ValueError as error:
+            raise HTTPException(404, str(error)) from None
 
     @application.post("/api/videos/{identity}/recapture", status_code=202)
     async def recapture_unavailable(identity: str, payload: VersionActionInput):
@@ -1010,6 +1096,7 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
         application.mount("/assets", StaticFiles(directory=dist / "assets"), name="assets")
 
     @application.get("/")
+    @application.get("/package-view/{package_id}")
     async def homepage():
         path = dist / "index.html"
         if not path.exists():

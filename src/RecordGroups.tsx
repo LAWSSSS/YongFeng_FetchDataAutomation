@@ -76,18 +76,19 @@ export function InspectionResults({records, selected, disabled, onToggle, onSele
 }
 
 export function VideoBatches<T extends BatchVideo>({videos, jobs, totalByJob, selectedIds, disabled, downloadEnabled,
-  onSelectBatch, onDownloadBatch, onDeleteRecords, children}: {
+  onSelectBatch, onDownloadBatch, onDeleteRecords, children, focusedVideoId, focusKey}: {
   videos: T[]; jobs: CollectionJob[]; totalByJob: Record<string, number>; selectedIds: Set<string>;
   disabled: boolean; downloadEnabled: boolean; onSelectBatch: (records: T[], select: boolean) => void;
   onDownloadBatch: (records: T[]) => void; onDeleteRecords:(records:T[],name:string,requestId:string)=>Promise<void>;
   children: (record: T) => ReactNode;
+  focusedVideoId?:string;focusKey?:string;
 }) {
   const groups = useMemo(() => groupVideos(videos, jobs), [videos, jobs]);
   const dates = groupSubmissionDays(groups, group=>group.records[0].submittedAt || group.job?.createdAt);
   const deleteVersion=(records:T[])=>records.map(row=>`${row.id}:${row.revision}`).sort().join('|');
   return <div className="date-list" aria-label="按提交日期归类的采集记录">{dates.map(date=>{
     const records=date.records.flatMap(group=>group.records);
-    return <DateSection key={date.day} day={date.day} summary={`${records.length} 条视频 · ${date.records.length} 次提交`}>
+    return <DateSection key={date.day} day={date.day} expandedKey={records.some(r=>r.id===focusedVideoId)?focusKey:undefined} summary={`${records.length} 条视频 · ${date.records.length} 次提交`}>
       <div className="date-tools"><p>按提交日期归类 · 仅操作当前筛选到的 {records.length} 条</p>
         <RecordDelete name={`${date.label} · ${records.length} 条采集记录`} version={deleteVersion(records)} disabled={disabled}
           onDelete={requestId=>onDeleteRecords(records,date.label,requestId)}/></div>

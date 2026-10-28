@@ -22,7 +22,7 @@ export function sliceTitle(name: string) {
     restored:/_恢复\.[^.]+$/.test(name)};
 }
 
-export function slicingControls(state: {enabled: boolean; busy: boolean; run: {
+export function slicingControls(state: {enabled: boolean; busy: boolean;resumeAvailable?:boolean; run: {
   state: string; finishedAt?: string; singleMode?: boolean; singleItemId?: string;
 } | null; items: {id: string; state: string}[]}) {
   const {run} = state;
@@ -31,7 +31,8 @@ export function slicingControls(state: {enabled: boolean; busy: boolean; run: {
     (['attention','paused','interrupted'].includes(run.state) && !!(run.finishedAt || run.singleMode)));
   const selected = run?.singleMode ? state.items.find(item=>item.id === run.singleItemId) : undefined;
   const canResume = idle && !!run && ['paused','interrupted','waiting_connection','attention'].includes(run.state) &&
-    (!run.singleMode || (!!selected && !['attention','complete'].includes(selected.state)));
+    (!run.singleMode || (!!selected && !['attention','complete','no_target','superseded'].includes(selected.state))) &&
+    (state.resumeAvailable??state.items.some(item=>['pending','analyzing','platform_processing','waiting_connection','waiting','submitting'].includes(item.state)));
   return {idle,scanReady,canStart:idle && scanReady,canResume};
 }
 
@@ -57,11 +58,11 @@ export function slicePage<T extends SliceItem>(items: T[], options: {
   return {rows:filtered.slice((page-1)*pageSize,page*pageSize),total:filtered.length,pages,page};
 }
 
-export function physicalFiles<T extends SliceItem & {id: string; path?: string}>(items: T[]) {
+export function physicalFiles<T extends SliceItem & {id: string; path?: string;mediaId?:string;mediaGeneration?:number;collectionRevision?:number}>(items: T[]) {
   const groups = new Map<string, T[]>();
   for (const item of items) {
     // Unbound, similarly named sources must remain distinct until bound.
-    const key = item.path || `unbound:${item.id}`;
+    const key = item.mediaId ? `${item.mediaId}:g${item.mediaGeneration??0}:v${item.collectionRevision??''}` : item.path || `unbound:${item.id}`;
     groups.set(key, [...(groups.get(key) || []), item]);
   }
   return [...groups].map(([key, records]) => ({key,records,name:records[0].name}));

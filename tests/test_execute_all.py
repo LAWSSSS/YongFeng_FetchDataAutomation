@@ -81,6 +81,27 @@ async def test_execute_all_waits_without_login_and_recovers_scan(environment):
 
 
 @pytest.mark.asyncio
+async def test_resume_needs_actual_pending_work_and_never_retries_attention(environment, tmp_path):
+    app, manager = environment
+    bed, magnet = pair(manager, tmp_path, ('complete', 'attention'))
+    run = {'id':'finished-run', 'state':'paused', 'items':['bed','magnet'], 'settingsRevision':0}
+    manager.store.save('runs', run)
+    manager.store.settings.update(latestRunId=run['id'], enabled=False)
+    manager.store.save_settings()
+    assert not manager.can_resume(run)
+    with pytest.raises(ValueError, match='没有可自动继续'):
+        manager.resume('no-work')
+    assert manager.store.get('items', magnet['id'])['state'] == 'attention'
+    assert not manager.store.settings['enabled']
+    magnet['state'] = 'pending'
+    manager.store.save('items', magnet)
+    assert manager.can_resume(run)
+    manager.resume('pending-work')
+    assert manager.store.settings['enabled']
+    await close_app(app)
+
+
+@pytest.mark.asyncio
 async def test_refresh_scan_waits_for_analysis_and_does_not_overwrite_it(environment):
     app, manager = environment
     blocker = asyncio.Event()
@@ -462,7 +483,9 @@ async def test_snapshot_migration_retains_all_127_receipts_and_observations(tmp_
     db.execute('INSERT INTO simple_slicing_observations VALUES(?,?)',('valid',json.dumps(observation)))
     db.commit();db.close()
     app=create_app(data_dir=data)
-    assert app.state.slicing.store.list('items')==rows
+    migrated=app.state.slicing.store.list('items')
+    assert [{k:v for k,v in item.items() if k not in {'mediaId','mediaGeneration','updatedAt'}} for item in migrated]==rows
+    assert all(item['mediaGeneration']==0 and item['mediaId'].startswith('local:') for item in migrated)
     assert app.state.slicing.store.get('observations','valid')==observation
     assert not app.state.slicing.store.settings['enabled']
     await close_app(app)

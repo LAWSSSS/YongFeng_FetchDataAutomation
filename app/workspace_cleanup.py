@@ -5,6 +5,8 @@ from .workspace_files import compatible, file_version
 
 
 def eligibility(manager, asset):
+    if any(item.get('superseded') for item in manager.linked(asset)):
+        return False, '旧版结果保留，等待视频更正流程处理。'
     if manager.is_preserved(asset):
         return False, '已上传历史视频，按保留规则跳过本地清理。'
     outcomes = manager.outcomes(asset)
@@ -101,6 +103,16 @@ async def cleanup(manager, asset):
                             'message': '平台暂不可核对，文件保留。'}
         manager.save('assets', asset)
         return
+    # The platform call above can overlap a correction or a new package. Never
+    # authorize deletion from the snapshot captured before that await.
+    current = manager.get('assets', asset['id'])
+    if current:
+        asset = current
+    eligible, reason = eligibility(manager, asset)
+    if not eligible:
+        asset['cleanup'] = {**asset.get('cleanup', {}), 'state': 'waiting', 'message': reason}
+        manager.save('assets', asset)
+        return
     journal = asset.get('cleanup') or {}
     manifest = journal.get('manifest')
     if not manifest:
@@ -139,6 +151,9 @@ async def cleanup(manager, asset):
                 continue
             path = checked_path(entry['path'])
             with manager.leases.write(path):
+                permitted, reason = eligibility(manager, asset)
+                if not permitted:
+                    raise ValueError(reason or '处理指令已更新，停止清理。')
                 if path.exists():
                     actual = await manager.videos.file_operation(file_version, path, 'edgeHash' in entry['expected'])
                     if not compatible(actual, entry['expected']):

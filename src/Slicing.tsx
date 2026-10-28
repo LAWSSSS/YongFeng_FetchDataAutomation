@@ -3,10 +3,13 @@ import type { FormEvent } from 'react';
 import { usePolling } from './usePolling';
 import { physicalCategories, physicalFiles, physicalState, slicePage, sliceTitle, slicingControls } from './slicing-view';
 import DateSection from './DateSection';
-import { groupSubmissionDays, submissionDay, submissionInstant, submissionTime } from './submission-dates';
+import { groupSubmissionDays, submissionInstant, submissionTime } from './submission-dates';
 import RecordDelete from './RecordDelete';
 import ProcessLimitControl from './ProcessLimitControl';
 import './slicing.css';
+import {localJson} from './local-api';
+import {requestIntents} from './request-intent';
+import {uiSequence} from './ui-sequence';
 
 type Category = {
   state: string; submittedAt?:string; intervals: {start: number; end: number}[]; intervalSeconds: number | null;
@@ -18,9 +21,9 @@ type Category = {
   failure?: {stage?: string; time?: number | null};
 };
 type Item = {
-  id: string; runId?: string; sourceDatasetId: string; sourceVideoId: string; name: string; path: string; state: string;
+  id: string; mediaId?:string; mediaGeneration?:number; collectionRevision?:number; collectionVideoId?:string; runId?: string; sourceDatasetId: string; sourceVideoId: string; name: string; path: string; state: string;
   submittedAt?:string; revision: number; progress: number; message: string; errorCode?: string;
-  partialRecovery?: boolean; localCleanupState?:string;
+  partialRecovery?: boolean; localCleanupState?:string; processingBlockedReason?:string; superseded?:boolean;
   analysisStage?: string; analysisTotal?: number; analysisDone?: number; analysisPosition?: number;
   remote: {duration: number | null; size: number | null}; metadata?: {duration: number; width: number; height: number};
   categories: {bed: Category; magnet: Category};
@@ -41,11 +44,11 @@ type Run = {executeAll?:boolean; id: string; state: string; message: string; ite
   singleMode?: boolean; singleItemId?: string; finishedAt?: string; settingsRevision?: number;
   excluded?: Record<string, number>; targetDatasets?: Record<string, DatasetChoice>; issues?: {path: string; message: string}[]};
 type SlicePackage = {id: string; revision: number; dataset: string; category: string; name: string; state: string; message?: string;
-  images?: string[]; imageCount?: number; bytes?:number; size?:number; retries?:number; cleanupMessage?:string; jobId?:string; errorCode?:string};
+  images?: string[]; imageCount?: number; bytes?:number; size?:number; retries?:number; cleanupMessage?:string; cleanupState?:string; localCleanupState?:string; jobId?:string; errorCode?:string};
 type OutputOrganization = {id:string;revision:number;state:string;root:string;message:string;
   counts:Record<string,number>;items:{packageId:string;name:string;category:string;state:string;message:string;
     size:number;fileCount:number;source:string;destination:string}[]};
-type State = {workspaceManaged?:boolean;phase?:string; connected: boolean; user: string; settings: Settings; settingsRevision: number;
+type State = {workspaceManaged?:boolean;phase?:string;resumeAvailable?:boolean; connected: boolean; user: string; settings: Settings; settingsRevision: number;
   hiddenRecordCount?:number;
   submissionReceipts?:{id:string;title:string;revision:number;submittedAt:string;itemIds:string[];message?:string;notice?:string}[];
   packages?: {targets: {id: string; name: string; importing: number; uploading: number; queued: number}[]; items: SlicePackage[]; paused?:boolean; busy?:boolean};
@@ -63,7 +66,7 @@ const emptySettings: Settings = {revision: 0, directories: [], magnetDeployDirec
   maxLocalSlicingProcesses:3, targetImages: 150, bedTargetImages: 180, targetDatasetIds: {'27912': null, '27944': null}};
 const empty: State = {connected: false, user: '', settings: emptySettings, settingsRevision: 0, run: null, items: [], counts: {}, busy: false, enabled: false};
 const labels: Record<string,string> = {pending:'待处理',analyzing:'识别中',exporting:'导出照片',platform_processing:'平台处理中',review:'待校对',queued:'排队上传',uploading:'正在上传',uploaded:'等待导入',importing:'正在导入',waiting:'等待平台结果',waiting_slot:'等待平台空位',
-  submitting:'提交核对中',ready:'准备切片',pilot_deferred:'待批量切片',no_target:'未检出目标',not_applicable:'不适用',complete:'完成',attention:'需处理',waiting_connection:'等待连接',paused:'已暂停',excluded:'平台已有任务'};
+  submitting:'提交核对中',ready:'准备切片',pilot_deferred:'待批量切片',no_target:'未检出目标',not_applicable:'不适用',complete:'完成',attention:'需处理',waiting_connection:'等待连接',paused:'已暂停',excluded:'平台已有任务',superseded:'旧版已停止'};
 const filters = [['all','全部'],['unsliced','未切片'],['pending','待处理'],['waiting_connection','等待连接'],['analyzing','识别中'],['platform_processing','平台处理中'],['attention','需处理'],['complete','已完成'],['no_target','未检出']];
 const uid = () => crypto.randomUUID();
 const formatDuration = (seconds?: number | null) => seconds == null ? '—' : `${Math.floor(Math.round(seconds) / 60)}分${Math.round(seconds) % 60}秒`;
@@ -71,23 +74,9 @@ const stageLabels: Record<string,string> = {checking_media:'检查视频末段',
 const formatWindows = (items: Category['intervals'] = []) => items.map(row => `${row.start.toFixed(1)}–${row.end.toFixed(1)}秒`).join(' · ') || '—';
 
 async function request<T>(path: string, body?: object): Promise<T> {
-  let response: Response;
-  try { response = await fetch(`/api/slicing${path}`, body === undefined ? undefined : {
-    method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body),
-  }); } catch { throw new Error('本地程序暂时无法连接。'); }
-  const data = await response.json();
-  if (!response.ok) throw new Error(data.message || data.detail || `请求失败（${response.status}）`);
-  return data as T;
+  return localJson<T>(`/api/slicing${path}`,body);
 }
 
-function intervalText(value: Category['intervals']) { return value.map(row => `${row.start.toFixed(1)}-${row.end.toFixed(1)}`).join(', '); }
-function parseIntervals(value: string) {
-  return value.split(',').map(part => part.trim()).filter(Boolean).map(part => {
-    const match = part.match(/^(\d+(?:\.\d+)?)\s*[-–]\s*(\d+(?:\.\d+)?)$/);
-    if (!match) throw new Error('区间请按“开始-结束秒”填写，多个区间用逗号分开。');
-    return {start:Number(match[1]), end:Number(match[2])};
-  });
-}
 
 function SliceLogin({onConnected}: {onConnected: (state: State) => void}) {
   const [account, setAccount] = useState('');
@@ -98,9 +87,7 @@ function SliceLogin({onConnected}: {onConnected: (state: State) => void}) {
     event.preventDefault();
     setBusy(true); setError('');
     try {
-      const response = await fetch('/api/upload-audit/login', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({account, password})});
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.message || data.detail || '连接失败。');
+      await localJson('/api/upload-audit/login',{account,password});
       setPassword('');
       onConnected(await request<State>(''));
     } catch (failure) { setError((failure as Error).message); }
@@ -114,94 +101,19 @@ function SliceLogin({onConnected}: {onConnected: (state: State) => void}) {
 }
 
 
-function CategoryCard({item, categoryName, category, packages = [], onUpdated}: {item: Item; categoryName: 'bed'|'magnet'; category: Category; packages?: SlicePackage[]; onUpdated: (state: State) => void}) {
-  const [editing, setEditing] = useState(false);
-  const [intervals, setIntervals] = useState(() => intervalText(category.intervals));
-  const [path, setPath] = useState(item.path);
-  const [error, setError] = useState('');
-  const [frameTime, setFrameTime] = useState<number | null>(null);
-  const [frameUrl, setFrameUrl] = useState('');
-  const [working, setWorking] = useState(false);
-  const [frameBusy, setFrameBusy] = useState(false);
-  const actionLock = useRef(false);
-  const title = categoryName === 'bed' ? '车斗' : '磁盘吊';
-  const savedIntervals = intervalText(category.intervals);
-  useEffect(() => {if (!editing) setIntervals(savedIntervals);}, [savedIntervals,editing]);
-  useEffect(() => {if (!editing) setPath(item.path);}, [item.path,editing]);
-  useEffect(() => () => {if (frameUrl) URL.revokeObjectURL(frameUrl);}, [frameUrl]);
-  async function act(name: string, body: object) {
-    if (actionLock.current) return;
-    actionLock.current=true;
-    setError('');setWorking(true);
-    try {onUpdated(await request<State>(`/${item.id}/${name}`, body));setEditing(false);}
-    catch (failure) {setError((failure as Error).message);}
-    finally {actionLock.current=false;setWorking(false);}
-  }
-  async function packageAction(name:'confirm'|'retry', pack:SlicePackage) {
-    if(actionLock.current) return;
-    actionLock.current=true;setWorking(true);setError('');
-    try {onUpdated(await request<State>(`/packages/${pack.id}/${name}`, {requestId:uid(),expectedRevision:pack.revision}));}
-    catch(failure) {setError((failure as Error).message);}
-    finally {actionLock.current=false;setWorking(false);}
-  }
-  async function showFrame(timestamp: number) {
-    setFrameBusy(true);setError('');
-    try {
-      const response = await fetch(`/api/slicing/${item.id}/frame?time_seconds=${timestamp}`);
-      if (!response.ok) throw new Error('关键画面读取失败。');
-      const blob = await response.blob();setFrameUrl(URL.createObjectURL(blob));setFrameTime(timestamp);
-    } catch (failure) {setError((failure as Error).message);}
-    finally {setFrameBusy(false);}
-  }
-  const pack = packages.find(row => row.id === category.packageId);
-  const expected = category.estimatedImages == null ? '未计算' : `${category.estimatedImages} 张`;
-  const actual = category.actualImages == null ? '尚未完成' : `${category.actualImages} 张`;
-  const analyzing = item.state === 'analyzing' && category.state === 'pending';
-  return <div className={`slice-category ${category.state === 'attention' ? 'needs-review' : ''}`}>
-    <div className="slice-category-head"><strong>{title}</strong><span className={`slice-state ${analyzing ? 'analyzing' : category.state}`}>{analyzing ? '识别中' : category.state === 'waiting' && category.platformStatus === '3' ? '核验图片' : labels[category.state] || category.state}</span></div>
-    {category.submittedAt&&<p className="slice-detail">提交于 {submissionDay(category.submittedAt)} {submissionTime(category.submittedAt)}</p>}
-    {category.partialRecovery && <p className="slice-detail">可解码片段模式 · 已跳过 {category.skippedSamples || 0} 个无法解码的抽样位置</p>}
-    {!!category.intervals?.length && <>{category.intervals.length > 2 ? <details className="slice-observations"><summary>有效区间 · {category.intervals.length} 段</summary><p className="slice-detail">{formatWindows(category.intervals)}</p></details> : <p className="slice-detail">{['pending','attention'].includes(category.state) && !pack && !category.taskId ? '暂存区间（尚未提交）' : '有效区间'}：{formatWindows(category.intervals)}</p>}
-      <p className="slice-detail">每 {category.intervalSeconds} 秒一张 · {category.actualImages == null ? `预计 ${expected}` : `已核验 ${actual}`}</p></>}
-    {category.taskId && <p className="slice-detail">平台任务 {category.taskId}{category.state === 'complete' && category.targetDatasetId && <> · <a href={`http://pre-athena-mv.cisdigital.cn/#/dataset/${category.targetDatasetId}?tab=content&namespace=1`} target="_blank" rel="noopener noreferrer">查看结果图片</a></>}</p>}
-    {pack && <><p className="slice-detail">{pack.jobId ? `导入任务 ${pack.jobId} · ` : ''}{pack.state === 'uploading' ? `已确认 ${Math.round((pack.bytes || 0)/1024**2)} / ${Math.round((pack.size || 0)/1024**2)} MB · ` : ''}重试 {pack.retries || 0} 次
-      {pack.state === 'complete' && <>{' · '}<a href={`http://pre-athena-mv.cisdigital.cn/#/dataset/${pack.dataset}?tab=content&namespace=1`} target="_blank" rel="noopener noreferrer">查看结果图片</a></>}</p>
-      {pack.cleanupMessage && <p className="slice-detail">{pack.cleanupMessage}</p>}
-      {pack.state === 'attention' && <button className="secondary" disabled={working} onClick={()=>void packageAction('retry',pack)}>{working ? '处理中…' : pack.errorCode === 'archive_layout' ? '修复压缩包并重传' : '重新核对并继续'}</button>}
-    </>}
-    {category.state === 'waiting' && category.lastPolledAt && <p className="slice-detail">最近核对：{new Date(category.lastPolledAt).toLocaleTimeString('zh-CN',{timeZone:'Asia/Shanghai',hour12:false})}</p>}
-    {category.message && !analyzing && category.state !== 'pending' && category.state !== 'complete' && <p className={category.state === 'attention' ? 'error' : 'slice-detail'}>{category.message}</p>}
-    {category.failure?.time != null && category.state === 'attention' && <p className="slice-detail">{category.failure.stage === 'checking_media' ? '末段检查位置' : '失败位置'}：{formatDuration(category.failure.time)} · 已保存 {category.observations || 0} 个有效判断</p>}
-    {category.imageQueryProgress && ['waiting','ready','submitting'].includes(category.state) && category.imageQueryProgress.total != null && category.imageQueryProgress.total > 0 &&
-      <progress aria-label="图片核验进度" max={category.imageQueryProgress.total} value={category.imageQueryProgress.read} />}
-    {!item.localCleanupState && category.intervals?.length > 0 && <details className="slice-observations"><summary>查看抽样边界 · {category.observations ?? 0} 个判断位置</summary>
-      <div className="slice-times">{category.intervals.flatMap((window, index) => [
-        <button className="link" disabled={frameBusy} key={`${index}-start`} onClick={() => void showFrame(window.start)}>{window.start.toFixed(1)} 秒</button>,
-        <button className="link" disabled={frameBusy} key={`${index}-end`} onClick={() => void showFrame(window.end)}>{window.end.toFixed(1)} 秒</button>,
-      ])}</div>
-    </details>}
-    {frameUrl && <div className="slice-frame"><img src={frameUrl} alt={`${title} ${frameTime} 秒关键画面`} /><span>{frameTime?.toFixed(1)} 秒</span></div>}
-    {category.state === 'review' && pack && <div className="slice-review-photos">
-      <div className="slice-photos">{(pack.images || []).slice(0, 12).map(name =>
-        <img key={name} src={`/api/slicing/packages/${pack.id}/images/${encodeURIComponent(name)}`} alt={name} />)}</div>
-      <p className="slice-detail">共 {pack.imageCount || pack.images?.length || 0} 张。确认后才会上传。</p>
-      <button disabled={working} onClick={() => void packageAction('confirm',pack)}>{working ? '确认中…' : '确认并上传这个压缩包'}</button>
-    </div>}
-    {!item.localCleanupState && !pack && (category.state === 'attention' || category.state === 'ready' || category.state === 'no_target') && <details className="slice-review" open={editing} onToggle={event => setEditing(event.currentTarget.open)}>
-      <summary>核对原片或调整区间</summary>
-      {editing && <div className="slice-review-body">
-        {item.path ? <video controls preload="metadata" src={`/api/slicing/${item.id}/stream`} /> : <p className="notice">先手动绑定一个本地视频文件。</p>}
-        <label>区间（秒；多个区间以逗号分开）<input value={intervals} onChange={event => setIntervals(event.target.value)} placeholder="例如 12-385, 520-880" /></label>
-        <div className="actions"><button disabled={working} onClick={() => {
-          try {void act('review', {requestId:uid(),expectedRevision:item.revision,category:categoryName,intervals:parseIntervals(intervals)});}
-          catch (failure) {setError((failure as Error).message);}
-        }}>保存区间</button>
-        <button className="secondary" disabled={working} onClick={() => void act('review', {requestId:uid(),expectedRevision:item.revision,category:categoryName,confirmedNoTarget:true})}>确认未检出</button></div>
-        <label>本地原视频完整路径<input value={path} onChange={event => setPath(event.target.value)} /></label>
-        {path !== item.path && <button className="secondary" disabled={working} onClick={() => void act('bind',{requestId:uid(),expectedRevision:item.revision,path})}>{item.path ? '重新绑定视频文件' : '绑定视频文件'}</button>}
-      </div>}
-    </details>}
-    {error && <p className="error" role="alert">{error}</p>}
+function CategoryCard({categoryName, category, packages = []}: {categoryName:'bed'|'magnet'; category:Category; packages?:SlicePackage[]}) {
+  const pack=packages.find(row=>row.id===category.packageId);
+  const title=categoryName==='bed'?'车斗':'磁盘吊';
+  const cleaned=pack?.cleanupState==='complete'||pack?.localCleanupState==='complete';
+  return <div className={`slice-category ${category.state==='attention'?'needs-review':''}`}>
+    <div className="slice-category-head"><strong>{title}</strong><span className={`slice-state ${category.state}`}>{labels[category.state]||category.state}</span></div>
+    {!!category.intervals?.length&&<details className="slice-observations"><summary>有效区间 · {category.intervals.length} 段</summary><p className="slice-detail">{formatWindows(category.intervals)}</p></details>}
+    {category.actualImages!=null&&!pack&&<p className="slice-detail">已核验 {category.actualImages} 张</p>}
+    {category.message&&category.state!=='complete'&&<p className={category.state==='attention'?'error':'slice-detail'}>{category.message}</p>}
+    {pack&&<p className="slice-detail">{category.actualImages!=null?`已核验 ${category.actualImages}`:pack.imageCount||0} 张 · {cleaned?'本地照片已清理':<a href={`/package-view/${pack.id}`} target="_blank" rel="noopener noreferrer">查看结果图片</a>}</p>}
+    {pack?.jobId&&<details className="slice-observations"><summary>导入凭证</summary><p className="slice-detail">任务 {pack.jobId}</p></details>}
+    {!pack&&category.taskId&&<p className="slice-detail">平台任务 {category.taskId} · 没有本地照片包</p>}
+    {category.failure?.time!=null&&<p className="slice-detail">失败位置：{formatDuration(category.failure.time)}</p>}
   </div>;
 }
 
@@ -221,16 +133,20 @@ export default function Slicing() {
   const [processDirty, setProcessDirty] = useState(false);
   const dirty = useRef(false);
   const settingsBase = useRef<number | null>(null);
-  const refreshSequence = useRef(0);
+  const intents=useRef(requestIntents());
+  const updates = useRef(uiSequence());
   const acceptState = useCallback((result: State) => {
-    ++refreshSequence.current;
+    updates.current.invalidate();
     setState(result);
     if (!dirty.current) {settingsBase.current=result.settingsRevision;setSettings(result.settings);}
   }, []);
   const refresh = useCallback(async () => {
-    const sequence = ++refreshSequence.current;
-    const result = await request<State>('');
-    if (sequence === refreshSequence.current) {acceptState(result);setPollError('');}
+    const sequence = updates.current.read();
+    if(sequence===null)return;
+    try{
+      const result = await request<State>('');
+      if (updates.current.accepts(sequence)) {acceptState(result);setPollError('');}
+    }catch(error){if(updates.current.accepts(sequence))throw error;}
   }, [acceptState]);
   useEffect(() => {void refresh().catch(failure => setError((failure as Error).message));}, [refresh]);
   useEffect(() => {
@@ -242,20 +158,21 @@ export default function Slicing() {
     if (!state.enabled && state.run && ['complete','attention','pilot_complete'].includes(state.run.state)) setNotice('');
   }, [state.enabled,state.run?.state]);
   async function run(name: string, task: () => Promise<State>, done: string) {
+    if(!updates.current.begin())return;
     setBusy(name);setError('');setNotice('');
-    try {acceptState(await task());setNotice(done);}
+    try {acceptState(await task());intents.current.complete(name);setNotice(done);}
     catch (failure) {setError((failure as Error).message);}
-    finally {setBusy('');}
+    finally {updates.current.finish();setBusy('');}
   }
   function beginSettingsEdit() {if(!dirty.current) settingsBase.current=state.settingsRevision;dirty.current=true;setSettingsDirty(true);}
   function set<K extends keyof Settings>(key: K, value: Settings[K]) {beginSettingsEdit();setSettings(current => ({...current,[key]:value}));}
   async function saveSettings() {
-    const result = await request<State>('/settings',{...settings,directories:state.settings.directories,sliceOutputDirectory:state.settings.sliceOutputDirectory,archiveCompletedDirectory:state.settings.archiveCompletedDirectory,archiveEmptyDirectory:state.settings.archiveEmptyDirectory,expectedRevision:settingsBase.current ?? state.settingsRevision,requestId:uid()});
+    const result = await request<State>('/settings',intents.current.payload('settings',{...settings,directories:state.settings.directories,sliceOutputDirectory:state.settings.sliceOutputDirectory,archiveCompletedDirectory:state.settings.archiveCompletedDirectory,archiveEmptyDirectory:state.settings.archiveEmptyDirectory,expectedRevision:settingsBase.current ?? state.settingsRevision}));
     dirty.current=false;setSettingsDirty(false);
     return result;
   }
   const groups = useMemo(() => physicalFiles(state.items), [state.items]);
-  const groupState = (group:typeof groups[number]) => state.archive?.items.some(file=>file.path === group.records[0].path && file.archiveState === 'attention') ? 'attention' : physicalState(group.records);
+  const groupState = (group:typeof groups[number]) => group.records.some(i=>!!i.processingBlockedReason&&!i.superseded)||state.archive?.items.some(file=>file.path === group.records[0].path && file.archiveState === 'attention') ? 'attention' : physicalState(group.records);
   const filtered = groups.filter(group => {
     const overall = groupState(group);
     if (filter === 'unsliced' && ['complete','no_target'].includes(overall)) return false;
@@ -281,17 +198,11 @@ export default function Slicing() {
   const controls = slicingControls(state);
   const managementApiReady = state.localWorkers !== undefined && state.sliceOutputDirectoryEffective !== undefined;
   const settingsStale = state.run?.settingsRevision != null && state.run.settingsRevision !== state.settingsRevision;
-  const canSingleSlice = (item: Item) => controls.scanReady && item.runId === state.run?.id && !!item.path &&
-    (item.state === 'pending' || (item.state === 'platform_processing' &&
-      Object.values(item.categories).some(category=>['ready','waiting_slot'].includes(category.state) && !category.taskId)));
   const targetRows = [
     {id:'27912', title:'车斗', name:'永锋车斗检测'},
     {id:'27944', title:'磁盘吊', name:'永锋-磁盘吊检测'},
   ] as const;
   const excluded = state.run?.excluded || {};
-  const recoverableCount = new Set(state.items
-    .filter(item=>item.state === 'attention' && item.errorCode === 'media_incomplete')
-    .map(item=>item.path || item.id)).size;
   const runMessage = state.run?.message?.replace(
     '请核对目标图片集和需要手动绑定的本地视频，再开始自动切片。',
     '本地原片已按唯一完整文件名自动匹配；扫描时会自动定位两个图片保存位置。',
@@ -312,33 +223,25 @@ export default function Slicing() {
           return <span key={id}>{title}：{target?.name || name}{target?.selectedId ? ` · 数据集 ${target.selectedId}` : ''}</span>;
         })}
       </div>
-      {!state.connected && <SliceLogin onConnected={acceptState} />}
+      {!state.connected && <SliceLogin onConnected={value=>{updates.current.invalidate();acceptState(value);}} />}
       <div className="actions slice-main-actions">
-        <button disabled={!!busy || settingsDirty} onClick={() => void run('execute', () => request('/execute-all',{requestId:uid(),expectedRevision:state.settingsRevision}), '已加入全部切片流程。')}>{busy === 'execute' ? '正在启动…' : '全部切片'}</button>
-        {recoverableCount > 0 && <button className="secondary" disabled={!state.connected || !!busy || state.busy || settingsDirty || settingsStale} onClick={() => void run('recover-decodable', () => request('/recover-decodable-all',{requestId:uid(),expectedRevision:state.settingsRevision}), `正在恢复 ${recoverableCount} 个视频的可解码片段。`)}>恢复可解码片段 · {recoverableCount}</button>}
-        <button className="secondary" disabled={!state.enabled || !!busy} onClick={() => void run('pause', () => request('/pause',{}),'已暂停，进度保留。')}>暂停</button>
-        <button className="secondary" disabled={!controls.canResume || !!busy || settingsDirty} onClick={() => void run('resume', () => request('/resume',{requestId:uid()}),'正在继续。')}>继续</button>
-        {state.localWorkers && <button className="secondary" disabled={!!busy || !state.packages} onClick={() => void run('package-uploads', () => request(state.packages?.paused ? '/packages/resume' : '/packages/pause',{}), state.packages?.paused ? '图片上传已继续；切片队列独立运行。' : '图片上传已暂停；切片队列独立运行。')}>{state.packages?.paused ? '继续图片上传' : '暂停图片上传'}</button>}
-        <button className="link" disabled={!!busy} onClick={() => void run('refresh', () => request<State>(''),'状态已更新。')}>刷新</button>
+        <button disabled={!!busy || settingsDirty} onClick={() => void run('execute', () => request('/execute-all',intents.current.payload('execute',{expectedRevision:state.settingsRevision})), '已加入全部切片流程。')}>{busy === 'execute' ? '正在启动…' : '全部切片'}</button>
+        {(state.enabled||controls.canResume)&&<button className="secondary" disabled={!!busy||(!state.enabled&&settingsDirty)} onClick={()=>void run(state.enabled?'pause':'resume',()=>request(state.enabled?'/pause':'/resume',state.enabled?{}:intents.current.payload('resume',{})),state.enabled?'已暂停，进度保留。':'正在继续。')}>{state.enabled?'暂停切片':'继续切片'}</button>}
       </div>
-      <p className="slice-flow">{settings.reviewBeforeUpload ? '已打开审核：磁盘吊照片确认后才上传。' : '自动模式：切片完成后直接上传压缩包。车斗导入 27892，磁盘吊导入 27893，不需要审核。'}</p>
-      {state.localWorkers ? <p className="slice-flow">本地识别任务 {state.localWorkers.active}/{state.localWorkers.max} · 当前进程 {state.localWorkers.processes} · 待识别 {state.localWorkers.queued}；图片上传与导入独立运行。</p> : <p className="slice-flow">正在使用当前后台版本；并行设置会在安全升级服务后启用。</p>}
-      {!!state.packages?.targets.length && <div className="slice-overall">{state.packages.targets.map(target =>
-        <span key={target.id}>{target.name} · 上传 {target.uploading} · 导入 {target.importing} · 排队 {target.queued}</span>)}</div>}
+      <p className="slice-flow">{settings.reviewBeforeUpload?'磁盘吊照片需确认后上传。':'切片照片自动上传并导入。'}</p>
       <div className="slice-overall"><span>{groups.length} 个视频</span><span>完成 {groups.filter(group=>group.records.every(item=>['complete','no_target'].includes(item.state))).length}</span><span>需处理 {groups.filter(group=>groupState(group) === 'attention').length}</span><span>已归档 {state.archive?.counts.complete || 0}</span></div>
       {settingsDirty && <p className="notice">设置有未保存修改，请先保存，或重新载入已保存的设置。</p>}
       {settingsDirty && settingsBase.current !== state.settingsRevision && <p className="notice">其他页面已保存新设置。当前草稿保留，请重新载入后再修改。</p>}
       {settingsStale && <p className="notice">模型或目录设置已变化，请重新扫描，再选择待处理视频。已有结果会保留。</p>}
-      {state.run && <div className={`slice-run-status ${state.run.state === 'attention' ? 'attention' : ''}`} role="status"><strong>{statusTitle}</strong><span>{statusMessage}</span>{!state.enabled && state.run.singleMode && !controls.canResume && state.run.state === 'attention' && <span>可重试该条，也可以选择下方其他待处理视频。</span>}</div>}
+      {state.run && <div className={`slice-run-status ${state.run.state === 'attention' ? 'attention' : ''}`} role="status"><strong>{statusTitle}</strong><span>{statusMessage}</span>{!state.enabled && state.run.singleMode && !controls.canResume && state.run.state === 'attention' && <span>异常请前往“视频查看与更正”处理。</span>}</div>}
       {Object.keys(excluded).length > 0 && <details className="slice-scan-details"><summary>扫描与去重明细</summary><p className="slice-detail">已排除：平台处理中 {excluded.active || 0} · 平台已完成 {excluded.complete || 0} · 已切片视频 {excluded.cut || 0} · 程序已有任务 {excluded.submitted || 0}</p></details>}
-      {(error || pollError) && <p className="error" role="alert">{error || pollError}</p>}{notice && <p className="success" role="status">{notice}</p>}
+      {(error || pollError) && <p className="error" role="alert">{error || pollError}{pollError&&<button className="link" disabled={!!busy} onClick={()=>void refresh().catch(f=>setPollError((f as Error).message))}>重试读取</button>}</p>}{notice && <p className="success" role="status">{notice}</p>}
     </section>
 
-    <section className="panel slicing-management" aria-label="进程与文件目录管理">
-      <div className="section-title"><h2>进程管理</h2><span>本地识别与上传独立运行</span></div>
+    <section className="panel slicing-management" aria-label="切片进程管理">
+      <div className="section-title"><h2>切片与上传进程</h2><span>独立运行</span></div>
       <div className="slicing-management-grid">
         <section className="slice-management-card">
-          <h3>本地切片进程</h3>
           <p className="slice-management-summary">{state.localWorkers
             ? `正在运行 ${state.localWorkers.active} 个 · 后台进程 ${state.localWorkers.processes} 个 · 排队 ${state.localWorkers.queued} 个`
             : '当前后台尚未提供进程状态。现有任务会继续运行，后台安全更新后即可在此调整。'}</p>
@@ -346,14 +249,13 @@ export default function Slicing() {
             disabled={!managementApiReady || !!busy} buttonLabel="保存进程数"
             onChange={value=>{setProcessDraft(value);setProcessDirty(true);}}
             onSave={()=>void run('process-limit',async()=>{
-                const result=await request<State>('/process-limit',{requestId:uid(),expectedRevision:state.localWorkers?.revision ?? 0,maxLocalSlicingProcesses:processDraft});
+                const result=await request<State>('/process-limit',intents.current.payload('process-limit',{expectedRevision:state.localWorkers?.revision ?? 0,maxLocalSlicingProcesses:processDraft}));
                 setProcessDirty(false);return result;
               },`并行识别数已设为 ${processDraft}。`)} />
-          <div className="slice-independent-queues"><strong>图片上传与导入（独立队列）</strong>{state.packages?.targets.map(target=><span key={target.id}>{target.name} · 上传 {target.uploading} · 导入 {target.importing} · 排队 {target.queued}</span>)}</div>
-          <p className="subtle">上传和导入不占用本地识别进程。增加识别进程会提高并行度，也会增加内存和显存占用。</p>
         </section>
-
-        <section className="slice-management-card"><h3>统一目录</h3><p>原片、照片和压缩包由上方“文件工作区”管理，处理完成后自动流转。</p><p className="slice-path-current">待核验照片：<code>{state.sliceOutputDirectoryEffective || '启用工作区后显示'}</code></p></section>
+        <section className="slice-management-card"><h3>图片上传与导入</h3><div className="slice-independent-queues">{state.packages?.targets.map(target=><span key={target.id}>{target.name} · 上传 {target.uploading} · 导入 {target.importing} · 排队 {target.queued}</span>)}</div>
+          {state.localWorkers&&<button className="secondary" disabled={!!busy||!state.packages} onClick={()=>void run('package-uploads',()=>request(state.packages?.paused?'/packages/resume':'/packages/pause',{}),state.packages?.paused?'图片上传已继续。':'图片上传已暂停。')}>{state.packages?.paused?'继续图片上传':'暂停图片上传'}</button>}
+        </section>
       </div>
 
     </section>
@@ -425,30 +327,15 @@ export default function Slicing() {
           <div className="slice-categories">{physicalCategories(group.records,source).map(({item,categoryName:name}) => {
             return <div key={name}>
               {item.state === 'analyzing' && <div className="slice-analysis"><p>{stageLabels[item.analysisStage || ''] || '准备识别'}{item.analysisTotal ? ` · ${item.analysisDone || 0}/${item.analysisTotal}` : ''}</p><progress max="100" value={item.progress} aria-label="识别进度" /></div>}
-              <CategoryCard item={item} categoryName={name} category={item.categories[name]} packages={state.packages?.items} onUpdated={acceptState} />
-              <div className="actions">
-                {canSingleSlice(item) && <button className="secondary" disabled={!state.connected || !controls.idle || settingsDirty || settingsStale || !!busy} onClick={() => void run(`single-${item.id}`, () => request('/start',{requestId:uid(),expectedRevision:state.settingsRevision,mode:'single',itemId:item.id}),'本条已启动。')}>执行本类</button>}
-                {!item.localCleanupState && item.state === 'attention' && !item.categories[name].packageId && <button className="secondary" disabled={!state.connected || (state.busy && !state.enabled) || !!busy || settingsDirty} onClick={() => void run(`retry-${item.id}`, () => request(`/${item.id}/retry`,{requestId:uid(),expectedRevision:item.revision}),'本条恢复中。')}>重试本类</button>}
-              </div>
+              <CategoryCard categoryName={name} category={item.categories[name]} packages={state.packages?.items} />
+
             </div>;
           })}</div>
           {physicalCategories(group.records).length < 2 && <p className="slice-detail">另一类别尚无处理记录，暂不归档。</p>}
+          {first.processingBlockedReason&&<p className="slice-detail">{first.processingBlockedReason}</p>}
           {archive?.archiveState === 'complete' && archive.cleanup?.state !== 'complete' && <p className="slice-archive">已统一归档 · {archive.archivePath}</p>}
           {archive?.cleanup?.state === 'complete' && <p className="slice-detail">已清理本地视频和照片；平台结果与处理记录保留。</p>}
-          {!state.workspaceManaged && archive?.archiveState === 'complete' && archive.cleanup?.state !== 'complete' && <div className="slice-archive">
-            {archive.cleanup?.state === 'attention' && <p className="error">{archive.cleanup.message || '清理未完成；剩余文件保留。'}</p>}
-            <button className="secondary" disabled={!!busy || state.busy} onClick={async()=>{
-              if (!window.confirm('程序已核验切片结果。确定删除本地原视频、程序生成的切片照片和压缩包？平台结果与记录会保留。')) return;
-              try {
-                const response = await fetch(`/api/files/${archive.id}/cleanup-confirmed`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({requestId:uid(),confirm:true})});
-                if (!response.ok) {const body = await response.json().catch(()=>({})); throw new Error(body.detail || '清理未完成，文件已保留或部分清理。');}
-                await refresh();
-              } catch(failure) {setError((failure as Error).message);}
-            }}>清理已核验视频和照片</button>
-          </div>}
-          {archive?.archiveState === 'attention' && <div className="slice-archive"><p>{archive.archiveMessage}</p><button className="secondary" onClick={async()=>{
-            try {const response = await fetch(`/api/files/${archive.id}/archive-retry`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});if(!response.ok) throw new Error('归档重试失败。');await refresh();} catch(failure) {setError((failure as Error).message);}
-          }}>重试归档</button></div>}
+          {group.records.some(item=>item.collectionVideoId||!['complete','no_target','excluded','superseded'].includes(item.state))&&<button className="secondary" onClick={()=>window.dispatchEvent(new CustomEvent('simple-open-video',{detail:{mediaId:first.mediaId,videoId:first.collectionVideoId}}))}>前往处理</button>}
           <details className="slice-file"><summary>文件位置</summary><p className="slice-detail">{first.name}<br/>{first.path || '未绑定文件'}</p></details>
           <RecordDelete name={`${heading.title}${heading.when?` · ${heading.when}`:''}`} version={group.records.map(i=>`${i.id}:${i.revision}`).sort().join('|')} disabled={!!busy}
             description="删除本视频的全部类别记录，原视频、平台成果和任务进度保留。正在进行的任务继续。"

@@ -4,7 +4,8 @@ import ProcessLimitControl from './ProcessLimitControl';
 export type DownloadWorkers = {active: number; queued: number; max: number; revision: number};
 export type DownloadLimitInput = {maxConcurrentDownloads: number; expectedRevision: number; requestId: string};
 
-export default function DownloadManager({workers, onSave, onRefresh}: {
+export default function DownloadManager({workers, directory, checkError, onSave, onRefresh}: {
+  directory?:string;checkError?:string;
   workers?: DownloadWorkers; onSave: (payload: DownloadLimitInput) => Promise<DownloadWorkers>;
   onRefresh: () => Promise<void>;
 }) {
@@ -34,17 +35,15 @@ export default function DownloadManager({workers, onSave, onRefresh}: {
   }
 
   return <section className="panel slicing-management download-management" aria-label="下载进程管理">
-    <div className="section-title"><h2>进程管理</h2><span>下载与切片独立运行</span></div>
-    <section className="slice-management-card">
-      <h3>视频下载</h3>
+    <div className="section-title"><h2>下载进程管理</h2><span>与切片独立运行</span></div>
       <p className="slice-management-summary" role="status">{workers
         ? `正在运行 ${workers.active} 条 · 排队 ${workers.queued} 条 · 当前上限 ${workers.max} 条`
         : '正在读取下载队列…'}</p>
       <ProcessLimitControl label="同时下载视频数（1–8）" value={draft} dirty={dirty} disabled={!workers}
         saving={saving} buttonLabel="保存下载数量" onSave={() => void save()}
         onChange={value => {setDraft(value);setDirty(true);pending.current = null;setError('');setNotice('');}} />
-      <p className="subtle">默认 5 条，保存后重启仍生效。调低后，正在下载的视频继续，新任务按新上限启动。校验与保存计入运行数量。</p>
+      <details className="operation-details"><summary>保存位置与说明</summary><p className="subtle">{directory||'请先启用文件工作区。'}<br/>下载数量包含校验与保存；调整后生效，现有下载继续。断盘保留断点。</p></details>
+      {checkError&&<p className="notice">{checkError}</p>}
       {error && <p className="error" role="alert">{error}</p>}{notice && <p className="success" role="status">{notice}</p>}
-    </section>
   </section>;
 }

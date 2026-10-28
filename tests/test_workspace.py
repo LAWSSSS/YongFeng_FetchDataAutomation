@@ -460,15 +460,20 @@ async def test_restart_after_publication_replays_bindings_not_bytes(env,tmp_path
 
 
 @pytest.mark.asyncio
-async def test_cleanup_restarts_after_unlink_before_acknowledgement(env,tmp_path,monkeypatch):
+@pytest.mark.parametrize('interrupt_at',[1,3,5])
+async def test_cleanup_restarts_after_unlink_before_acknowledgement(env,tmp_path,monkeypatch,interrupt_at):
     app,w=env
     path=pair(w,tmp_path/'old',('complete','complete'));proofs(w,path,tmp_path)
     await enable(w,tmp_path)
     original=Path(w.rows('assets')[0]['path'])
     saved=w.videos.file_operation
+    deletions=0
     async def interrupt(function,*args):
+        nonlocal deletions
         value=await saved(function,*args)
-        if getattr(function,'__name__','')=='unlink':raise asyncio.CancelledError()
+        if getattr(function,'__name__','')=='unlink':
+            deletions+=1
+            if deletions==interrupt_at:raise asyncio.CancelledError()
         return value
     monkeypatch.setattr(w.videos,'file_operation',interrupt)
     with pytest.raises(asyncio.CancelledError):await w.reconcile()
@@ -501,6 +506,8 @@ async def test_53_record_snapshot_preserves_corrections_observations_and_binding
     await enable(w,tmp_path)
     for row in w.videos.store.list():
         assert row['versions'][0]['filePath']!=before[row['id']]['versions'][0]['filePath']
+        from app.audit_moves import source_fingerprint
+        assert row['versions'][0].pop('fileVersion') == source_fingerprint(Path(row['versions'][0]['filePath']))
         row['versions'][0]['filePath']=before[row['id']]['versions'][0]['filePath']
         row['versions'][0].pop('classifiedAt',None)
         row.pop('updatedAt',None)

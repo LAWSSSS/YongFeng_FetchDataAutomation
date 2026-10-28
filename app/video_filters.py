@@ -1,11 +1,14 @@
 """Read-only record filtering; time and identity facts are never rewritten."""
 from datetime import datetime
+from .recovery_results import partial_complete
 
 
 def record_status(row):
     if row.get("deletion", {}).get("state") in ("pending", "error"):
         return "deleting"
     active = next(v for v in row["versions"] if v["revision"] == row["activeRevision"])
+    if partial_complete(active):
+        return 'saved'
     if active["state"] in ("attention", "failed", "uncertain"):
         return "review"
     if active["state"] == "saved":
@@ -15,11 +18,20 @@ def record_status(row):
     return "ready" if active["state"] == "ready" else "waiting"
 
 
+def matches_status(row, status):
+    if status == 'complete':
+        # Older clients may still request the partial-results subset. The
+        # current UI groups these records with all other saved results.
+        active = next(v for v in row['versions'] if v['revision'] == row['activeRevision'])
+        return record_status(row) != 'deleting' and partial_complete(active)
+    return status == 'all' or record_status(row) == status
+
+
 def filter_records(rows, query):
     query = query or {}
     status, correction = query.get("status", "all"), query.get("correction", "all")
     basis = query.get("timeBasis", "quality")
-    if status not in ("all", "ready", "waiting", "review", "download", "saved", "deleting"):
+    if status not in ("all", "ready", "waiting", "review", "download", "saved", "complete", "deleting"):
         raise ValueError("视频状态筛选无效。")
     if correction not in ("all", "corrected", "withdrawn", "uncorrected") or basis not in ("quality", "capture"):
         raise ValueError("更正或时间依据筛选无效。")
@@ -43,7 +55,7 @@ def filter_records(rows, query):
         withdrawn = bool(actions and actions[-1]["kind"] == "withdraw")
         if (first and date < first or last and date > last
                 or needles and not any(n in (row["name"] + " " + row["plate"]).upper() for n in needles)
-                or status != "all" and record_status(row) != status
+                or not matches_status(row, status)
                 or correction == "corrected" and not has_correction
                 or correction == "uncorrected" and has_correction
                 or correction == "withdrawn" and not withdrawn):

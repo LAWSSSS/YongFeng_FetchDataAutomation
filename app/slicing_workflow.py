@@ -1,4 +1,5 @@
 """Durable one-click intent and recovery, separate from platform submission."""
+import asyncio
 from .domain import now_iso
 from .videos import Conflict
 
@@ -30,7 +31,8 @@ class SlicingWorkflow:
     async def _workflow_scan(self):
         """Run one refresh between analyses; retain the same batch identity."""
         self._reap_analysis_tasks()
-        if self._active_analysis_tasks() or (self.files and self.files.busy) or (self.scan_task and not self.scan_task.done()):
+        if (self._active_analysis_tasks() or self.export_tasks or (self.files and self.files.busy)
+                or (self.scan_task and not self.scan_task.done())):
             return False
         from uuid import uuid4
         workflow = self.store.settings['workflow']
@@ -133,13 +135,15 @@ class SlicingWorkflow:
         self.store.save('items', current)
         return current
 
-    async def _restore_waiting_files(self):
+    async def _restore_waiting_files(self, items=None):
         from .slicing import source_version
-        for item in self.store.list('items'):
+        rows = self.store.list('items') if items is None else items
+        rows = self._scope_run_items(rows)
+        for item in rows:
             if item.get('state') != 'waiting_connection':
                 continue
             try:
-                if not self.auth.connected or source_version(item['path']) != item['fileVersion']:
+                if not self.auth.connected or await asyncio.to_thread(source_version, item['path']) != item['fileVersion']:
                     continue
             except (OSError, ValueError):
                 continue

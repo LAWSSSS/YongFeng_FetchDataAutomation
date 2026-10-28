@@ -1,0 +1,26 @@
+.hero.compact {margin-bottom:20px}
+.hero.compact h1 {font-size:26px;margin-bottom:8px}
+.hero.compact p {margin:0;color:#526159;line-height:1.6}
+.connections-summary {margin:0 0 20px;color:#365744;font-size:14px}
+.connections-summary>summary,.record-advanced>summary,.operation-details>summary {cursor:pointer;font-weight:600}
+.connections-summary .connections {margin-top:12px}
+.record-filters.condensed {grid-template-columns:minmax(0,1fr) auto;margin-top:16px}
+.record-filters.condensed>.record-search {grid-column:auto}
+.record-filters.condensed>.actions {grid-column:auto;margin:0}
+.record-advanced {grid-column:1/-1;color:#365744;font-size:14px}
+.record-filter-details {display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin-top:16px}
+.selection-scope {display:flex;align-items:center;gap:8px;margin:0;flex-wrap:wrap}
+.selection-scope select {width:auto;min-width:168px;max-width:100%}
+.selection-bar>span {white-space:nowrap}
+.operation-details {margin-top:14px;font-size:14px;color:#365744}
+.operation-details p {overflow-wrap:anywhere}
+@media(max-width:700px){
+  .hero.compact h1 {font-size:24px}
+  .record-filters.condensed {grid-template-columns:1fr}
+  .record-filter-details {grid-template-columns:1fr 1fr}
+  .selection-bar>.actions {flex-wrap:wrap}
+  .selection-scope {width:100%}
+  .selection-scope select {flex:1;min-width:0;font-size:16px}
+  .record-advanced input,.record-advanced select {min-width:0;width:100%}
+}
+@media(max-width:420px){.record-filter-details {grid-template-columns:1fr}}
