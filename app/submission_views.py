@@ -1,4 +1,5 @@
 """Small, read-only receipt views; durable operation evidence stays in its stores."""
+import json
 from math import ceil
 from hashlib import sha256
 
@@ -14,15 +15,24 @@ def collection_record(job):
 class SubmissionViews:
     def __init__(self, jobs, slicing, submissions=None):
         self.jobs, self.slicing, self.submissions = jobs, slicing, submissions
+        self.slicing.store.db.execute("CREATE INDEX IF NOT EXISTS slicing_run_request ON simple_slicing_runs(json_extract(payload, '$.requestId'))")
+        self.slicing.store.db.commit()
 
     def get(self, identity):
         """Adapter for immutable, presentation-only receipt child identities."""
-        parent_id, _, _ = identity.partition(':')
-        row = self.submissions.get(parent_id) if self.submissions else None
-        if not row:
-            return None
-        return next((item for item in self.project(row, detail=True, page_size=100000)['detail']['items']
-                     if item.get('deletionKey') == identity), None)
+        return self.get_many([identity]).get(identity)
+
+    def get_many(self, identities):
+        """Build each receipt once while validating a batch of child records."""
+        wanted = set(identities)
+        result = {}
+        for parent_id in {identity.partition(':')[0] for identity in wanted}:
+            row = self.submissions.get(parent_id) if self.submissions else None
+            if not row:
+                continue
+            items = self.project(row, detail=True, page_size=100000)['detail']['items']
+            result.update((item['deletionKey'], item) for item in items if item.get('deletionKey') in wanted)
+        return result
 
     def slicing_receipts(self):
         hidden = self.submissions.visibility.hidden()
@@ -52,7 +62,10 @@ class SubmissionViews:
         run_id = detail.get('runId') or request.get('runId')
         run = self.slicing.store.get('runs', run_id or '')
         if not run and request_id:
-            matches = [r for r in self.slicing.store.list('runs') if r.get('requestId') == request_id]
+            # Only exact request matches are evidence. Do not deserialize every
+            # old run (and its snapshots) while rendering each receipt.
+            matches = [json.loads(value[0]) for value in self.slicing.store.db.execute(
+                "SELECT payload FROM simple_slicing_runs WHERE json_extract(payload, '$.requestId')=? LIMIT 2", (request_id,))]
             run = matches[0] if len(matches) == 1 else None
         if run:
             return ([request['itemId']] if request.get('itemId') else run.get('items', [])), run['id'], ''

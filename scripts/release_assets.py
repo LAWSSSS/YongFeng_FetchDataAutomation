@@ -4,10 +4,14 @@ import hashlib
 import json
 import shutil
 import subprocess
+import sys
 import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from app.runtime import VERSION
+from scripts.package_safety import verify_tree
 
 
 def sha(path):
@@ -18,21 +22,22 @@ def sha(path):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("folder", type=Path)
-    parser.add_argument("--output", type=Path, default=ROOT / "releases/v1.1.0")
+    parser.add_argument("--output", type=Path, default=ROOT / "releases" / f"v{VERSION}")
     args = parser.parse_args()
     if args.output.exists():
         raise ValueError("Release output exists; choose a new folder.")
     args.output.mkdir(parents=True)
     manifest = json.loads((args.folder / "文件校验.json").read_text())
-    for entry in manifest["files"]:
-        if sha(args.folder / entry["path"]) != entry["sha256"]:
-            raise ValueError(f'Package file changed: {entry["path"]}')
-    destination = args.output / "gather-assistant-1.1.0-macos-arm64.zip"
+    verify_tree(args.folder, manifest)
+    if manifest.get("version") != VERSION:
+        raise ValueError("Package version does not match the current source.")
+    destination = args.output / f"gather-assistant-{VERSION}-macos-arm64.zip"
     # App signatures and executable modes survive Archive Utility extraction.
     # Source files have no resource forks; exclude incidental build metadata.
     subprocess.run(["/usr/bin/ditto", "-c", "-k", "--norsrc", "--keepParent", str(args.folder.resolve()),
                     str(destination.resolve())], check=True)
     resources = args.folder / "采集助手.app/Contents/Resources"
+    shutil.copy2(args.folder / "源码与模型.zip", args.output / f"source-and-models-{VERSION}.zip")
     model_manifest = json.loads((ROOT / "assets/models/manifest.json").read_text())
     with zipfile.ZipFile(args.output / "models-v1.zip", "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for entry in model_manifest["files"]:

@@ -4,6 +4,7 @@ from typing import Any, Literal
 import httpx
 
 from .domain import ORIGIN
+from .availability import ConnectionAvailability
 
 Service = Literal["source", "target"]
 
@@ -39,6 +40,7 @@ class RemoteClient:
         self.connected = False
         self.user = ""
         self.login_lock = asyncio.Lock()
+        self.availability = ConnectionAvailability()
 
     def clear(self):
         self.client.cookies.clear()
@@ -53,8 +55,10 @@ class RemoteClient:
         try:
             response = await self.client.request(method, path.lstrip("/"), params=params, **({"json": body} if body is not None else {}))
         except httpx.HTTPError:
+            self.availability.unavailable()
             # 原站登录接口使用 query 传密码，禁止输出包含请求 URL 的异常内容。
             raise RemoteError("无法连接原站或请求超时，请检查网络。", "NETWORK", write) from None
+        self.availability.received()
         if response.status_code in (401, 403):
             self.connected = False
             raise RemoteError("登录已失效或账号无权限，请重新登录。", str(response.status_code))

@@ -20,15 +20,19 @@ from uuid import uuid4
 
 from .slicing_workflow import SlicingWorkflow
 from .audit_moves import fingerprint, source_fingerprint
-from .slicing_analysis import SharedSlicingAnalysis, outcome_changed, revision_after_outcome
+from .slicing_analysis import SharedSlicingAnalysis, category_signature, outcome_changed, revision_after_outcome
 from .slice_export import (PACKAGE_DATASETS, interior_timestamps, magnet_refine_windows, package_directory,
                            package_identity, photo_export_identity, photo_names, read_jpeg, select_recognized_frames, slice_timestamps,
                            write_image_archive)
 from .slice_packages import SlicePackageManager
 from .upload_remote import UploadRemote
 from .domain import now_iso
+from .availability import connection_state
+from .presentation import slicing_view, SUMMARY_CATEGORY, SUMMARY_ITEM, category_display_state, terminal_state
 from .file_leases import FileLeases, finish_io
-from .slicing_core import build_category_result, category_image_target, sample_points
+from .inference_pipe import MAX_JPEG_BYTES, abort as abort_inference, read_reply, send_request
+from .slicing_core import (build_category_result, category_image_target, sample_points,
+                           record_decode_coverage, processing_conclusion, position_excluded)
 from .slicing_remote import (CUT_TYPES, SlicingRemote, log_matches_video, parse_config, source_video_ids,
                              target_dataset_id, task_state)
 from .upload_audit import AuditError, VIDEO_EXTENSIONS
@@ -64,7 +68,8 @@ ERROR_TEXT = {
     "frame_extract_failed": "视频抽帧失败，原文件保留，可单条重试。",
     "media_incomplete": "视频末段缺失或无法解码，不能完成切片。请使用完整版本；原文件和有效判断已保留。",
     "media_check_timeout": "读取视频末段超时。请检查外置盘连接后单条重试。",
-    "frame_timeout": "单个位置解码超过30秒，已停止本条；文件和已有判断均保留。",
+    "frame_timeout": "解码等待超过30秒，将检查文件并跳过确认不可用的位置。",
+    "frame_timestamp_missing": "抽帧工具未返回画面时间，已暂停；不会把其他位置当作当前画面。",
     "frame_tool_error": "抽帧工具运行异常，未把该位置当作坏帧；请检查工具后重试。",
     "frame_io_error": "读取原片时发生磁盘或文件错误，未把该位置当作坏帧；请检查磁盘后重试。",
     "output_conflict": "输出位置已有同名照片或压缩包，文件保留；请换目录后重试。",
@@ -169,7 +174,7 @@ def ffprobe_file(path, ffmpeg_path):
     if not ffprobe:
         raise ValueError("找不到 ffprobe，请检查抽帧工具路径。")
     result = subprocess.run([str(ffprobe), "-v", "error", "-select_streams", "v:0", "-show_entries",
-        "format=duration,size:stream=width,height,avg_frame_rate,r_frame_rate", "-of", "json", str(path)],
+        "format=duration,size:stream=width,height,avg_frame_rate,r_frame_rate,start_time", "-of", "json", str(path)],
         capture_output=True, timeout=40, check=False)
     if result.returncode:
         raise ValueError("视频元数据读取失败。")
@@ -186,7 +191,8 @@ def ffprobe_file(path, ffmpeg_path):
         frame_rate = 25.0
     return {"duration": float(fmt["duration"]), "size": int(fmt.get("size", 0)),
             "width": int(streams[0].get("width", 0)), "height": int(streams[0].get("height", 0)),
-            "frameRate": frame_rate if math.isfinite(frame_rate) and frame_rate > 0 else 25.0}
+            "frameRate": frame_rate if math.isfinite(frame_rate) and frame_rate > 0 else 25.0,
+            "streamStartTime": float(streams[0].get("start_time") or 0)}
 
 
 def scan_local_files(directories):
@@ -310,7 +316,7 @@ async def target_dataset_verified(remote, identity, row, descriptor):
         raise
 
 
-_LOCAL_WORK_STATES = {"complete", "waiting", "submitting", "queued", "uploading", "uploaded", "importing", "review", "ready"}
+_LOCAL_WORK_STATES = {"complete", "no_target", "uncuttable", "waiting", "submitting", "queued", "uploading", "uploaded", "importing", "review", "ready"}
 
 
 def _category_has_local_work(category):
@@ -319,6 +325,11 @@ def _category_has_local_work(category):
     if category.get("taskId") or category.get("packageId") or category.get("intervals") or category.get("modelFingerprint"):
         return True
     return category.get("state") in _LOCAL_WORK_STATES
+
+
+def _uses_both_categories(item):
+    return bool(item.get('localWorkspace') or item.get('collectionRecovery')
+                or item.get('sourceType') in {'local_workspace', 'local_collection_recovery'})
 
 
 def applicable_category(source_dataset_id):
@@ -384,11 +395,6 @@ class SlicingStore:
     @staticmethod
     def defaults(python_path=None, frame_tool=None):
         settings = {"revision": 0, "directories": ["/Volumes/out/视频"],
-                "magnetDeployDirectory": "/Volumes/out/yongfeng_cipandiao_deploy",
-                "magnetModelPath": "/Volumes/out/yongfeng_cipandiao_deploy/best.onnx",
-                "bedDeployDirectory": "/Volumes/out/yongfeng_wall_presence_deploy_20261018_v1",
-                "bedModelPath": "/Volumes/out/yongfeng_wall_presence_deploy_20261018_v1/runs/supervised_wall_20261017_v5/model.pt",
-                "bedGeometryPath": "/Volumes/out/yongfeng_wall_presence_deploy_20261018_v1/runs/supervised_wall_20261017_v5/geometry.npz",
                 "frameToolPath": frame_tool or shutil.which("ffmpeg") or "/opt/homebrew/bin/ffmpeg",
                 "workerPythonPath": python_path or str(ROOT / ".venv-slicing" / "bin" / "python"),
                 "sharedSampling": True, "sampleIntervalSeconds": 30, "magnetIntervalSeconds": 30,
@@ -399,6 +405,7 @@ class SlicingStore:
                 "latestRunId": "", "settingsRequestIds": {}, "autoArchive": True,
                 "archiveCompletedDirectory": "切片完成", "archiveEmptyDirectory": "未检出目标",
                 "reviewBeforeUpload": False, "localExport": True, "sliceOutputDirectory": ""}
+        settings.update(runtime.source_model_paths())
         settings.update(runtime.slicing_paths())
         if runtime.portable():
             settings["bundledResources"] = str(runtime.resources())
@@ -430,7 +437,7 @@ class SlicingStore:
                         for key in ("taskId", "operationId", "packageId"):
                             if category.get(key) and not slot.get(key):
                                 slot[key] = category[key]
-                    if value.get("state") not in {"complete", "no_target"}:
+                    if value.get("state") not in {"complete", "no_target", "uncuttable"}:
                         value["state"] = "superseded"
         value["updatedAt"] = now_iso()
         self.db.execute(f"INSERT INTO simple_slicing_{kind} VALUES(?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload",
@@ -462,6 +469,8 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
         self.analysis_tasks = {}
         self.analysis_video_keys = {}
         self.export_tasks = {}
+        self.export_recovery_task = None
+        self.export_recovery_next = 0
         self.exporting = set()
         self.worker_process = None
         self.worker_processes = set()
@@ -469,6 +478,10 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
         self.stopping = False
         self.tick_lock = asyncio.Lock()
         self.start_lock = asyncio.Lock()
+        self.connection_task = None
+        self.connection_retry_at = 0
+        self.platform_task = None
+        self.platform_next_check = 0
         self.fingerprint_cache = {}
         self.files = None
         self.packages = SlicePackageManager(store.db, UploadRemote(auth), clock=self.clock, leases=self.leases)
@@ -502,7 +515,7 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
 
     @property
     def busy(self):
-        return bool(self.exporting or any(task and not task.done() for task in (self.scan_task, self.scheduler_task))
+        return bool(self.exporting or any(task and not task.done() for task in (self.scan_task, self.scheduler_task, self.platform_task))
                     or self._active_analysis_tasks() or any(not task.done() for task in self.export_tasks.values())
                     or (self.files and self.files.busy))
 
@@ -540,6 +553,7 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
 
     def _scope_run_items(self, items):
         """Limit scheduler work to the current recovery batch or single item."""
+        items = self._effective_items(items)
         run = self.run or {}
         if run.get("localRecoveryOnly"):
             allowed = set(run.get("items") or [])
@@ -548,6 +562,14 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
             selected = run["singleItemId"]
             items = [item for item in items if item.get("id") == selected]
         return items
+
+    def _effective_items(self, items=None):
+        items = self.store.list('items') if items is None else items
+        control = getattr(self, 'control', None)
+        if control and hasattr(control, 'effective_items'):
+            return control.effective_items(items)
+        covered = control.recovery_covered_items(items) if control else {}
+        return [item for item in items if not item.get('superseded') and item['id'] not in covered]
 
     def _reap_analysis_tasks(self):
         for identity, task in list(self.analysis_tasks.items()):
@@ -604,14 +626,14 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
     def phase(self, run):
         if not self.store.settings.get("enabled"):
             return "idle"
-        if not self.auth.connected or (run and run.get("state") == "waiting_connection"):
-            return "waiting_connection"
-        if self.store.settings.get("workflow", {}).get("phase") == "scan":
-            return "scanning"
         if self._active_analysis_tasks():
             return "analyzing"
         if self.exporting or self.export_tasks:
             return "exporting"
+        if not self.auth.connected or (run and run.get("state") == "waiting_connection"):
+            return "waiting_connection"
+        if self.store.settings.get("workflow", {}).get("phase") == "scan":
+            return "scanning"
         if self.files and (self.files.busy or self.files.archive_count('waiting')):
             return "archiving"
         return "platform_processing"
@@ -630,44 +652,82 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
                    and not i.get('collectionRecoveryPaused') and not i.get('superseded')
                    and (not getattr(self, 'control', None) or self.control.allowed(i)) for i in items)
 
-    def state(self):
-        if getattr(self, "control", None):
-            self.control.refresh()
-        hidden = self.visibility.hidden()
-        all_items = self.store.list("items")
-        items = [item for item in all_items if item['id'] not in hidden]
-        run = self.store.get("runs", self.store.settings.get("latestRunId")) or self.run
-        if run:
-            self.run = run
-        counts = {}
-        for item in items:
-            counts[item.get("state", "attention")] = counts.get(item.get("state", "attention"), 0) + 1
+    def public_items(self, items, *, lean=False, covered=None):
+        """Render source details without building unrelated page and archive state."""
+        covered = covered or {}
         public_items = []
         views = getattr(self, 'submission_views', None)
         submission_dates = views.slicing_dates() if views else {}
+        # Dates do not require decoding operation snapshots or package manifests
+        # once per category on every poll.
+        operation_dates = dict(self.store.db.execute(
+            "SELECT id,json_extract(payload,'$.createdAt') FROM simple_slicing_operations"))
+        package_dates = dict(self.store.db.execute(
+            "SELECT id,json_extract(payload,'$.createdAt') FROM simple_slice_package_items"))
         for item in items:
-            public = {**item, "categories": {}}
+            public = ({key: value for key, value in item.items() if key in SUMMARY_ITEM | {'path'}}
+                      if lean else dict(item))
+            public['categories'] = {}
+            if item['id'] in covered:
+                public['coveredByRecovery'] = covered[item['id']]
             if getattr(self, "control", None):
                 public["processingBlockedReason"] = self.control.reason(item)
             known_dates = []
             for name, category in item.get("categories", {}).items():
                 public["categories"][name] = {key: value for key, value in category.items()
-                    if key not in {"preSubmitImageIds", "preSubmitTaskIds", "outputImageIds", "fileVersion"}}
+                    if (key in SUMMARY_CATEGORY if lean else
+                        key not in {"preSubmitImageIds", "preSubmitTaskIds", "outputImageIds", "fileVersion"})}
+                public['categories'][name]['state'] = category_display_state(category)
                 if (item["id"], name) in self.exporting:
                     public["categories"][name].update(state="exporting", message="正在导出照片并生成压缩包。")
-                operation = self.store.get('operations', category.get('operationId') or '') or {}
-                package = self.packages.store.get('items', category.get('packageId') or '') or {}
-                submitted_at = operation.get('createdAt') or package.get('createdAt')
+                submitted_at = operation_dates.get(category.get('operationId')) or package_dates.get(category.get('packageId'))
                 if submitted_at:
                     public['categories'][name]['submittedAt'] = submitted_at
                     known_dates.append(submitted_at)
             public['submittedAt'] = min(known_dates) if known_dates else submission_dates.get(item['id'], '')
+            if public.get('state') == 'complete':
+                public['state'] = terminal_state([category['state'] for category in public['categories'].values()
+                                                 if category.get('state') != 'not_applicable'])
             public_items.append(public)
-        return {"workflow": self.store.settings.get("workflow"),
+        return public_items
+
+    def state(self, *, summary=False, records_day=None, page=1, page_size=20,
+              status='all', source='all', search=''):
+        lean = summary or records_day is not None
+        if getattr(self, "control", None):
+            self.control.refresh()
+        hidden = self.visibility.hidden()
+        all_items = self.store.list("items")
+        items = [item for item in all_items if item['id'] not in hidden]
+        covered = self.control.recovery_covered_items(all_items) if getattr(self, 'control', None) else {}
+        run = self.store.get("runs", self.store.settings.get("latestRunId")) or self.run
+        if run:
+            self.run = run
+        counts = {}
+        for item in self._effective_items(items):
+            counts[item.get("state", "attention")] = counts.get(item.get("state", "attention"), 0) + 1
+        public_items = self.public_items(items, lean=lean, covered=covered)
+        flow = getattr(self, 'final_processing', None)
+        presentations = {(value['videoId'], value['version'], value['mediaGeneration']): value
+                         for value in flow.presentations()} if flow else {}
+        for item in public_items:
+            presentation = presentations.get((item.get('collectionVideoId'), item.get('collectionRevision'),
+                                              item.get('mediaGeneration', 0)))
+            if presentation:
+                # The final approval is the real submission of local photo work.
+                # Keep any existing platform submission date; never rewrite history.
+                if not item.get('submittedAt'):
+                    item['submittedAt'] = presentation.get('confirmedAt') or ''
+                item['processing'] = {key: presentation.get(key) for key in (
+                    'operationId', 'version', 'mediaGeneration', 'state', 'stageLabel', 'message',
+                    'updatedAt', 'terminal', 'progress')}
+        views = getattr(self, 'submission_views', None)
+        value = {"workflow": self.store.settings.get("workflow"),
                 "workspaceManaged": bool(getattr(self, 'workspace', None) and self.workspace.enabled),
-                "archive": self.files.state() if self.files else {"items": [], "counts": {}},
+                "archive": self.files.state(summary=lean) if self.files else {"items": [], "counts": {}},
                 "phase": self.phase(run),
                 "connected": bool(self.auth.connected), "user": self.auth.user if self.auth.connected else "",
+                "availability": connection_state(self.auth),
                 "settings": self._safe_settings(), "settingsRevision": self.store.settings["revision"],
                 "run": run, "items": public_items, "counts": counts, "busy": self.busy, "resumeAvailable": self.can_resume(run),
                 "hiddenRecordCount": sum(item['id'] in hidden for item in all_items),
@@ -677,16 +737,41 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
                                  "processes": len(self.worker_processes),
                                  "max": self.store.settings.get("maxLocalSlicingProcesses", 3),
                                  "revision": self.store.settings.get("processLimitRevision", 0),
-                                 "queued": sum(item.get("state") == "pending" and bool(item.get("path")) for item in items)},
+                                 "queued": sum(item.get("state") == "pending" and bool(item.get("path"))
+                                    and (not getattr(self, 'control', None) or self.control.allowed(item))
+                                    for item in self._effective_items(items))},
                 "sliceOutputDirectoryEffective": self.slice_output_directory(),
                 "outputOrganization": (self.output_organizer.state()
                                        if getattr(self, "output_organizer", None) and not
                                        (getattr(self, 'workspace', None) and self.workspace.enabled) else None),
-                "packages": self.packages.state()}
+                "packages": self.packages.state(summary=lean)}
+        if not lean:
+            return value
+        projected = slicing_view(value, summary=summary, day=records_day, page=page,
+                                 page_size=page_size, status=status, source=source, search=search)
+        if records_day is not None:
+            selected = {item['id']: item for item in projected['items']}
+            detailed = []
+            for item in items:
+                if item['id'] not in selected:
+                    continue
+                detail = {**item, **selected[item['id']], 'categories': {}}
+                for name, category in item.get('categories', {}).items():
+                    detail['categories'][name] = {
+                        **{key: value for key, value in category.items() if key not in
+                           {'preSubmitImageIds', 'preSubmitTaskIds', 'outputImageIds', 'fileVersion'}},
+                        **selected[item['id']]['categories'].get(name, {})}
+                detailed.append(detail)
+            details_by_id = {item['id']: item for item in detailed}
+            projected['items'] = [details_by_id[item['id']] for item in projected['items']]
+            projected['packages'] = self.packages.state(item_ids=set(selected))
+            if self.files:
+                projected['archive'] = self.files.state(paths={item.get('path') for item in detailed if item.get('path')})
+        return projected
 
     def queue_collection_recovery(self, *, video_id, revision, path, file_version, metadata, name, request_id):
         """Queue a local-only item without inventing a platform source-video ID."""
-        if not self.auth.connected:
+        if not self.auth.connected and not self.store.settings.get('localExport', True):
             raise AuditError(ERROR_TEXT["auth"], "auth", 401)
         targets = self.store.settings.get("targetDatasetIds") or {}
         if not all(str(targets.get(key) or "").isdigit() for key in ("27912", "27944")):
@@ -702,7 +787,7 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
         if existing:
             if existing.get("fileVersion") != file_version or existing.get("path") != str(path):
                 raise Conflict("恢复文件版本与已有切片记录不同；文件和进度均已保留。")
-            if existing.get("state") not in {"complete", "no_target", "attention"}:
+            if existing.get("state") not in {"complete", "no_target", "uncuttable", "attention"}:
                 return existing
             if existing.get("state") == "attention":
                 for category in existing.get("categories", {}).values():
@@ -833,10 +918,13 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
         if self.busy or self.store.settings.get("enabled") or self.start_lock.locked():
             raise Conflict("切片正在运行或停止中，请暂停并等待结束后再修改设置，已保存的进度会保留。")
         updates = {key: value for key, value in data.items() if key not in {"expectedRevision", "requestId"}}
-        updates.setdefault("maxLocalSlicingProcesses", 3)
+        current_limit = int(self.store.settings.get("maxLocalSlicingProcesses", 3))
+        updates.setdefault("maxLocalSlicingProcesses", current_limit)
         if (type(updates["maxLocalSlicingProcesses"]) is not int
                 or not 1 <= updates["maxLocalSlicingProcesses"] <= 8):
             raise ValueError("本地切片并行进程数需为1到8的整数。")
+        if updates["maxLocalSlicingProcesses"] != current_limit:
+            raise Conflict("进程数量已单独调整，请刷新设置；并行数量请在“切片与上传进程”修改。")
         for key in ("archiveCompletedDirectory", "archiveEmptyDirectory"):
             value = updates.get(key, self.store.settings[key])
             if value in {".", ".."} or "/" in value or "\\" in value:
@@ -929,10 +1017,19 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
 
     async def _scan(self, run_id):
         run = self.store.get("runs", run_id)
+        from .slicing_analysis import category_signature
+        def scan_version(item):
+            return (item.get('state'), item.get('revision'), item.get('runId'), item.get('fileVersion'),
+                    item.get('mediaGeneration'), item.get('collectionRevision'),
+                    {name: category_signature(value) for name, value in item.get('categories', {}).items()})
+        prior_versions = {item['id']: scan_version(item) for item in self.store.list('items')}
+        original_scope = list(run.get('items') or [])
+        scan_request_id = run.get('requestId')
         try:
             local, roots, issues = await asyncio.to_thread(scan_local_files, self.store.settings["directories"])
             if not roots and issues:
                 raise AuditError("视频目录暂不可用，等待原磁盘恢复。", "disk")
+            run = self.store.get('runs', run_id) or run
             run.update(localCount=len(local), directories=roots, issues=issues,
                        message="正在读取平台视频、切片任务及目标图片集…")
             self.store.save("runs", run)
@@ -1033,14 +1130,14 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
                 for source_identity in task.get("sourceVideoIds", []):
                     known_task_by_source.setdefault((task["datasetId"], source_identity), []).append(task)
             recovery_paths = {str(Path(row.get("path", "")).resolve()) for row in self.store.list("items")
-                              if row.get("collectionRecovery") and row.get("path")}
+                              if (row.get("collectionRecovery") or row.get('localWorkspace')) and row.get("path")}
             local_by_name = {}
             for row in local:
                 if str(Path(row["path"]).resolve()) in recovery_paths:
                     continue
                 local_by_name.setdefault(row["name"].casefold(), []).append(row)
             existing_items = {(str(item["sourceDatasetId"]), str(item["sourceVideoId"])): item
-                              for item in self.store.list("items") if not item.get("collectionRecovery")}
+                              for item in self.store.list("items") if not (item.get("collectionRecovery") or item.get('localWorkspace'))}
             candidates = []
             run["excluded"] = {"cut": 0, "active": 0, "complete": 0, "submitted": 0}
             for source_id, rows in all_remote.items():
@@ -1056,9 +1153,16 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
                         if prior.get('localCleanupState') == 'complete':
                             run['excluded']['complete'] += 1
                             continue
+                        changed_during_scan = prior_versions.get(prior['id']) != scan_version(prior)
+                        in_use = any(task and not task.done() for task in
+                                     (self.analysis_tasks.get(prior['id']), self.export_tasks.get(prior['id'])))
+                        if (changed_during_scan or in_use or prior.get('superseded')
+                                or (getattr(self, 'control', None) and not self.control.allowed(prior))):
+                            candidates.append((source_id, remote_video, prior, ''))
+                            continue
                         active_category = applicable_category(source_id)
                         for category_name, category in prior.get("categories", {}).items():
-                            if category_name != active_category and not _category_has_local_work(category):
+                            if category_name != active_category and not _uses_both_categories(prior) and not _category_has_local_work(category):
                                 category.update(state="not_applicable", errorCode="", message="此视频集不使用该类别模型。")
                             elif category_name == active_category and category.get("errorCode") == "frame_extract_failed":
                                 if category.get("intervals"):
@@ -1070,11 +1174,11 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
                                 prior.update(state="platform_processing", errorCode="", message="识别结果保留，正在重新导出并上传。")
                             else:
                                 prior.update(state="pending", errorCode="", message="抽帧修复后重新识别。")
-                        if source_id in unresolved_log_datasets and prior.get("state") not in {"complete", "no_target"}:
+                        if source_id in unresolved_log_datasets and prior.get("state") not in {"complete", "no_target", "uncuttable"}:
                             prior.update(state="attention", errorCode="task_log_unavailable",
                                          message="平台有切片任务日志无法读取，不能排除重复提交；核对平台任务后再处理。")
                             for category_name, category in prior.get("categories", {}).items():
-                                if category_name == active_category and category.get("state") not in {"complete", "no_target", "waiting", "submitting"}:
+                                if category_name == active_category and category.get("state") not in {"complete", "no_target", "uncuttable", "waiting", "submitting"}:
                                     category.update(state="attention", errorCode="task_log_unavailable",
                                                     message="平台切片任务日志无法核对，暂不自动提交。")
                             self.store.save("items", prior)
@@ -1092,7 +1196,7 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
                             prior["runId"] = run_id
                             prior["revision"] += 1
                             self.store.save("items", prior)
-                        if prior.get("state") not in {"complete", "attention", "no_target"}:
+                        if prior.get("state") not in {"complete", "attention", "no_target", "uncuttable"}:
                             run["excluded"]["submitted"] += 1
                         prior["runId"] = run_id
                         prior["settingsRevision"] = self.store.settings["revision"]
@@ -1132,21 +1236,33 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
                                                  "type": str(matched_job.get("type", ""))}
                         if task_state(matched_job) == "failed":
                             item["message"] = "此前平台切片任务失败，可在确认区间后单条重试。"
-                    self.store.save("items", item)
+                    concurrent = self.store.get('items', item['id'])
+                    if concurrent:
+                        item = concurrent
+                    else:
+                        self.store.save("items", item)
                     candidates.append((source_id, remote_video, item, name))
-            run.update(state="complete", message="扫描完成。请核对目标图片集和需要手动绑定的本地视频，再开始自动切片。",
-                       finishedAt=now_iso(), items=[item[2]["id"] for item in candidates], itemCount=len(candidates),
+            latest_run = self.store.get('runs', run_id) or run
+            scope = list(dict.fromkeys([*original_scope, *(latest_run.get('items') or []),
+                *(item['id'] for item in self.store.list('items') if item.get('runId') == run_id),
+                *(item[2]['id'] for item in candidates)]))
+            excluded = run['excluded']
+            run = latest_run
+            run.update(state='paused' if run.get('state') == 'paused' else 'complete',
+                       message="扫描完成。请核对目标图片集和需要手动绑定的本地视频，再开始自动切片。",
+                       finishedAt=now_iso(), items=scope, itemCount=len(scope), excluded=excluded,
+                       localCount=len(local), directories=roots, issues=issues,
                        targetDatasets=candidate_targets, taskLogIndex=log_index, taskLogLines=task_log_rows,
                        sourceCounts={key: len(value) for key, value in all_remote.items()})
             self.store.save("runs", run)
-            request = self.store.get("requests", run["requestId"])
+            request = self.store.get("requests", scan_request_id)
             if request:
                 request.update(state="complete", receiptRunId=run_id, receiptItemIds=list(run['items']))
                 self.store.save("requests", request)
-            self.store.settings["latestRunId"] = run_id
-            self.store.save_settings()
         except asyncio.CancelledError:
-            run.update(state="interrupted", message="扫描已暂停，之前的任务记录与抽样观察保留。")
+            run = self.store.get('runs', run_id) or run
+            run.update(state='paused' if run.get('state') == 'paused' else 'interrupted',
+                       message="扫描已暂停，之前的任务记录与抽样观察保留。")
             self.store.save("runs", run)
             raise
         except (AuditError, ValueError, OSError, TimeoutError) as error:
@@ -1230,7 +1346,7 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
 
     def _get_observation(self, key):
         observation = self.store.get("observations", key)
-        if observation and observation.get("code") in {"frame_extract_failed", "worker_stalled", "media_check_timeout", "observations_incomplete"}:
+        if observation and observation.get("code") in {"frame_extract_failed", "frame_timeout", "worker_stalled", "media_check_timeout", "observations_incomplete"}:
             return None
         return observation
 
@@ -1287,9 +1403,9 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
         if path_changed or changed_version:
             active_category = applicable_category(item["sourceDatasetId"])
             for category_name, category in item.get("categories", {}).items():
-                if category_name == active_category and category.get("state") == "attention" and category.get("errorCode") in _RETRYABLE_LOCAL_ERRORS:
+                if (category_name == active_category or _uses_both_categories(item)) and category.get("state") == "attention" and category.get("errorCode") in _RETRYABLE_LOCAL_ERRORS and not category.get('packageId'):
                     category.update(state="pending", errorCode="", message="已重新定位本地视频，将恢复抽帧识别。")
-                elif category_name != active_category and not category.get("taskId"):
+                elif category_name != active_category and not _uses_both_categories(item) and not _category_has_local_work(category):
                     category.update(state="not_applicable", errorCode="", message="此视频集不使用该类别模型。")
             item["updatedAt"] = now_iso()
             self.store.save("items", item)
@@ -1303,10 +1419,12 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
         metadata = item.get("metadata") or await asyncio.to_thread(
             ffprobe_file, item["path"], self.store.settings["frameToolPath"])
         item["metadata"] = metadata
-        self.store.save("items", item)
+        self._save_analysis_item(item)
         settings = self.store.settings
         active_category = applicable_category(item["sourceDatasetId"])
-        run_categories = ("bed", "magnet") if settings.get("sharedSampling", True) or item.get("collectionRecovery") else (active_category,)
+        run_categories = ("bed", "magnet") if settings.get("sharedSampling", True) or item.get("collectionRecovery") or item.get('localWorkspace') else (active_category,)
+        if item.get('localWorkspaceCategories'):
+            run_categories = tuple(name for name in item['localWorkspaceCategories'] if name in {'bed', 'magnet'})
         for name in run_categories:
             slot = item["categories"].setdefault(name, {"state": "pending", "intervals": []})
             if name != active_category and slot.get("state") == "not_applicable" and not slot.get("taskId"):
@@ -1315,12 +1433,20 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
         fingerprints = {}
         for category in run_categories:
             slot = item["categories"][category]
+            if any(slot.get(key) for key in ('taskId', 'operationId', 'packageId')):
+                continue
+            if slot.get('retryNotBefore', 0) > self.clock():
+                continue
             if slot.get("intervalSeconds") and slot.get("state") not in {"pending"}:
                 continue
-            if slot.get("state") in {"complete", "waiting", "submitting", "review", "queued", "uploading", "uploaded", "importing"}:
+            if slot.get("state") in {"attention", "complete", "waiting", "submitting", "review", "queued", "uploading", "uploaded", "importing"}:
                 continue
             intervals[category] = int(settings[f"{category}IntervalSeconds"] if not settings.get("sharedSampling", True) else settings["sampleIntervalSeconds"])
             fingerprints[category] = self._model_fingerprint(category)
+        if '_analysisOwned' in item:
+            stored = self.store.get('items', item['id']) or {}
+            for category in intervals:
+                item['_analysisOwned'].setdefault(category, category_signature(stored.get('categories', {}).get(category)))
         results = {}
         phase = "initial"
         for phase in ("initial", "refine"):
@@ -1330,6 +1456,8 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
             for category in active_categories:
                 sample_interval = 10 if phase == "refine" else intervals[category]
                 points = sample_points(float(metadata["duration"]), sample_interval, float(metadata.get("frameRate") or 25))
+                if phase == "refine":
+                    points = [point for point in points if not position_excluded(point, (item.get("decodeCoverage") or {}).get("exclusionIntervals", []))]
                 keys, missing = {}, []
                 for point in points:
                     key = self._observation_key(item, category, point, fingerprints[category])
@@ -1343,18 +1471,21 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
             for category in active_categories:
                 sample_interval = 10 if phase == "refine" else intervals[category]
                 results[category] = self._category_observations(item, category,
-                    sample_points(metadata["duration"], sample_interval, metadata.get("frameRate", 25)),
+                    list(keys_by_category.get(category, {})),
                     keys_by_category.get(category, {}), fingerprints[category])
+                record_decode_coverage(item, results[category], metadata["duration"])
             if phase == "initial":
                 magnet = results.get("magnet", [])
                 if "magnet" not in intervals:
                     break
                 unavailable = [row for row in magnet if row.get("code") == "decode_unavailable"]
                 valid_magnet = [row for row in magnet if row.get("code") != "decode_unavailable"]
+                if unavailable and not valid_magnet:
+                    break
                 initial_result = build_category_result(valid_magnet, interval=intervals["magnet"],
                     duration=metadata["duration"], positive_labels={"target"},
                     target=category_image_target(settings, "magnet"),
-                    undecodable_points=[row["time"] for row in unavailable] if item.get("partialRecovery") else ())
+                    exclusion_intervals=(item.get("decodeCoverage") or {}).get("exclusionIntervals", []))
                 if not (initial_result["estimatedImages"] < 100 or initial_result["estimatedImages"] > 200):
                     break
         analyzed = {}
@@ -1363,6 +1494,8 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
             refined = category == "magnet" and phase == "refine"
             expected_points = sample_points(metadata["duration"], 10 if refined else sample_interval,
                                             metadata.get("frameRate", 25))
+            if refined:
+                expected_points = [point for point in expected_points if not position_excluded(point, (item.get("decodeCoverage") or {}).get("exclusionIntervals", []))]
             partial = bool(item.get("partialRecovery"))
             unavailable = [row for row in observations if row.get("code") == "decode_unavailable"]
             valid = [row for row in observations if row.get("code") != "decode_unavailable"]
@@ -1371,7 +1504,7 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
             final_interval = 10 if refined else sample_interval
             result = build_category_result(valid, interval=final_interval, duration=metadata["duration"],
                 positive_labels={"target"}, target=category_image_target(settings, category),
-                undecodable_points=[row["time"] for row in unavailable] if partial else ())
+                exclusion_intervals=(item.get("decodeCoverage") or {}).get("exclusionIntervals", []))
             categories = item["categories"][category]
             categories.update(intervals=result["intervals"], intervalSeconds=result["intervalSeconds"],
                               estimatedImages=result["estimatedImages"], observations=len(valid),
@@ -1379,9 +1512,10 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
                               partialRecovery=partial, skippedSamples=len(unavailable))
             if categories.get("state") == "attention":
                 pass
-            elif partial and not valid:
-                categories.update(state="attention", errorCode="no_decodable_samples",
-                                  message=ERROR_TEXT["no_decodable_samples"])
+            elif partial and not valid and observations and len(observations) == len(expected_points):
+                categories.update(state="uncuttable", errorCode="", endReason="no_usable_frames",
+                                  processingConclusion=processing_conclusion(item, observations, "no_usable_frames"),
+                                  message="按配置抽样未找到可用画面，已结束；原片等待手动清理。")
             elif len(valid) + len(unavailable) != len(expected_points):
                 categories.update(state="attention", errorCode="observations_incomplete",
                                   message=ERROR_TEXT["observations_incomplete"])
@@ -1395,8 +1529,9 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
                     categories.update(state="attention", errorCode="no_cuttable_fragments",
                                       message=ERROR_TEXT["no_cuttable_fragments"])
                 else:
-                    categories.update(state="no_target", message=(
-                        "可解码片段未检出目标，损坏位置已跳过。" if partial else "未检出目标"))
+                    categories.update(state="no_target", errorCode="", endReason="no_target",
+                        processingConclusion=processing_conclusion(item, observations, "no_target"), message=(
+                        "可用画面未检出目标，已结束。" if partial else "未检出目标"))
             elif result["tooMany"] or (result["intervalSeconds"] is None and result["estimatedImages"] > 200):
                 categories.update(state="attention", errorCode="slice_limit", message=ERROR_TEXT["slice_limit"])
             elif categories.get("state") not in {"complete", "waiting", "submitting", "attention"}:
@@ -1405,7 +1540,7 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
                     "识别完成，准备核对平台任务槽位。"))
             target_key = "27912" if category == "bed" else "27944"
             categories["targetDatasetId"] = settings.get("targetDatasetIds", {}).get(target_key)
-        self.store.save("items", item)
+        self._save_analysis_item(item)
         return metadata
 
     def _category_observations(self, item, category, points, keys, model_fingerprint):
@@ -1414,7 +1549,7 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
             key = keys.get(point) or self._observation_key(item, category, point, model_fingerprint)
             observation = self._get_observation(key)
             if observation:
-                rows.append({key_name: observation[key_name] for key_name in ("time", "label", "score", "code", "width", "height", "quality") if key_name in observation})
+                rows.append({key_name: observation[key_name] for key_name in ("time", "label", "score", "code", "width", "height", "quality", "requestedTime", "actualTime", "decodeAttempts", "decodeReason") if key_name in observation})
         return sorted(rows, key=lambda row: row["time"])
 
     async def _run_worker(self, item, metadata, points, keys, phase):
@@ -1426,11 +1561,18 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
         if not Path(self.store.settings["frameToolPath"]).is_file():
             raise ValueError("worker_missing")
         request = {"filePath": item["path"], "frameToolPath": self.store.settings["frameToolPath"],
-                   "expectedFileVersion": item.get("fileVersion"),
+                   "expectedFileVersion": item.get("fileVersion"), 'metadata': metadata,
                    "settings": {key: self.store.settings[key] for key in (
                        "magnetDeployDirectory", "magnetModelPath", "bedDeployDirectory", "bedModelPath",
                         "bedGeometryPath", "magnetConfidence")}, "points": points}
-        request["skipUndecodableSamples"] = bool(item.get("partialRecovery"))
+        request["skipUndecodableSamples"] = True  # All approved local processing isolates bad positions.
+        verified_media = bool(item.get('fileVersion') and item.get('mediaVerifiedFileVersion') == item.get('fileVersion'))
+        if not verified_media and item.get('collectionVideoId') and getattr(self, 'control', None):
+            row = self.control.videos.store.get(item['collectionVideoId'])
+            version = self.control.videos.version(row, item.get('collectionRevision')) if row else None
+            verified_media = bool(version and version.get('state') == 'saved' and version.get('sha256')
+                                  and version.get('fileVersion') == item.get('fileVersion') and self.control.allowed(item))
+        request['verifiedMedia'] = verified_media
         with self._read_lease(item["path"]):
             process = await asyncio.create_subprocess_exec(python, "-B", "-m", "app.slicing_worker",
                 stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
@@ -1460,6 +1602,8 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
                     kind = event.get("event")
                     if kind == "stage":
                         item["analysisStage"] = event.get("stage")
+                        if event.get('stage') == 'loading_model' and request.get('verifiedMedia'):
+                            item['mediaVerifiedFileVersion'] = item.get('fileVersion')
                         item["analysisTotal"] = sum(len(values) for values in points.values())
                         item["analysisDone"] = 0
                         self._save_analysis_item(item)
@@ -1474,8 +1618,10 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
                                  "score": event.get("score"), "code": event.get("code", ""),
                                  "width": event.get("width"), "height": event.get("height"),
                                  "quality": event.get("quality"), "modelFingerprint": fingerprints[category],
+                                 **{name: event[name] for name in ("requestedTime", "actualTime", "decodeAttempts", "decodeReason") if name in event},
                                  "fileVersion": item["fileVersion"], "phase": phase}
                         self.store.save("observations", value)
+                        record_decode_coverage(item, [value], metadata["duration"])
                         observations += 1
                         item["progress"] = min(90, int(10 + 80 * observations / max(1, sum(len(v) for v in points.values()))))
                         item.update(analysisDone=observations, analysisPosition=timestamp)
@@ -1483,6 +1629,11 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
                     elif kind == "error":
                         failed.append({"category": event.get("category", "both"), "code": event.get("code", "inference_failed"),
                                        "stage": event.get("stage", "sampling"), "time": event.get("time")})
+                    elif kind == "complete":
+                        received = event.get("metadata") or {}
+                        metadata.update({key: received[key] for key in (
+                            "duration", "size", "width", "height", "frameRate", "streamStartTime") if key in received})
+                        item["metadata"] = metadata
                 if process.returncode is None and failed and any(f["code"] == "worker_stalled" for f in failed):
                     await self._stop_worker(process)
                 await process.wait()
@@ -1649,6 +1800,8 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
                 self._signal_worker(process)
         if self.scheduler_task and not self.scheduler_task.done():
             self.scheduler_task.cancel()
+        if self.platform_task and not self.platform_task.done():
+            self.platform_task.cancel()
         for task in self.analysis_tasks.values():
             if not task.done():
                 task.cancel()
@@ -1669,7 +1822,7 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
             raise Conflict("切片启动中，请等待操作完成。")
         if self.busy and not self.store.settings.get("enabled"):
             raise Conflict("上一条处理正在停止，请稍后继续。")
-        if not self.auth.connected:
+        if not self.auth.connected and not self.store.settings.get('localExport', True):
             raise AuditError("请先重新连接视觉AI平台，已保存进度保留。", "auth", 401)
         run = self.store.get("runs", self.store.settings.get("latestRunId"))
         if not run or run.get("state") not in {"paused", "interrupted", "waiting_connection", "running", "attention"}:
@@ -1686,7 +1839,13 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
         self.store.save_settings()
         workflow = self.store.settings.get("workflow")
         if workflow and (run.get("executeAll") or workflow.get("phase") == "scan"):
-            workflow["enabled"] = True
+            if (getattr(self, 'workspace', None) and self.workspace.enabled
+                    and self.store.settings.get('localExport', True)):
+                # Resume already journaled work immediately. A fresh platform
+                # inventory belongs to execute-all, not every local restart.
+                workflow.update(enabled=False, phase='local_processing')
+            else:
+                workflow["enabled"] = True
             self.store.save_settings()
         run.update(state="running", message="正在先对账已有平台任务，再继续队列。")
         self.run = run
@@ -1708,12 +1867,12 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
             raise Conflict("切片启动中，请等待操作完成。")
         if self.busy and not self.store.settings.get("enabled"):
             raise Conflict("上一条处理正在停止，请稍后重试。")
-        if not self.auth.connected:
+        if not self.auth.connected and not self.store.settings.get('localExport', True):
             raise AuditError(ERROR_TEXT["auth"], "auth", 401)
         if item.get("state") != "attention":
             raise Conflict("该视频状态已变化，请刷新后查看；不会重复识别或提交。")
-        if recover_decodable and item.get("errorCode") != "media_incomplete":
-            raise Conflict("仅可对末段无法解码的视频使用此恢复方式。")
+        if recover_decodable and item.get("errorCode") not in {"media_incomplete", "frame_extract_failed", "frame_timeout", "no_decodable_samples", "no_cuttable_fragments"}:
+            raise Conflict("只有已确认的媒体解码异常可以使用可用部分处理；环境或身份异常需先恢复。")
         run = self.store.get("runs", self.store.settings.get("latestRunId"))
         if not run or run.get("state") == "scanning":
             raise ValueError("请先完成平台视频扫描。")
@@ -1726,19 +1885,27 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
         active_category = applicable_category(item["sourceDatasetId"])
         output_retry = False
         uncertain_retry = False
+        needs_analysis = False
         for category_name, category in item["categories"].items():
-            if category_name == active_category and category.get("state") == "attention":
-                output_retry = bool(category.get("taskId") and category.get("errorCode") == "output_unverified")
-                uncertain_retry = bool(category.get("operationId") and category.get("errorCode") == "submit_uncertain")
+            applicable = category_name == active_category or _uses_both_categories(item)
+            if applicable and category.get("state") == "attention" and not category.get("packageId"):
+                output = bool(category.get("taskId") and category.get("errorCode") == "output_unverified")
+                uncertain = bool(category.get("operationId") and category.get("errorCode") == "submit_uncertain")
+                output_retry |= output
+                uncertain_retry |= uncertain
+                needs_analysis |= not output and not uncertain
                 archive_failed_attempt(category)
-                category.update(state="submitting" if uncertain_retry else "waiting" if output_retry else "pending", errorCode="",
-                    message="正在对账原提交，不重新发送。" if uncertain_retry else
-                            "继续核验已有平台任务的图片。" if output_retry else "已加入单条重试队列。")
-            elif category_name != active_category and not category.get("taskId"):
+                category.update(state="submitting" if uncertain else "waiting" if output else "pending", errorCode="",
+                    automaticRetries=0, retryNotBefore=0,
+                    message="正在对账原提交，不重新发送。" if uncertain else
+                            "继续核验已有平台任务的图片。" if output else "已加入单条重试队列。")
+            elif not applicable and not _category_has_local_work(category):
                 category.update(state="not_applicable", errorCode="", message="此视频集不使用该类别模型。")
+        if not (output_retry or uncertain_retry or needs_analysis):
+            raise Conflict("此条关联的照片包需要单独核对，未重新识别。")
         if not item.get("path") and not (output_retry or uncertain_retry):
             raise ValueError("请先绑定本地视频文件，再重试识别。")
-        item.update(state="platform_processing" if (output_retry or uncertain_retry) else "pending", errorCode="",
+        item.update(state="pending" if needs_analysis else "platform_processing", errorCode="", automaticRetries=0,
                     message="正在对账原提交，不重新发送。" if uncertain_retry else
                             "等待核验已有切片结果。" if output_retry else
                             "仅识别并提交可解码片段；无法解码的位置将跳过。" if recover_decodable else
@@ -1758,6 +1925,11 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
             self.store.save("runs", run)
             self.store.settings["enabled"] = True
             self.store.save_settings()
+        elif run.get('localRecoveryOnly') and identity not in (run.get('items') or []):
+            run['items'] = [*(run.get('items') or []), identity]
+            run['itemCount'] = len(run['items'])
+            self.store.save('runs', run)
+            self.run = run
         self._continue_after_manual_action()
         self._wake_scheduler()
         return self.state()
@@ -1930,6 +2102,22 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
 
     async def startup(self):
         await self._recover_moved_sources()
+        cache = self.store.settings.get('modelCache') or {}
+        if cache.get('manifestSha256'):
+            for item in self.store.list('items'):
+                if (item.get('state') != 'attention' or item.get('analysisStage') != 'loading_model'
+                        or item.get('analysisDone', 0) or item.get('modelInitRetryCache') == cache['manifestSha256']):
+                    continue
+                recovered = False
+                for category in item.get('categories', {}).values():
+                    if (category.get('state') == 'attention' and category.get('errorCode') == 'worker_failed'
+                            and not category.get('taskId') and not category.get('operationId') and not category.get('packageId')):
+                        category.update(state='pending', errorCode='', message='模型缓存已修复，继续识别。')
+                        recovered = True
+                if recovered:
+                    item.update(state='pending', errorCode='', modelInitRetryCache=cache['manifestSha256'],
+                                message='模型缓存已修复，继续已登记的原片。')
+                    self.store.save('items', item)
         if self.files:
             self.files.refresh()
         await self.packages.start()
@@ -1939,6 +2127,8 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
                 if legacy_layout(package):
                     package.update(errorCode="archive_layout", message="压缩包目录格式有误，原片保留；可修复格式后重传。")
                     self.packages._save(package)
+                else:
+                    self.packages.queue_verification_retry(package)
             self._package_changed(package)
         if self.store.settings.get("enabled"):
             self._wake_scheduler()
@@ -1954,7 +2144,7 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
                 active_category = ""
             if active_category:
                 for category_name, category in item.get("categories", {}).items():
-                    if category_name != active_category and not _category_has_local_work(category):
+                    if category_name != active_category and not _uses_both_categories(item) and not _category_has_local_work(category):
                         category.update(state="not_applicable", errorCode="", message="此视频集不使用该类别模型。")
             errors = {item.get("errorCode", "")} | {
                 category.get("errorCode", "") for category in item.get("categories", {}).values()
@@ -1985,7 +2175,7 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
                     continue
                 if category.get("intervals") and not category.get("packageId"):
                     category.update(state="ready", errorCode="", message="识别结果保留，重新导出照片并上传。")
-                elif category_name == active_category:
+                elif category_name == active_category or _uses_both_categories(item):
                     category.update(state="pending", errorCode="", message="原视频已重新定位，将恢复抽帧识别。")
             if any(category.get("state") == "ready" for category in item.get("categories", {}).values()):
                 item.update(state="platform_processing", errorCode="", message="识别结果保留，正在重新导出并上传。")
@@ -2007,10 +2197,14 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
 
     async def shutdown(self):
         self.stopping = True
+        if self.connection_task:
+            self.connection_task.cancel()
+            await asyncio.gather(self.connection_task, return_exceptions=True)
         await self.packages.shutdown()
         if self.files:
             await self.files.shutdown()
-        tasks = [self.scan_task, self.scheduler_task, *self.analysis_tasks.values(), *self.export_tasks.values()]
+        tasks = [self.scan_task, self.scheduler_task, self.platform_task, self.export_recovery_task,
+                 *self.analysis_tasks.values(), *self.export_tasks.values()]
         if self.analysis_task and self.analysis_task not in tasks:
             tasks.append(self.analysis_task)
         for task in tasks:
@@ -2057,32 +2251,98 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
 
     def _poll_timeout(self):
         """Idle queue stays at 30s. Platform cuts and filled slots are checked again in 8s."""
+        timeout = TICK_SECONDS
         for item in self._scope_run_items(self.store.list("items")):
+            for category in (item.get('categories') or {}).values():
+                deadline = category.get('retryNotBefore', 0)
+                if category.get('state') == 'pending' and deadline > self.clock():
+                    timeout = min(timeout, max(.1, deadline - self.clock()))
             if item.get("state") in {"waiting", "waiting_slot", "platform_processing"}:
-                return ACTIVE_TICK_SECONDS
+                timeout = min(timeout, ACTIVE_TICK_SECONDS)
             for category in (item.get("categories") or {}).values():
                 if isinstance(category, dict) and category.get("state") in {"waiting", "waiting_slot"}:
-                    return ACTIVE_TICK_SECONDS
-        return TICK_SECONDS
+                    timeout = min(timeout, ACTIVE_TICK_SECONDS)
+        return timeout
+
+    def _schedule_platform_work(self):
+        if (not self.auth.connected or self.stopping or not self.store.settings.get('enabled')
+                or (self.platform_task and not self.platform_task.done()) or self.clock() < self.platform_next_check):
+            return
+        workflow = self.store.settings.get('workflow') or {}
+        remote_pending = any(c.get('state') in {'waiting', 'submitting'} or
+            (not self.store.settings.get('localExport', True) and c.get('state') in {'ready', 'waiting_slot'})
+            for item in self._scope_run_items(self.store.list('items')) for c in item.get('categories', {}).values())
+        if not remote_pending and not (workflow.get('enabled') and workflow.get('phase') == 'scan'):
+            return
+        self.platform_task = asyncio.create_task(self._platform_step(), name='slicing-platform-stage')
+
+    async def _platform_step(self):
+        try:
+            workflow = self.store.settings.get('workflow') or {}
+            if workflow.get('enabled') and workflow.get('phase') == 'scan':
+                if not await self._workflow_scan():
+                    return
+            if not self.store.settings.get('enabled') or self.stopping:
+                return
+            if not self.store.settings.get('localExport', True):
+                for item in self._scope_run_items(self.store.list('items')):
+                    if (not item.get('collectionRecoveryPaused')
+                            and (not getattr(self, 'control', None) or self.control.allowed(item))
+                            and any(c.get('state') in {'ready', 'waiting_slot'} for c in item.get('categories', {}).values())):
+                        await self._submit_ready(item)
+            single = self.run.get('singleItemId') if self.run and self.run.get('singleMode') else None
+            await self._reconcile_waiting(single_item_id=single)
+        except asyncio.CancelledError:
+            raise
+        except (AuditError, OSError, ValueError) as error:
+            code = error.code if isinstance(error, AuditError) else 'network'
+            if self.run and not self._active_analysis_tasks() and not self.export_tasks:
+                current = self.store.get('runs', self.run['id']) or self.run
+                current.update(state='waiting_connection', message=ERROR_TEXT.get(code, '等待平台恢复，本地进度保留。'))
+                self.store.save('runs', current)
+                self.run = current
+        except Exception as error:
+            if self.run:
+                current = self.store.get('runs', self.run['id']) or self.run
+                current.update(platformFailure={'errorType': type(error).__name__, 'at': now_iso()},
+                               message='平台核对暂未完成，本地处理继续，已提交凭证保留。')
+                self.store.save('runs', current)
+        finally:
+            self.platform_next_check = self.clock() + ACTIVE_TICK_SECONDS
+            self.wake.set()
 
     async def _tick(self):
         if getattr(self, 'workspace', None) and self.workspace.blocked:
             return
-        if not self.auth.connected and self.store.settings.get("workflow", {}).get("enabled"):
-            await self.auth.restore_saved_connection()
-        if not self.auth.connected:
+        local_mode = self.store.settings.get('localExport', True)
+        if (not self.auth.connected and not getattr(self.auth, 'connection_managed', False)
+                and (self.store.settings.get('enabled') or self.store.settings.get("workflow", {}).get("enabled"))):
+            if local_mode:
+                # A slow login must not hold up already-bound local videos.
+                if (not self.connection_task or self.connection_task.done()) and self.clock() >= self.connection_retry_at:
+                    self.connection_retry_at = self.clock() + TICK_SECONDS
+                    async def reconnect():
+                        try:
+                            await self.auth.restore_saved_connection()
+                        except Exception:
+                            pass
+                        finally:
+                            if not self.stopping:
+                                self.wake.set()
+                    self.connection_task = asyncio.create_task(reconnect(), name='slice-reconnect')
+                    await asyncio.sleep(0)
+            else:
+                await self.auth.restore_saved_connection()
+        if not self.auth.connected and not local_mode:
             raise AuditError(ERROR_TEXT["auth"], "auth", 401)
+        self._start_export_environment_recovery()
         async with self.tick_lock:
             if getattr(self, "control", None):
                 self.control.refresh()
             workflow = self.store.settings.get("workflow") or {}
-            if workflow.get("enabled") and workflow.get("phase") == "scan":
-                if not await self._workflow_scan():
-                    return
             await self._restore_waiting_files()
             self._reap_analysis_tasks()
             single_item_id = self.run.get("singleItemId") if self.run and self.run.get("singleMode") else None
-            await self._reconcile_waiting(single_item_id=single_item_id)
             if self.run and self.run.get("pilotMode"):
                 target_ids = {str(value) for value in self.store.settings.get("targetDatasetIds", {}).values() if value}
                 done = set(self.run.get("pilotDoneTargets", []))
@@ -2097,20 +2357,16 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
             for item in submit_items:
                 if getattr(self, "control", None) and not self.control.allowed(item):
                     continue
-                if item.get("collectionRecoveryPaused"):
+                if item.get("collectionRecoveryPaused") or item.get('pipelinePaused'):
                     continue
                 if item.get('localCleanupState') == 'complete':
                     continue
-                if item.get("state") in {"excluded", "complete", "no_target", "analyzing"}:
+                if item.get("state") in {"excluded", "complete", "no_target", "uncuttable", "analyzing"}:
                     continue
                 if any(category.get("state") in {"ready", "waiting_slot"} for category in item.get("categories", {}).values()):
-                    local = self.store.settings.get("localExport", True) and (item.get("collectionRecovery") or not (
-                        self.run and (self.run.get("pilotMode") or self.run.get("singleMode")))
-                    )
+                    local = self.store.settings.get('localExport', True)
                     if local:
                         self._schedule_export(item)
-                    else:
-                        await self._submit_ready(item)
             # Local inference has its own bounded worker pool. Package uploads
             # run on SlicePackageManager's independent scheduler and are never
             # paused or throttled by this queue.
@@ -2127,17 +2383,22 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
                     break
                 if getattr(self, "control", None) and not self.control.allowed(item):
                     continue
-                if item.get("collectionRecoveryPaused"):
+                if item.get("collectionRecoveryPaused") or item.get('pipelinePaused'):
                     continue
-                if item.get("state") != "pending" or not item.get("path"):
+                if not self.pending_analysis(item) or not item.get("path"):
+                    continue
+                if self.leases.key(item['path']) in self.leases.writers:
+                    self.defer_occupied_file(item)
                     continue
                 video_key = self._analysis_video_key(item)
                 if video_key in reserved:
                     continue
+                active_source_pending = SOURCE.get(str(item.get('sourceDatasetId') or ''), {}).get('category') in self.pending_analysis(item)
                 item.update(state="analyzing", message="正在抽帧识别；平台切片任务与图片包上传独立运行。")
                 self.store.save("items", item)
                 task = asyncio.create_task(
-                    self.process_with_recovery(item) if item.get("collectionRecovery") else
+                    self.process_with_recovery(item) if (item.get("collectionRecovery") or item.get('localWorkspace')
+                        or not active_source_pending) else
                     self._process_shared(item, submit_items) if self.store.settings.get("sharedSampling")
                     else self.process_with_recovery(item), name="slice-analysis-" + item["id"])
                 self.analysis_tasks[item["id"]] = task
@@ -2147,10 +2408,13 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
                 task.add_done_callback(lambda finished, identity=item["id"]: self._analysis_finished(identity, finished))
                 reserved.add(video_key)
                 free_slots -= 1
+            # Admit local work before polling the platform. A slow remote job
+            # read can then run alongside extraction instead of blocking it.
+            self._schedule_platform_work()
             if self.files and (workflow.get("enabled") or single_item_id):
                 self.files.schedule(self.wake.set, item_id=single_item_id)
             items = self._scope_run_items(self.store.list("items"))
-            actionable = [item for item in items if not item.get("collectionRecoveryPaused")
+            actionable = [item for item in items if not item.get("collectionRecoveryPaused") and not item.get('pipelinePaused')
                           and (not getattr(self, "control", None) or self.control.allowed(item)) and (
                           item.get("state") in {"pending", "analyzing", "platform_processing", "waiting_connection"}
                           or any(category.get("state") in {"submitting", "waiting"} for category in item.get("categories", {}).values())
@@ -2159,22 +2423,31 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
                               for category in item.get("categories", {}).values())))]
             if self.run:
                 unresolved = [item for item in items if item.get("state") == "attention"]
-                paused = [item for item in items if item.get("collectionRecoveryPaused")]
+                paused = [item for item in items if item.get('collectionRecoveryPaused') or item.get('pipelinePaused')
+                          or (getattr(self, 'control', None) and
+                              (self.control.get(item.get('mediaId', '')) or {}).get('paused'))]
                 if not actionable and paused:
                     self.run.update(state="paused", message=f"{len(paused)} 条恢复已暂停；其余自动处理已结束。")
                     self.store.settings["enabled"] = False
                     self.store.save_settings()
                     self.store.save("runs", self.run)
                     return
-                if actionable:
-                    self.run.update(state="running", message=f"队列处理中：{len(actionable)} 条仍可自动继续，{len(unresolved)} 条待核对。")
+                scan_waiting = workflow.get('enabled') and workflow.get('phase') == 'scan'
+                platform_busy = self.platform_task and not self.platform_task.done()
+                file_recovery_busy = self.export_recovery_task and not self.export_recovery_task.done()
+                if actionable or scan_waiting or platform_busy or file_recovery_busy:
+                    if not self.auth.connected and not self._active_analysis_tasks() and not self.export_tasks:
+                        self.run.update(state='waiting_connection', message='本地可处理部分已继续；等待平台恢复后核对并导入照片。')
+                    else:
+                        self.run.update(state="running", message=f"队列处理中：{len(actionable)} 条仍可自动继续，{len(unresolved)} 条待核对。")
                 else:
                     if single_item_id:
                         selected = items[0] if items else {}
-                        selected_complete = selected.get("state") in {"complete", "no_target"}
+                        selected_complete = selected.get("state") in {"complete", "no_target", "uncuttable"}
                         no_target = selected.get("state") == "no_target"
                         self.run.update(state="complete" if selected_complete else "attention",
-                            message=(f"单条识别结束：{selected.get('name', single_item_id)} 未检出目标，未提交切片任务。" if no_target else
+                            message=(f"单条处理结束：{selected.get('name', single_item_id)} 按配置抽样未找到可用画面。" if selected.get("state") == "uncuttable" else
+                                     f"单条识别结束：{selected.get('name', single_item_id)} 未检出目标，未提交切片任务。" if no_target else
                                      f"单条试切已结束：{selected.get('name', single_item_id)} 已完成并核验。" if selected_complete
                                      else f"单条试切需人工处理：{selected.get('name', single_item_id)}；其他视频未启动。"))
                         self.run["singleFinishedAt"] = now_iso()
@@ -2196,23 +2469,43 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
 
     async def _process_item(self, item):
         guard = ExitStack()
+        aborted = False
+        identity_fence = (item.get('mediaId'), item.get('mediaGeneration', 0), item.get('collectionRevision'))
         try:
             if getattr(self, "control", None):
                 self.control.claim(item)
             await self._refresh_local_binding(item)
-            guard.enter_context(self._read_lease(item["path"]))
+            stored = self.store.get('items', item['id'])
+            if stored:
+                if (stored.get('superseded') or identity_fence !=
+                        (stored.get('mediaId'), stored.get('mediaGeneration', 0), stored.get('collectionRevision'))):
+                    aborted = True
+                    return
+                item.clear(); item.update(stored)
+            item['_analysisFence'] = (copy.deepcopy(item.get('fileVersion')), item.get('mediaGeneration', 0), item.get('collectionRevision'), item.get('path'))
+            item['_analysisOwned'] = {name: category_signature(category) for name, category in item.get('categories', {}).items()
+                                      if category.get('state') == 'pending' and not any(category.get(key)
+                                          for key in ('taskId', 'operationId', 'packageId'))}
+            try:
+                guard.enter_context(self._read_lease(item["path"]))
+            except ValueError:
+                if self.leases.key(item['path']) not in self.leases.writers:
+                    raise
+                self.defer_occupied_file(item)
+                return
             item.update(state="analyzing", message="正在按来源视频集运行对应模型并抽帧识别。")
-            self.store.save("items", item)
+            self._save_analysis_item(item)
             item["metadata"] = await self._analyze_item(item)
             pending = [c for c in item["categories"].values() if c.get("state") == "pending"]
             if pending:
-                item.update(state="pending", errorCode="worker_failed", message=ERROR_TEXT["inference_failed"])
-            elif all(c.get("state") in {"no_target", "complete", "not_applicable"} for c in item["categories"].values()):
-                no_target = item["categories"][applicable_category(item["sourceDatasetId"])].get("state") == "no_target"
-                item.update(state="no_target" if no_target else "complete", errorCode="", progress=100,
-                            message="未检出目标，未提交切片任务。" if no_target else "切片任务已完成并核验。")
+                retry_waiting = any(c.get('retryNotBefore', 0) > self.clock() for c in pending)
+                item.update(state="pending", errorCode='',
+                            message='等待已登记的自动重试。' if retry_waiting else '继续剩余类别识别，已有成果保留。')
+            elif all(c.get("state") in {"no_target", "complete", "uncuttable", "not_applicable"} for c in item["categories"].values()):
+                no_target = not any(c.get('state') == 'complete' for c in item['categories'].values())
+                self._set_terminal_outcome(item)
             elif any(c.get("state") == "attention" for c in item["categories"].values()):
-                category = item["categories"][applicable_category(item["sourceDatasetId"])]
+                category = next(c for c in item['categories'].values() if c.get('state') == 'attention')
                 item.update(state="attention", errorCode=category.get("errorCode", ""),
                             message=category.get("message") or "本条需要核对，其他视频可独立继续。")
             else:
@@ -2237,12 +2530,16 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
             raise
         finally:
             guard.close()
-            if item.get("id"):
-                stored = self.store.get("items", item["id"])
-                if stored and "collectionRecoveryPaused" in stored:
-                    item["collectionRecoveryPaused"] = stored["collectionRecoveryPaused"]
-                revision_after_outcome(stored, item, outcome_changed(stored, item))
-                self.store.save("items", item)
+            if item.get("id") and not aborted:
+                if '_analysisOwned' in item:
+                    item['_analysisFinal'] = True
+                    self._save_analysis_item(item)
+                else:
+                    stored = self.store.get("items", item["id"])
+                    if stored and "collectionRecoveryPaused" in stored:
+                        item["collectionRecoveryPaused"] = stored["collectionRecoveryPaused"]
+                    revision_after_outcome(stored, item, outcome_changed(stored, item))
+                    self.store.save("items", item)
 
     async def _jobs_for_all_sources(self):
         queries = [(source_id, kind) for source_id in SOURCE for kind in ("21", "22")]
@@ -2253,33 +2550,67 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
         return result
 
     def _image_progress(self, item, category, phase):
+        baseline = copy.deepcopy(item)
         def update(progress):
             category["imageQueryProgress"] = {**progress, "phase": phase}
             total = progress.get("total")
             count = f"{progress['read']} / {total}" if total is not None else str(progress["read"])
             category["message"] = f"{phase}：已读取本视频相关图片 {count} 张。"
-            self.store.save("items", item)
+            self._save_category_progress(item, baseline)
         return update
 
-    def _save_category_progress(self, item, baseline=None):
+    @staticmethod
+    def _set_terminal_outcome(item):
         categories = list(item.get("categories", {}).values())
-        if categories and all(c.get("state") in {"complete", "no_target", "not_applicable"} for c in categories):
-            no_target = not any(c.get("state") == "complete" for c in categories)
-            item.update(state="no_target" if no_target else "complete", errorCode="", progress=100,
-                message="未检出目标，未提交切片任务。" if no_target else "切片任务完成，目标图片已核验。")
+        if any(category.get("state") == "complete" for category in categories):
+            outcome = "partial_complete" if item.get("partialRecovery") else "complete"
+            state = "complete"
+            message = "可用部分已处理，照片已导入核验。" if outcome == "partial_complete" else "处理完成，照片已导入核验。"
+        elif any(category.get("state") == "uncuttable" for category in categories):
+            state, outcome, message = "uncuttable", "no_usable_frames", "按配置抽样未找到可用画面，已结束；等待手动清理。"
+        else:
+            state, outcome, message = "no_target", "no_target", "未检出目标，已结束；等待手动清理。"
+        item.update(state=state, endReason=outcome, errorCode="", progress=100, message=message)
+
+    def _save_category_progress(self, item, baseline=None):
+        if baseline is not None and item.get('id'):
+            from .slicing_analysis import category_signature
+            latest = self.store.get('items', item['id'])
+            if (not latest or latest.get('superseded')
+                    or latest.get('mediaGeneration', 0) != baseline.get('mediaGeneration', 0)
+                    or latest.get('collectionRevision') != baseline.get('collectionRevision')):
+                return
+            merged = copy.deepcopy(latest)
+            for name, category in item.get('categories', {}).items():
+                before = baseline.get('categories', {}).get(name, {})
+                current = latest.get('categories', {}).get(name, {})
+                own_operation = bool(category.get('operationId') and category.get('operationId') == current.get('operationId')
+                    and current.get('state') not in {'complete', 'attention'}
+                    and (not current.get('taskId') or current.get('taskId') == category.get('taskId')))
+                if category_signature(before) == category_signature(current) or own_operation:
+                    merged.setdefault('categories', {})[name] = copy.deepcopy(category)
+            item = merged
+        categories = list(item.get("categories", {}).values())
+        if categories and all(c.get("state") in {"complete", "no_target", "uncuttable", "not_applicable"} for c in categories):
+            self._set_terminal_outcome(item)
         elif any(c.get("state") == "attention" for c in categories):
             failure = next(c for c in categories if c.get("state") == "attention")
             item.update(state="attention", errorCode=failure.get("errorCode", ""),
                         message=failure.get("message") or "本条需要核对；其他视频可独立继续。")
-        elif categories and all(c.get("state") in {"pilot_deferred", "complete", "no_target", "not_applicable"} for c in categories):
+        elif categories and all(c.get("state") in {"pilot_deferred", "complete", "no_target", "uncuttable", "not_applicable"} for c in categories):
             item.update(state="pilot_deferred", errorCode="", message="该类别已通过试切，等待开放批量切片。")
         elif any(c.get("state") == "review" for c in categories):
             item.update(state="review", errorCode="", message="请查看切片照片后再上传。")
+        elif any(c.get('state') == 'pending' for c in categories):
+            item.update(state='pending', errorCode='', message='剩余类别将继续识别，照片上传独立运行。')
         elif any(c.get("state") in {"queued", "uploading", "uploaded", "importing", "submitting"} for c in categories):
             item.update(state="platform_processing", errorCode="", message="切片压缩包正在上传或等待导入。")
+        elif any(c.get('state') == 'waiting_connection' and c.get('waitStage') == 'export' for c in categories):
+            item.update(state='waiting_connection', errorCode='', waitCode='frame_io_error',
+                        message='等待原片读取恢复，已有识别和照片成果保留。')
         else:
             item.update(state="platform_processing", errorCode="", message="平台切片处理中，原视频保留。")
-        previous = baseline if baseline is not None else (self.store.get("items", item["id"]) if item.get("id") else None)
+        previous = self.store.get("items", item["id"]) if item.get("id") else None
         revision_after_outcome(previous, item, outcome_changed(previous, item))
         self.store.save("items", item)
 
@@ -2296,6 +2627,7 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
             return
         jobs = None
         for item in waiting:
+            baseline_item = copy.deepcopy(item)
             for category_name, category in item["categories"].items():
                 if category.get("state") not in {"waiting", "submitting"}:
                     continue
@@ -2347,7 +2679,7 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
                         self.store.save("operations", operation)
                 elif status == "complete":
                     category.update(message="平台已完成，正在核验本视频生成的图片。")
-                    self.store.save("items", item)
+                    self._save_category_progress(item, baseline_item)
                     try:
                         image_rows = await self.remote.image_rows(category["targetDatasetId"],
                             prefix=category.get("prefix") or None,
@@ -2377,7 +2709,7 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
                                 self.store.save("runs", self.run)
                         else:
                             category.update(state="attention", errorCode="output_unverified", message=ERROR_TEXT["output_unverified"])
-            self._save_category_progress(item)
+            self._save_category_progress(item, baseline_item)
 
     def _bind_platform_job(self, item, job):
         """Show an in-progress platform cut in the unsliced list without creating another task."""
@@ -2464,29 +2796,81 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
         return label if label == "target" else "other"
 
     async def _read_export_frame(self, item, stamp):
-        # The exporter holds a read lease and checks the full version before
-        # and after extraction; rereading file edges for every JPEG is redundant.
-        partial = bool(item.get("partialRecovery"))
+        # Production files are version-bound. Use exactly the same bounded
+        # position decoder as recognition; no skipped-ahead JPEG is published.
+        exclusions = (item.get("decodeCoverage") or {}).get("exclusionIntervals", [])
+        if position_excluded(float(stamp), exclusions):
+            return None
+        if self.slice_reader is read_jpeg and item.get("fileVersion"):
+            from .frame_decode import decode_position
+            metadata = item.get("metadata") or {}
+            if "streamStartTime" not in metadata:
+                metadata = await finish_io(ffprobe_file, item["path"], self.store.settings["frameToolPath"])
+                item["metadata"] = metadata
+            try:
+                decoded = await finish_io(decode_position, item["path"], self.store.settings["frameToolPath"],
+                    stamp, metadata, expected=item["fileVersion"], quality=3)
+            except RuntimeError as error:
+                if str(error) == 'frame_io_error':
+                    item['_exportEnvironmentPosition'] = float(stamp)
+                raise
+            rate = float(metadata.get("frameRate") or 25)
+            if (decoded.image is None and decoded.reason == "decode_unavailable"
+                    and math.isfinite(rate) and rate > 0
+                    and 0 <= float(metadata["duration"]) - float(stamp) <= 1 / rate + .001):
+                # Container duration can extend just beyond its final PTS.
+                # Preserve the established normal-video behavior: omit that
+                # nonexistent grid point, without reporting media corruption.
+                item.setdefault("exportDecodeObservations", {})[str(round(float(stamp), 6))] = {
+                    "time": float(stamp), "code": "eof_no_frame", **decoded.observation()}
+                return None
+            evidence = {"time": float(stamp), "code": "" if decoded.image is not None else "decode_unavailable",
+                        **decoded.observation()}
+            record_decode_coverage(item, [evidence], float(metadata["duration"]))
+            item.setdefault("exportDecodeObservations", {})[str(round(float(stamp), 6))] = evidence
+            if decoded.image is None and item.get("id"):
+                # A restart must not spend another minute on the same damaged
+                # position. Merge evidence only; do not overwrite photo callbacks.
+                current = self.store.get("items", item["id"])
+                if (current and not current.get("superseded") and current.get("fileVersion") == item.get("fileVersion")
+                        and current.get("mediaGeneration", 0) == item.get("mediaGeneration", 0)
+                        and current.get("collectionRevision") == item.get("collectionRevision")):
+                    record_decode_coverage(current, [evidence], float(metadata["duration"]))
+                    current.setdefault("exportDecodeObservations", {})[str(round(float(stamp), 6))] = evidence
+                    self.store.save("items", current)
+            return decoded.image
+        # Injected readers are used by isolated protocol tests and older
+        # adapters. Keep their explicit tool/IO failures; tolerate media faults
+        # only when the real source has an independently verifiable version.
+        partial = bool(item.get("partialRecovery") or item.get("fileVersion"))
         for attempt in range(2 if partial else 1):
             try:
-                if self.slice_reader is read_jpeg:
-                    blob = await finish_io(self.slice_reader, item["path"],
-                        self.store.settings["frameToolPath"], stamp, 30 if partial else 60)
-                else:
-                    blob = await finish_io(self.slice_reader, item["path"],
-                        self.store.settings["frameToolPath"], stamp)
-                return blob
+                return await finish_io(self.slice_reader, item["path"], self.store.settings["frameToolPath"], stamp)
             except RuntimeError as error:
                 code = str(error)
                 if not partial:
                     if code == "decode_unavailable":
+                        metadata = item.get("metadata") or {}
+                        duration = float(metadata.get("duration") or 0)
+                        frame_rate = float(metadata.get("frameRate") or 25)
+                        if (math.isfinite(frame_rate) and frame_rate > 0 and duration > 0
+                                and 0 <= duration - float(stamp) <= 1 / frame_rate + .001):
+                            return None
                         raise RuntimeError("frame_extract_failed") from None
                     raise
-                if code in {"frame_timeout", "frame_tool_error", "frame_io_error"}:
+                if code not in {"decode_unavailable", "frame_timeout"}:
                     raise
-                if code != "decode_unavailable":
+                if item.get("fileVersion"):
+                    from .frame_decode import check_source
+                    await finish_io(check_source, item["path"], item["fileVersion"], edges=True)
+                elif code == "frame_timeout":
                     raise
                 if attempt == 1:
+                    if item.get("fileVersion") and item.get("metadata", {}).get("duration"):
+                        evidence = {"time": float(stamp), "code": "decode_unavailable", "requestedTime": float(stamp),
+                                    "actualTime": None, "decodeAttempts": 2, "decodeReason": code}
+                        record_decode_coverage(item, [evidence], float(item["metadata"]["duration"]))
+                        item.setdefault("exportDecodeObservations", {})[str(round(float(stamp), 6))] = evidence
                     return None
         return None
 
@@ -2500,15 +2884,28 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
         settings = {key: self.store.settings.get(key) for key in (
             "magnetDeployDirectory", "magnetModelPath", "magnetConfidence")}
         process = subprocess.Popen([python, "-B", "-m", "app.magnet_export"],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, cwd=str(ROOT), text=True)
-        process.stdin.write(json.dumps({"settings": settings}) + "\n")
-        process.stdin.flush()
-        payload = json.loads(process.stdout.readline() or "{}")
-        if not payload.get("ready"):
-            process.kill()
-            raise RuntimeError(payload.get("code") or "magnet_model_missing")
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, cwd=str(ROOT))
+        send_request(process, {"settings": settings})
+        payload = read_reply(process)
+        if not isinstance(payload, dict) or payload.get("ready") is not True:
+            abort_inference(process)
+            raise RuntimeError((payload.get("code") or "magnet_model_missing")
+                               if isinstance(payload, dict) else "inference_failed")
 
         def label(blob):
+            if payload.get('jpegBytes'):
+                if (not isinstance(blob, bytes) or not 0 < len(blob) <= MAX_JPEG_BYTES
+                        or not blob.startswith(b'\xff\xd8') or not blob.endswith(b'\xff\xd9')):
+                    abort_inference(process)
+                    raise RuntimeError('inference_failed')
+                send_request(process, {'jpegBytes': len(blob)}, blob)
+                labels = read_reply(process)
+                if (not isinstance(labels, list) or len(labels) != 1 or not isinstance(labels[0], str)
+                        or labels[0] not in {'target', 'other'}):
+                    abort_inference(process)
+                    raise RuntimeError('inference_failed')
+                return labels[0]
+            # Keep older packaged inference workers compatible during update.
             cache = None
             if getattr(self, 'workspace', None) and self.workspace.enabled:
                 cache = self.workspace.require_root() / '.缓存' / '识别'
@@ -2516,26 +2913,40 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
             with tempfile.TemporaryDirectory(dir=cache) as folder:
                 path = Path(folder) / "frame.jpg"
                 path.write_bytes(blob)
-                process.stdin.write(json.dumps({"paths": [str(path)]}) + "\n")
-                process.stdin.flush()
-                labels = json.loads(process.stdout.readline() or "[]")
-            if not labels:
+                send_request(process, {"paths": [str(path)]})
+                labels = read_reply(process)
+            if (not isinstance(labels, list) or len(labels) != 1 or not isinstance(labels[0], str)
+                    or labels[0] not in {'target', 'other'}):
+                abort_inference(process)
                 raise RuntimeError("inference_failed")
             return labels[0]
 
         def close():
             try:
-                process.stdin.write(json.dumps({"stop": True}) + "\n")
-                process.stdin.flush()
+                send_request(process, {"stop": True})
                 process.wait(timeout=30)
             except Exception:
                 process.kill()
+                process.wait(timeout=30)
+            finally:
+                process.stdin.close()
+                process.stdout.close()
         label.close = close
         return label
 
     async def _recognized_magnet_frames(self, item, points):
-        labeler = await asyncio.to_thread(self._open_magnet_labeler)
+        opening = asyncio.create_task(asyncio.to_thread(self._open_magnet_labeler))
+        labeler = None
         try:
+            try:
+                labeler = await asyncio.shield(opening)
+            except asyncio.CancelledError:
+                # Loading owns a process too. Its pipe has a bounded deadline;
+                # retain the source lease until the resulting worker is closed.
+                outcome = await asyncio.gather(opening, return_exceptions=True)
+                if outcome and callable(outcome[0]):
+                    labeler = outcome[0]
+                raise
             samples = []
             frames = {}
 
@@ -2544,7 +2955,9 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
                 if blob is None:
                     samples.append((stamp, "unavailable"))
                     return
-                label = await asyncio.to_thread(self._magnet_label, blob, labeler)
+                # A pause must finish the in-flight model message before the
+                # finally block closes that worker's pipes.
+                label = await finish_io(self._magnet_label, blob, labeler)
                 samples.append((stamp, label))
                 if label == "target":
                     frames[round(float(stamp), 3)] = blob
@@ -2564,12 +2977,13 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
                             continue
                         await consider(stamp)
                 gap = step
+            item["lastMagnetExportSamples"] = [{"time": stamp, "label": label, "code": "decode_unavailable" if label == "unavailable" else ""} for stamp, label in samples]
             chosen = select_recognized_frames(samples, target=target, maximum=200)
             return [(stamp, frames[stamp]) for stamp in chosen if stamp in frames]
         finally:
             closer = getattr(labeler, "close", None)
             if closer:
-                await asyncio.to_thread(closer)
+                await finish_io(closer)
 
     async def _export_ready(self, item):
         names = [name for name, category in (item.get("categories") or {}).items()
@@ -2620,6 +3034,9 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
         # Merge only this category into the latest row, preserving those receipts.
         current = self.store.get("items", item["id"]) or copy.deepcopy(item)
         current["categories"][category_name] = copy.deepcopy(item["categories"][category_name])
+        for field in ("decodeCoverage", "exportDecodeObservations", "partialRecovery"):
+            if field in item:
+                current[field] = copy.deepcopy(item[field])
         item.clear()
         item.update(current)
         self._save_category_progress(item)
@@ -2630,7 +3047,7 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
         category = item["categories"].get(category_name, {})
         if category.get("state") not in {"ready", "waiting_slot"} or category.get("packageId"):
             return
-        existing = None if item.get("collectionRecovery") else self.packages.store.find(
+        existing = None if item.get("collectionRecovery") or item.get('localWorkspace') else self.packages.store.find(
             str(item["sourceDatasetId"]), item.get("sourceVideoId"), category_name)
         if not existing and item.get("path"):
             version = await asyncio.to_thread(source_fingerprint, Path(item["path"]))
@@ -2662,16 +3079,19 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
                 if not recognized:
                     if await asyncio.to_thread(source_version, item["path"]) != source_before:
                         raise ValueError("local_video_changed")
-                    if item.get("partialRecovery"):
-                        category.update(state="attention", errorCode="no_cuttable_fragments",
-                                        message=ERROR_TEXT["no_cuttable_fragments"], skippedExportFrames=len(points))
-                    else:
-                        category.update(state="no_target", message="未检出磁盘吊，没有可保存的照片。")
+                    samples = item.get("lastMagnetExportSamples") or []
+                    usable = any(row.get("code") != "decode_unavailable" for row in samples)
+                    outcome = "no_target" if usable else "no_usable_frames"
+                    category.update(state="no_target" if usable else "uncuttable", errorCode="", endReason=outcome,
+                        processingConclusion=processing_conclusion(item, samples, outcome),
+                        message="可用画面未检出磁盘吊。" if usable else "导出位置均无法解码，已结束；原片等待手动清理。",
+                        skippedExportFrames=sum(row.get("code") == "decode_unavailable" for row in samples))
                     self._save_export_progress(item, category_name)
                     return
                 export_points = [stamp for stamp, _ in recognized]
                 frames = [blob for _, blob in recognized]
-                skipped_export = max(0, len(points) - len(recognized))
+                skipped_export = sum(row.get("code") == "decode_unavailable"
+                                     for row in item.get("lastMagnetExportSamples") or [])
             else:
                 frames = []
                 export_points = []
@@ -2686,10 +3106,10 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
                 if not frames:
                     if await asyncio.to_thread(source_version, item["path"]) != source_before:
                         raise ValueError("local_video_changed")
-                    category.update(state="attention" if item.get("partialRecovery") else "attention",
-                                    errorCode="no_cuttable_fragments" if item.get("partialRecovery") else "frame_extract_failed",
-                                    message=ERROR_TEXT["no_cuttable_fragments"] if item.get("partialRecovery") else ERROR_TEXT["frame_extract_failed"],
-                                    skippedExportFrames=skipped_export)
+                    evidence = [{"time": stamp, "code": "decode_unavailable"} for stamp in points]
+                    category.update(state="uncuttable", errorCode="", endReason="no_usable_frames",
+                        processingConclusion=processing_conclusion(item, evidence, "no_usable_frames"),
+                        message="导出位置均无法解码，已结束；原片等待手动清理。", skippedExportFrames=skipped_export)
                     self._save_export_progress(item, category_name)
                     return
             export_identity = await asyncio.to_thread(photo_export_identity, item, category_name, export_points, frames)
@@ -2717,11 +3137,17 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
                 cancelled_after_publish = True
         except (OSError, RuntimeError, ValueError) as error:
             code = str(error) if str(error) in ERROR_TEXT else "frame_extract_failed"
-            category.update(state="attention", errorCode=code, message=ERROR_TEXT.get(code, ERROR_TEXT["frame_extract_failed"]))
+            if code == 'frame_io_error':
+                category.update(state='waiting_connection', errorCode='', waitCode=code,
+                    waitStage='export', retryNotBefore=self.clock() + 30,
+                    exportEnvironmentPosition=item.pop('_exportEnvironmentPosition', None),
+                    recoveryDisposition='waiting', message='等待原片读取恢复，再继续导出；已有成果保留。')
+            else:
+                category.update(state="attention", errorCode=code, message=ERROR_TEXT.get(code, ERROR_TEXT["frame_extract_failed"]))
             self._save_export_progress(item, category_name)
             return
         # Bed exports are already accepted and can upload immediately. Magnet stays for review.
-        review = category_name == "magnet" and bool(self.store.settings.get("reviewBeforeUpload", True))
+        review = category_name == "magnet" and bool(self.store.settings.get("reviewBeforeUpload", True)) and not item.get("finalProcessingIntent")
         package_source_id = item.get("sourceIdentity") or item["sourceVideoId"]
         record = {"id": package_identity(item["sourceDatasetId"], package_source_id, category_name),
                   "dataset": PACKAGE_DATASETS[category_name], "category": category_name,
@@ -2736,7 +3162,11 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
                   "message": "请查看切片照片后再上传。" if review else "正在排队上传切片压缩包。"}
         saved = self.packages.remember(record)
         category.update(packageId=saved["id"], imageCount=saved["imageCount"],
-                        skippedExportFrames=skipped_export if item.get("partialRecovery") else 0,
+                        skippedExportFrames=skipped_export,
+                        partialRecovery=bool(item.get("partialRecovery")),
+                        exportedPositions=[{"requestedTime": point, "actualTime": (
+                            item.get("exportDecodeObservations", {}).get(str(round(float(point), 6)), {}).get("actualTime"))}
+                            for point in export_points],
                         exportedImages=len(names),
                         state="review" if saved.get("state") == "review" else "queued", message=saved["message"])
         self._save_export_progress(item, category_name)
@@ -2745,7 +3175,13 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
             raise asyncio.CancelledError
 
     def _package_changed(self, package):
-        for item in self.store.list("items"):
+        # Reconcile only the exact package references, including shared-result
+        # mirrors. Startup must not decode every source for every old package.
+        rows = self.store.db.execute("""SELECT payload FROM simple_slicing_items WHERE EXISTS (
+            SELECT 1 FROM json_each(simple_slicing_items.payload,'$.categories')
+            WHERE json_extract(value,'$.packageId')=?) ORDER BY rowid""", (package['id'],)).fetchall()
+        for (raw,) in rows:
+            item = json.loads(raw)
             if item.get("state") == "analyzing":
                 continue
             changed = False
@@ -2875,6 +3311,13 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
                 continue
             if getattr(self, "control", None) and not self.control.allowed(self.store.get("items", item["id"]) or item):
                 return
+            from .slicing_analysis import category_signature
+            latest = self.store.get('items', item['id'])
+            if (not latest or latest.get('superseded')
+                    or latest.get('mediaGeneration', 0) != outcome_baseline.get('mediaGeneration', 0)
+                    or category_signature(latest.get('categories', {}).get(category_name, {})) !=
+                       category_signature(outcome_baseline.get('categories', {}).get(category_name, {}))):
+                continue
             operation = {"id": operation_id, "state": "submitting", "requestId": uuid4().hex,
                          "sourceDatasetId": source_id, "sourceVideoId": item["sourceVideoId"], "targetDatasetId": target_id,
                          "type": 21, "preSubmitTaskIds": sorted(str(job["id"]) for rows in jobs.values() for job in rows),
@@ -2885,7 +3328,7 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
             category.update(state="submitting", operationId=operation_id, targetDatasetId=target_id,
                             preSubmitTaskIds=operation["preSubmitTaskIds"], preSubmitImageIds=baseline, prefix=prefix,
                             message="已保存提交前快照，正在提交唯一的21类手动切片任务。")
-            self.store.save("items", item)
+            self._save_category_progress(item, outcome_baseline)
             try:
                 result = await self.remote.create_cut(source_id, item["sourceVideoId"], target_id, intervals,
                     int(category["intervalSeconds"]), prefix, operation["requestId"])
@@ -2903,7 +3346,7 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
             category.update(state="waiting", taskId=task_id, platformStatus=str(result.get("status", "")),
                             message="平台已接收切片任务，等待完成后关联核验图片。")
             self.store.save("operations", operation)
-            self.store.save("items", item)
+            self._save_category_progress(item, outcome_baseline)
             # Keep this tick's snapshot so another category of the same item cannot open a second task.
             jobs.setdefault(source_id, []).append({"id": task_id, "type": "21", "status": result.get("status", "1"),
                 "config": {"target": {"dataset": {"id": target_id}}, "source": {"datasets": [{"videos": {"ids": [item["sourceVideoId"]]}}]}}})

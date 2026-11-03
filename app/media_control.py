@@ -10,6 +10,8 @@ from .videos import Conflict
 
 
 TERMINAL = {"complete", "no_target", "excluded", "superseded"}
+SAFE_RETRY_ERRORS = {'worker_stalled', 'worker_failed', 'frame_extract_failed', 'frame_timeout',
+                     'media_check_timeout', 'observations_incomplete', 'media_incomplete'}
 
 
 class MediaControl:
@@ -64,11 +66,12 @@ class MediaControl:
         row = self.db.execute("SELECT payload FROM simple_media_controls WHERE id=?", (identity,)).fetchone()
         return json.loads(row[0]) if row else None
 
-    def save(self, row):
+    def save(self, row, *, commit=True):
         row["updatedAt"] = now_iso()
         self.db.execute("INSERT INTO simple_media_controls VALUES(?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload",
                         (row["id"], json.dumps(row, ensure_ascii=False)))
-        self.db.commit()
+        if commit:
+            self.db.commit()
 
     @staticmethod
     def same_version(left, right):
@@ -76,6 +79,11 @@ class MediaControl:
         return "size" in keys and len(keys) >= 3 and all(left[k] == right[k] for k in keys)
 
     def refresh(self):
+        # Index only when persisted inputs changed. Repeated status reads must
+        # not rebuild all collection-version and file identities.
+        changes = (self.db.total_changes, self.db.execute('PRAGMA data_version').fetchone()[0])
+        if getattr(self, '_indexed_changes', None) == changes:
+            return
         index = {}
         for row in self.videos.store.list(include_deleted=True):
             for version in row.get("versions", []):
@@ -130,6 +138,7 @@ class MediaControl:
             if original != json.dumps(item, sort_keys=True):
                 self.slicing.store.save("items", item)
             physical.setdefault(self.physical_key(item), []).append(item)
+        self._indexed_changes = (self.db.total_changes, changes[1])
 
     @staticmethod
     def physical_key(item):
@@ -146,10 +155,12 @@ class MediaControl:
                 row["paths"].append(destination)
                 self.save(row)
 
-    def reason(self, item):
+    def reason(self, item, allow_paused=False):
         if item.get("identityConflict"):
             return item.get("processingReason") or "原片身份需要核对。"
         control = self.get(item.get("mediaId", ""))
+        if control and control.get('paused') and not allow_paused:
+            return '此视频已手动暂停，继续后才会处理。'
         if item.get("superseded") or (control and item.get("mediaGeneration", 0) != control["generation"]):
             return "旧版处理已停止，按视频查看与更正中的指令执行。"
         if control and control.get("blocked"):
@@ -165,12 +176,308 @@ class MediaControl:
                 return "等待当前版本经人工确认并下载完成。"
         return ""
 
+    def recovery_covered_items(self, items, *, proof_inventory=None):
+        """Identify unsent attempts covered by the same verified recovery.
+
+        This never changes a task or approves a result. The recovery's own
+        complete photo receipts remain mandatory for any archive or cleanup.
+        """
+        from .photo_completion import photo_results_verified
+        from .recovery_results import partial_complete, verified_result
+
+        candidates = [item for item in items if not item.get('superseded') and not item.get('collectionRecovery')
+                      and item.get('state') in {'pending', 'attention'}
+                      and item.get('collectionVideoId') and item.get('mediaId')]
+        if not candidates:
+            return {}
+        by_id = {item['id']: item for item in items}
+        if proof_inventory is None:
+            changes = (self.db.total_changes, self.db.execute('PRAGMA data_version').fetchone()[0])
+            if getattr(self, '_proof_changes', None) != changes:
+                packages = self.slicing.packages.store.list('items')
+                submitted_ids = {package.get('itemId') for package in packages if not package.get('superseded')}
+                submitted_ids.update(operation.get('itemId') for operation in self.slicing.store.list('operations'))
+                self._proof_inventory = packages, submitted_ids
+                self._proof_changes = changes
+            proof_inventory = self._proof_inventory
+        packages, submitted_ids = proof_inventory
+        covered, checked = {}, {}
+        for item in candidates:
+            if item['id'] in submitted_ids:
+                continue
+            categories = (item.get('categories') or {}).values()
+            if any(category.get(key) for category in categories
+                   for key in ('taskId', 'operationId', 'packageId', 'preSubmitTaskIds', 'preSubmitImageIds')):
+                continue
+            video_id, revision = item['collectionVideoId'], item.get('collectionRevision')
+            key = (video_id, revision, item['mediaId'], item.get('mediaGeneration', 0))
+            if key not in checked:
+                row = self.videos.store.get(video_id)
+                version = self.videos.version(row, revision) if row and row.get('activeRevision') == revision else None
+                recovery = (version or {}).get('recovery') or {}
+                completed = by_id.get(recovery.get('slicingItemId'))
+                valid = (version and not (row or {}).get('deletedAt') and partial_complete(version)
+                         and completed and completed.get('collectionRecovery')
+                         and completed.get('mediaId') == item['mediaId']
+                         and completed.get('collectionRevision') == revision
+                         and completed.get('mediaGeneration', 0) == item.get('mediaGeneration', 0)
+                         and photo_results_verified([completed], packages))
+                if valid:
+                    proof = verified_result(completed, lambda identity: self.slicing.packages.store.get('items', identity))
+                    valid = bool(proof and recovery.get('results') == proof)
+                checked[key] = completed if valid else None
+            completed = checked[key]
+            expected, actual = item.get('fileVersion') or {}, (completed or {}).get('fileVersion') or {}
+            required = {'device', 'inode', 'size', 'modifiedNs'}
+            if (completed and required.issubset(expected) and required.issubset(actual)
+                    and self.same_version(expected, actual)):
+                covered[item['id']] = completed['id']
+        return covered
+
+    def scoped_effective_items(self, items):
+        """The same coverage proof, with indexed reads for status-only scopes."""
+        context = {item['id']: item for item in items}
+        candidates = [item for item in items if not item.get('superseded')
+                      and not item.get('collectionRecovery') and item.get('state') in {'pending', 'attention'}
+                      and item.get('collectionVideoId') and item.get('mediaId')]
+        if candidates:
+            for item in candidates:
+                row = self.videos.store.get(item['collectionVideoId'])
+                version = self.videos.version(row, item.get('collectionRevision')) if row else None
+                identity = ((version or {}).get('recovery') or {}).get('slicingItemId')
+                if identity and identity not in context:
+                    recovered = self.slicing.store.get('items', identity)
+                    if recovered:
+                        context[identity] = recovered
+            ids = tuple(context)
+            placeholders = ','.join('?' for _ in ids)
+            packages = [json.loads(raw[0]) for raw in self.db.execute(
+                f"SELECT payload FROM simple_slice_package_items WHERE json_extract(payload, '$.itemId') IN ({placeholders})", ids)]
+            submitted = {p.get('itemId') for p in packages if not p.get('superseded')}
+            submitted.update(raw[0] for raw in self.db.execute(
+                f"SELECT json_extract(payload, '$.itemId') FROM simple_slicing_operations WHERE json_extract(payload, '$.itemId') IN ({placeholders})", ids))
+            covered = self.recovery_covered_items(list(context.values()), proof_inventory=(packages, submitted))
+        else:
+            covered = {}
+        return [item for item in items if not item.get('superseded') and item['id'] not in covered
+                and not item.get('coveredByRecovery')]
+
     def allowed(self, item):
         return not self.reason(item)
 
-    def package_allowed(self, package):
+    def effective_items(self, items=None):
+        """One execution view; historical attempts remain immutable receipts.
+
+        Coverage is proved against the complete inventory even when a caller
+        requests a single run whose old IDs omit the recovery's own row.
+        """
+        changes = (self.db.total_changes, self.db.execute('PRAGMA data_version').fetchone()[0])
+        if getattr(self, '_effective_changes', None) != changes:
+            universe = self.slicing.store.list('items')
+            self._effective_covered = self.recovery_covered_items(universe)
+            self._effective_changes = changes
+        rows = self.slicing.store.list('items') if items is None else items
+        return [item for item in rows if not item.get('superseded')
+                and item.get('id') not in self._effective_covered
+                and not item.get('coveredByRecovery')]
+
+    def next_action(self, group):
+        """Read-only recommendation shared by automatic and manual entrypoints."""
+        rows = self.effective_items(group.get('items', []))
+        packages = [p for p in group.get('packages', []) if not p.get('superseded')
+                    and p.get('itemId') in {item['id'] for item in rows}]
+        def result(kind, action, stage, reason, selections=None, pending=None, **extra):
+            if kind == 'complete':
+                extra.pop('progress', None)
+            return dict(kind=kind, action=action, stage=stage, reason=reason, terminal=kind == 'complete',
+                        canContinue=action in {'continue', 'archive'},
+                        versionSelections=[{'id': row['id'], 'expectedRevision': row.get('revision', 0)} for row in rows],
+                        selections=selections or [], packages=pending or [], **extra)
+        if not rows:
+            return result('complete', 'none', '已完成', '旧尝试已由验证成功的结果覆盖。')
+        control = self.get(group.get('id') or group.get('mediaId') or rows[0].get('mediaId', '')) or {}
+        paused = control.get('paused') or next((row for row in rows if row.get('collectionRecoveryPaused') or row.get('pipelinePaused')), None)
+        if paused:
+            return result('waiting', 'resume' if control.get('paused') else 'open', '已暂停',
+                          '此视频已手动暂停，继续后才会处理。',
+                          [{'id': row['id'], 'expectedRevision': row.get('revision', 0)} for row in rows])
+        blocked = next(((row, reason) for row in rows if (reason := self.reason(row))), None)
+        if blocked:
+            row, reason = blocked
+            control = self.get(row.get('mediaId', '')) or {}
+            version = {}
+            video = self.videos.store.get(row.get('collectionVideoId', ''))
+            if video:
+                version = self.videos.version(video, row.get('collectionRevision')) or {}
+            waiting = bool(control.get('blocked') or version.get('downloadRequested') or
+                           version.get('state') in {'downloading', 'publishing', 'waiting', 'submitted', 'submitting'})
+            return result('waiting' if waiting else 'manual', 'none' if waiting else 'open',
+                          '等待视频处理' if waiting else '需要你处理', reason)
+        active = {'pending', 'analyzing', 'platform_processing', 'ready', 'exporting', 'waiting_slot',
+                  'queued', 'uploading', 'uploaded', 'submitting', 'importing', 'waiting', 'retry_wait'}
+        waiting = next((item for item in rows if item.get('state') == 'waiting_connection'), None)
+        if waiting:
+            return result('waiting', 'none', '等待恢复', waiting.get('message') or '等待所需网络、磁盘或文件恢复。')
+        selections = []
+        for item in rows:
+            # Legacy export callbacks could hide unsent pending analysis under
+            # platform_processing. The action resumes those slots only; it
+            # never reopens an uploaded or verified category.
+            if (item.get('state') == 'platform_processing' and self.slicing.pending_analysis(item, due=False)
+                    and not any(task and not task.done() for task in
+                                (self.slicing.analysis_tasks.get(item['id']), self.slicing.export_tasks.get(item['id'])))):
+                selections.append({'id': item['id'], 'expectedRevision': item.get('revision', 0)})
+                continue
+            failed = [slot for slot in item.get('categories', {}).values()
+                      if slot.get('state') == 'attention' and not slot.get('packageId')]
+            if (item.get('state') == 'attention' and item.get('errorCode') in SAFE_RETRY_ERRORS and failed
+                    and all(not slot.get('taskId') and not slot.get('operationId')
+                            and (slot.get('errorCode') or item.get('errorCode')) in SAFE_RETRY_ERRORS for slot in failed)):
+                selections.append({'id': item['id'], 'expectedRevision': item.get('revision', 0)})
+        pending = [{'id': pack['id'], 'expectedRevision': pack.get('revision', 0)} for pack in packages
+                   if pack.get('state') == 'attention' and pack.get('errorCode') == 'verification' and pack.get('jobId')]
+        if selections or pending:
+            automatic = all((row.get('errorCode') != 'worker_failed' or row.get('recoveryDisposition') == 'retry')
+                            and all(int(slot.get('automaticRetries', row.get('automaticRetries', 0)) or 0) < 2
+                                    for slot in row.get('categories', {}).values()
+                                    if slot.get('state') == 'attention' and not slot.get('packageId'))
+                            for row in rows if row['id'] in {choice['id'] for choice in selections})
+            for choice in pending:
+                stored = self.slicing.packages.store.get('items', choice['id']) or {}
+                automatic = automatic and int(stored.get('verificationFailures') or 0) < 2 and (
+                    stored.get('verificationAutoRetryForJob') != str(stored.get('jobId') or ''))
+            reason = '可继续已有断点或核对已提交的照片结果。'
+            if not automatic:
+                problem = next((row for row in rows if row.get('state') == 'attention' and row.get('message')), None)
+                if not problem:
+                    problem = next((pack for pack in packages if pack.get('state') == 'attention' and pack.get('message')), None)
+                reason = (problem or {}).get('message') or '自动重试已停止，请核对本条后继续。'
+            return result('automatic' if automatic else 'manual', 'continue', '可以继续' if automatic else '需要核对后继续',
+                          reason, selections, pending, autoEligible=automatic)
+        problem = next((pack for pack in packages if pack.get('state') in {'attention', 'review'}), None)
+        if not problem:
+            problem = next((row for row in rows if row.get('state') in {'attention', 'review'}), None)
+        if problem:
+            return result('manual', 'open', '需要你处理', problem.get('message') or '请核对本视频的身份、画面或处理结果。')
+        if any(row.get('state') in active for row in rows) or any(pack.get('state') in active for pack in packages):
+            analysis = next((row for row in rows if row.get('state') == 'analyzing'), None)
+            if analysis:
+                labels = {'checking_media': '检查视频', 'loading_model': '加载模型', 'sampling': '抽帧识别'}
+                done, total = int(analysis.get('analysisDone') or 0), int(analysis.get('analysisTotal') or 0)
+                return result('automatic', 'none', labels.get(analysis.get('analysisStage'), '识别中'),
+                              f'已识别 {done}/{total} 个位置。' if total else analysis.get('message') or '准备识别。',
+                              progress={'done': done, 'total': total, 'unit': '个位置'})
+            exporting = next((row for row in rows if row.get('state') == 'exporting' or
+                              ((task := self.slicing.export_tasks.get(row['id'])) and not task.done())), None)
+            if exporting:
+                return result('automatic', 'none', '导出照片', exporting.get('message') or '正在生成本地照片包。')
+            # Already submitted imports continue reconciling during an upload
+            # pause. Unsent packages must not masquerade as running work.
+            package = next((pack for pack in packages if pack.get('state') in {'submitting', 'importing'}), None)
+            package = package or next((pack for pack in packages if pack.get('state') in active), None)
+            if package:
+                labels = {'queued': '排队上传', 'uploading': '上传照片', 'uploaded': '等待导入',
+                          'submitting': '提交导入', 'importing': '导入照片'}
+                runtime = self.slicing.packages.runtime.get(package['id']) or {}
+                done = max(int(package.get('bytes') or 0), int(runtime.get('bytes') or 0))
+                if self.slicing.packages.paused and package.get('state') in {'queued', 'uploading', 'uploaded'}:
+                    return result('waiting', 'none', '照片上传已暂停',
+                                  '照片包与断点保留。继续照片上传后，将自动导入并整理。',
+                                  progress={'done': done, 'total': int(package.get('size') or 0), 'unit': 'bytes'})
+                return result('automatic', 'none', labels.get(package.get('state'), '照片处理中'),
+                              package.get('message') or '照片包按队列继续处理。',
+                              progress={'done': done, 'total': int(package.get('size') or 0), 'unit': 'bytes'})
+            reason = next((row.get('message') for row in rows if row.get('state') in active and row.get('message')), '')
+            return result('automatic', 'none', '自动处理中', reason or '正在按已登记的步骤处理。')
+        archive = next((file for file in group.get('files', []) if file.get('archiveState') in {'attention', 'waiting'}), None)
+        if archive:
+            if archive.get('archiveState') == 'attention':
+                if not archive.get('actionItemId'):
+                    return result('manual', 'open', '整理待处理', '文件与当前视频记录的关联需核对，原文件保留。')
+                return result('manual', 'archive', '整理待处理', archive.get('archiveMessage') or '整理需要再次核对。',
+                              fileId=archive['id'], actionItemId=archive['actionItemId'])
+            return result('waiting', 'none', '等待整理', archive.get('archiveMessage') or '等待文件释放或磁盘恢复。')
+        return result('complete', 'none', '已完成', '本视频的适用处理已结束。')
+
+    async def pause_media(self, identity, body, paused=True):
+        """Pause one physical source without revoking its submitted evidence."""
+        from uuid import uuid4
+        async with self.locks.setdefault(identity, asyncio.Lock()):
+            self.refresh()
+            control = self.get(identity)
+            signature = json.dumps({**body, 'paused': paused}, sort_keys=True)
+            key = 'pause:' + hashlib.sha256((identity + ':' + body['requestId']).encode()).hexdigest()
+            old = self.db.execute('SELECT payload FROM simple_media_actions WHERE id=?', (key,)).fetchone()
+            if old:
+                receipt = json.loads(old[0])
+                if receipt.get('signature') != signature:
+                    raise Conflict('请求编号已用于其他操作。')
+                if receipt.get('state') == 'complete':
+                    return {'ok': True, 'message': '此视频已暂停。' if paused else '此视频已继续。'}
+            if not control or control.get('generation') != body.get('generation'):
+                raise Conflict('视频版本已变化，请刷新后重试。')
+            pipeline = getattr(getattr(self.slicing, 'workspace', None), 'pipeline', None)
+            if not paused and pipeline and pipeline.paused:
+                raise Conflict('自动处理已全局暂停，请先继续自动处理；本视频的进度保留。')
+            rows = [row for row in self.effective_items() if row.get('mediaId') == identity]
+            choices = {choice['id']: choice['expectedRevision'] for choice in body.get('selections', [])}
+            if not rows or (not old and any(row['id'] in choices and row.get('revision', 0) != choices[row['id']] for row in rows)):
+                raise Conflict('视频记录已变化，请刷新后重试。')
+            if set(choices) - {row['id'] for row in rows}:
+                raise Conflict('所选记录不属于当前视频。')
+            self.db.execute('INSERT INTO simple_media_actions VALUES(?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload',
+                            (key, json.dumps({'signature': signature, 'state': 'running'})))
+            self.db.commit()
+            control.update(paused=paused)
+            self.save(control)
+            ids = {row['id'] for row in rows}
+            if paused:
+                tasks = [task for identity in ids for task in
+                         (self.slicing.analysis_tasks.get(identity), self.slicing.export_tasks.get(identity))
+                         if task and not task.done()]
+                tasks.extend(task for pack in self.slicing.packages.store.list('items')
+                             if pack.get('itemId') in ids and not pack.get('jobId')
+                             and (task := self.slicing.packages.running.get(pack['id'])) and not task.done())
+                for task in tasks:
+                    task.cancel()
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+            else:
+                if not self.slicing.store.settings.get('enabled'):
+                    run = {'id': 'resume-media-' + uuid4().hex, 'items': sorted(ids), 'state': 'running',
+                           'settingsRevision': self.slicing.store.settings['revision'], 'localRecoveryOnly': True,
+                           'singleMode': False, 'createdAt': now_iso(), 'message': '继续此视频；其他暂停项目保持原状。'}
+                    self.slicing.run = run
+                    self.slicing.store.save('runs', run)
+                    self.slicing.store.settings.update(enabled=True, latestRunId=run['id'])
+                    self.slicing.store.save_settings()
+                else:
+                    run = self.slicing.store.get('runs', self.slicing.store.settings.get('latestRunId')) or self.slicing.run
+                    if run and (run.get('localRecoveryOnly') or run.get('singleMode')):
+                        previous = ([run['singleItemId']] if run.get('singleMode') and run.get('singleItemId')
+                                    else run.get('items', []))
+                        run.update(items=list(dict.fromkeys([*previous, *sorted(ids)])),
+                                   singleMode=False, localRecoveryOnly=True, state='running')
+                        run.pop('singleItemId', None)
+                        self.slicing.store.save('runs', run)
+                        self.slicing.run = run
+                self.slicing.packages.wake.set()
+            if paused:
+                self.slicing.wake.set()
+            else:
+                # The last paused video can make the scheduler exit. Setting
+                # its event alone cannot restart that finished coroutine.
+                self.slicing._wake_scheduler()
+            if (self.get(identity) or {}).get('generation') != body['generation']:
+                raise Conflict('视频已被更正，旧版暂停操作已停止。')
+            self.db.execute('INSERT INTO simple_media_actions VALUES(?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload',
+                            (key, json.dumps({'signature': signature, 'state': 'complete'})))
+            self.db.commit()
+            return {'ok': True, 'message': '此视频已暂停，断点保留。' if paused else '此视频已继续。'}
+
+    def package_allowed(self, package, allow_paused=False):
         item = self.slicing.store.get("items", package.get("itemId"))
-        return not package.get("superseded") and (not item or self.allowed(item))
+        return not package.get("superseded") and (not item or not self.reason(item, allow_paused=allow_paused))
 
     def claim(self, item):
         if not self.allowed(item):
@@ -180,13 +487,14 @@ class MediaControl:
             row["owner"] = "slicing"
             self.save(row)
 
-    def reserve(self, video_id, request_id):
-        self.refresh()
+    def reserve(self, video_id, request_id, *, commit=True, refresh=True):
+        if refresh:
+            self.refresh()
         identity = "collection:" + video_id
         row = self.get(identity) or {"id": identity, "videoId": video_id, "generation": 0, "paths": []}
         if row.get("requestId") != request_id:
             row.update(generation=row["generation"] + 1, requestId=request_id, owner="review", blocked=True)
-            self.save(row)
+            self.save(row, commit=commit)
         return row["generation"]
 
     async def take_over(self, video_id, request_id, expected_generation=None):
@@ -319,37 +627,234 @@ class MediaControl:
             query["mediaId"] = item["mediaId"]
         return "/?" + urlencode(query)
 
-    def state(self):
-        public_items = {item["id"]: item for item in self.slicing.state()["items"]}
+    def execution_groups(self, paths):
+        """Schedule current work without rendering every historical file card."""
+        if not paths:
+            return []
+        self.refresh()
+        items = [item for item in self.effective_items() if item.get('path') in paths]
+        ids = tuple(item['id'] for item in items)
+        if not ids:
+            return []
+        placeholders = ','.join('?' for _ in ids)
+        packages = [json.loads(row[0]) for row in self.db.execute(
+            f"SELECT payload FROM simple_slice_package_items WHERE json_extract(payload, '$.itemId') IN ({placeholders})", ids)]
+        by_item = {}
+        for package in packages:
+            if not package.get('superseded'):
+                by_item.setdefault(package.get('itemId'), []).append(package)
         groups = {}
-        for item in self.slicing.store.list("items"):
-            if item.get("superseded") or item["id"] not in public_items:
+        for item in items:
+            identity = item.get('mediaId') or 'unbound:' + item['id']
+            if identity not in groups:
+                groups[identity] = {'id': identity, 'items': [], 'packages': [],
+                    'generation': (self.get(identity) or {}).get('generation', 0)}
+            group = groups[identity]
+            group['items'].append(item)
+            group['packages'].extend(by_item.get(item['id'], []))
+        pending = []
+        for group in groups.values():
+            if (all(item.get('state') in TERMINAL | {'uncuttable'}
+                    and all(slot.get('state') in TERMINAL | {'uncuttable', 'not_applicable'}
+                            for slot in item.get('categories', {}).values()) for item in group['items'])
+                    and all(package.get('state') in {'complete', 'dismissed', 'superseded'}
+                            for package in group['packages'])):
+                continue
+            group['nextAction'] = self.next_action(group)
+            pending.append(group)
+        return pending
+
+    def state(self, include_completed=False, *, include_cleanup_actions=True):
+        files = getattr(self.slicing, 'files', None)
+        if files:
+            files.refresh()
+        self.refresh()
+        all_items = self.slicing.store.list('items')
+        hidden = self.slicing.visibility.hidden()
+        visible = [item for item in all_items if item['id'] not in hidden]
+        public_items = {item['id']: item for item in self.slicing.public_items(visible,
+            covered=self.recovery_covered_items(all_items))}
+        groups = {}
+        for item in self.effective_items(all_items):
+            if item["id"] not in public_items:
                 continue
             identity = item.get("mediaId") or "unbound:" + item["id"]
             group = groups.setdefault(identity, {"id": identity, "videoId": item.get("collectionVideoId"),
                 "name": item.get("name"), "createdAt": item.get("createdAt") or item.get("updatedAt"), "items": []})
             reason = self.reason(item)
             group["items"].append({**public_items[item["id"]], "blockedReason": reason})
-            group.update(generation=(self.get(identity) or {}).get("generation", 0),
-                         owner=(self.get(identity) or {}).get("owner", "slicing"), blockedReason=reason,
+            control = self.get(identity) or {}
+            group.update(generation=control.get("generation", 0),
+                         owner=control.get("owner", "slicing"), blockedReason=reason,
                          processingEntry=self.processing_entry(item))
-        packages = self.slicing.packages.state()["items"]
-        files = getattr(self.slicing, 'files', None)
-        if files:
-            files.refresh()
+        packages = self.slicing.packages.state(item_ids=public_items)['items']
         public_files = {row['id']: row for row in files.state()['items']} if files else {}
+        indexed_files = files.rows('files') if files else []
+        workspace = getattr(files, 'workspace', None) if files else None
+        assets = {}
+        if workspace and workspace.enabled:
+            for asset in workspace.rows('assets'):
+                assets.setdefault(asset['path'], asset)
+        cleanup_files = []
         for group in groups.values():
             ids = {item["id"] for item in group["items"]}
             group["packages"] = [p for p in packages if p.get("itemId") in ids]
-            group["files"] = [{k: public_files.get(f['id'], f).get(k) for k in ("id", "archiveState", "archiveMessage", "cleanup")}
-                              for f in files.rows("files") if ids.intersection(f.get("links", {}).get("slicing", []))] if files else []
-            if files and getattr(files, 'workspace', None) and files.workspace.enabled:
+            group["files"] = []
+            for file in indexed_files:
+                linked_ids = ids.intersection(file.get("links", {}).get("slicing", []))
+                if not linked_ids:
+                    continue
+                # A physical video can have several processing records and
+                # several original/recovery files. A file action must use its
+                # own current binding, never the group's first record.
+                binding = next((item for item in group['items'] if item['id'] in linked_ids
+                                and not item.get('coveredByRecovery') and not self.reason(item)), None)
+                value = {k: public_files.get(file['id'], file).get(k)
+                         for k in ("id", "archiveState", "archiveMessage", "cleanup")}
+                value['actionItemId'] = binding['id'] if binding else None
+                group['files'].append(value)
+            # Cleanup-button eligibility is expensive and is not part of the
+            # pipeline's recommendation. The detailed control view keeps it;
+            # actual cleanup always checks the current receipts independently.
+            if include_cleanup_actions and workspace and workspace.enabled:
                 for file in group['files']:
-                    asset = files.workspace.asset_for(public_files.get(file['id'], {}).get('path', ''))
+                    asset = assets.get(public_files.get(file['id'], {}).get('path', ''))
                     if asset and file['archiveState'] == 'complete' and file.get('cleanup', {}).get('state') != 'complete':
-                        file['cleanupEligible'], file['cleanupReason'] = files.workspace.cleanup_eligibility(asset)
-        return {"groups": [g for g in groups.values() if g.get("videoId") or
+                        cleanup_files.append((file, asset))
+            group['nextAction'] = self.next_action(group)
+        if cleanup_files:
+            statuses = workspace.cleanup_statuses(list({asset['id']: asset for _, asset in cleanup_files}.values()))
+            for file, asset in cleanup_files:
+                file['cleanupEligible'], file['cleanupReason'] = statuses[asset['id']]
+        return {"groups": [g for g in groups.values() if include_completed or g.get("videoId") or
                            any(i.get("state") not in TERMINAL for i in g["items"])]}
+
+    async def continue_safe(self, identity, body):
+        """Continue a physical video without guessing its identity or approving results."""
+        from uuid import uuid4
+        safe_errors = SAFE_RETRY_ERRORS
+        lock = self.locks.setdefault(identity, asyncio.Lock())
+        async with lock:
+            signature = json.dumps(body, sort_keys=True, separators=(',', ':'))
+            key = hashlib.sha256(('continue:' + identity + ':' + body['requestId']).encode()).hexdigest()
+            old = self.db.execute('SELECT payload FROM simple_media_actions WHERE id=?', (key,)).fetchone()
+            receipt = json.loads(old[0]) if old else None
+            if receipt and receipt['signature'] != signature:
+                raise Conflict('请求编号已用于其他操作。')
+            if receipt and receipt.get('state') == 'complete':
+                return {'outcomes': receipt['outcomes'], 'state': self.slicing.state()}
+            self.refresh()
+            control = self.get(identity)
+            if not control or control.get('generation') != body['generation']:
+                raise Conflict('视频版本已变化，请刷新后重试。')
+            pipeline = getattr(getattr(self.slicing, 'workspace', None), 'pipeline', None)
+            if pipeline and pipeline.paused:
+                raise Conflict('自动处理已全局暂停，请先继续自动处理；本视频的进度保留。')
+            choices, package_choices = body['selections'], body['packages']
+            if not choices and not package_choices:
+                raise ValueError('没有可自动继续的项目，请查看具体原因。')
+            if len({c['id'] for c in choices}) != len(choices) or len({c['id'] for c in package_choices}) != len(package_choices):
+                raise ValueError('不能重复选择同一条记录。')
+            if not self.slicing.auth.connected and not self.slicing.store.settings.get('localExport', True):
+                raise ValueError('视觉AI平台未连接，请先到设置中连接。')
+            done = {entry['key'] for entry in (receipt or {}).get('outcomes', []) if entry.get('ok')}
+            def sub_id(kind, item_id):
+                return 'continue-' + hashlib.sha256((key + kind + item_id).encode()).hexdigest()[:48]
+            selected = []
+            pending_ids = set()
+            for choice in choices:
+                item = self.slicing.store.get('items', choice['id'])
+                if not item or item.get('mediaId') != identity:
+                    raise Conflict('切片记录不属于此视频，请刷新后重试。')
+                if not self.allowed(item):
+                    raise Conflict(self.reason(item))
+                marker = self.slicing.store.get('requests', sub_id('item', item['id']))
+                pending = item.get('state') != 'attention' and bool(self.slicing.pending_analysis(item, due=False))
+                if 'item:' + item['id'] not in done and not marker:
+                    if item.get('revision') != choice['expectedRevision'] or (item.get('state') != 'attention' and not pending):
+                        raise Conflict('切片记录已变化，请刷新后重试。')
+                    if not pending and item.get('errorCode') not in safe_errors:
+                        raise Conflict('此异常需要人工核对，未自动修改。')
+                    for category in item.get('categories', {}).values():
+                        if pending or category.get('state') != 'attention' or category.get('packageId'):
+                            continue
+                        if category.get('taskId') or category.get('operationId') or (category.get('errorCode') or item.get('errorCode')) not in safe_errors:
+                            raise Conflict('已有平台提交或需要人工核对的异常，未自动修改。')
+                if (pending and not marker) or (marker and marker.get('kind') == 'continue-pending'):
+                    pending_ids.add(item['id'])
+                selected.append(item)
+            packages = []
+            for choice in package_choices:
+                package = self.slicing.packages.store.get('items', choice['id'])
+                item = self.slicing.store.get('items', (package or {}).get('itemId'))
+                if not package or not item or item.get('mediaId') != identity or not self.allowed(item):
+                    raise Conflict('照片包不属于当前视频版本，请刷新后重试。')
+                marker = self.slicing.packages.store.get('batches', 'retry:' + sub_id('package', package['id']))
+                if 'package:' + package['id'] not in done and not marker:
+                    if package.get('revision', 0) != choice['expectedRevision'] or package.get('state') != 'attention':
+                        raise Conflict('照片包状态已变化，请刷新后重试。')
+                    if package.get('errorCode') != 'verification' or not package.get('jobId'):
+                        raise Conflict('此照片包需要人工核对，不会自动重传。')
+                packages.append(package)
+            active_ids = {item['id'] for item in self.slicing.store.list('items') if item.get('mediaId') == identity}
+            if any(task and not task.done() for key in active_ids for task in
+                   (self.slicing.analysis_tasks.get(key), self.slicing.export_tasks.get(key))):
+                raise Conflict('该视频仍在处理，完成后再继续。')
+            run = self.slicing.store.get('runs', self.slicing.store.settings.get('latestRunId')) or self.slicing.run
+            if selected and self.slicing.store.settings.get('enabled') and run and run.get('singleMode'):
+                if any(item['id'] != run.get('singleItemId') for item in selected):
+                    raise Conflict('其他单条任务正在运行，请稍后重试。')
+            if selected and not self.slicing.store.settings.get('enabled'):
+                if self.slicing.busy:
+                    raise Conflict('切片进程正在停止，请稍后重试。')
+                # A targeted request resumes only these items, leaving other paused work untouched.
+                run = {'id': 'continue-' + uuid4().hex, 'requestId': body['requestId'], 'state': 'running',
+                       'items': [item['id'] for item in selected], 'settingsRevision': self.slicing.store.settings['revision'],
+                       'localRecoveryOnly': True, 'singleMode': False, 'createdAt': now_iso(), 'message': '正在继续选中视频。'}
+                self.slicing.store.save('runs', run)
+                self.slicing.run = run
+                self.slicing.store.settings.update(enabled=True, latestRunId=run['id'])
+                self.slicing.store.save_settings()
+            if not receipt:
+                receipt = {'signature': signature, 'state': 'running', 'outcomes': []}
+                self.db.execute('INSERT INTO simple_media_actions VALUES(?,?)', (key, json.dumps(receipt)))
+                self.db.commit()
+            for item in selected:
+                result_key = 'item:' + item['id']
+                if result_key in done:
+                    continue
+                try:
+                    previous = self.slicing.store.get('requests', sub_id('item', item['id'])) or {}
+                    if item['id'] in pending_ids:
+                        self.slicing.continue_pending(item['id'], item['revision'], sub_id('item', item['id']))
+                    else:
+                        recovery = previous.get('kind') == 'recover-decodable' if previous else item.get('errorCode') == 'media_incomplete'
+                        self.slicing.retry(item['id'], item['revision'], sub_id('item', item['id']), recover_decodable=recovery)
+                    outcome = {'key': result_key, 'ok': True, 'message': '已加入识别队列。'}
+                except (Conflict, ValueError) as error:
+                    outcome = {'key': result_key, 'ok': False, 'message': str(error)}
+                receipt['outcomes'] = [x for x in receipt['outcomes'] if x['key'] != result_key] + [outcome]
+                self.db.execute('UPDATE simple_media_actions SET payload=? WHERE id=?', (json.dumps(receipt), key)); self.db.commit()
+            for package in packages:
+                result_key = 'package:' + package['id']
+                if result_key in done:
+                    continue
+                try:
+                    await self.slicing.packages.retry(package['id'], sub_id('package', package['id']), package.get('revision', 0))
+                    outcome = {'key': result_key, 'ok': True, 'message': '正在重新核对已有照片导入。'}
+                except (Conflict, ValueError) as error:
+                    outcome = {'key': result_key, 'ok': False, 'message': str(error)}
+                receipt['outcomes'] = [x for x in receipt['outcomes'] if x['key'] != result_key] + [outcome]
+                self.db.execute('UPDATE simple_media_actions SET payload=? WHERE id=?', (json.dumps(receipt), key)); self.db.commit()
+            receipt['state'] = 'complete'
+            self.db.execute('UPDATE simple_media_actions SET payload=? WHERE id=?', (json.dumps(receipt), key)); self.db.commit()
+            if selected:
+                # Persisted child requests may return idempotently after a
+                # restart without waking the dispatcher themselves.
+                self.slicing._wake_scheduler()
+            else:
+                self.slicing.wake.set()
+            return {'outcomes': receipt['outcomes'], 'state': self.slicing.state()}
 
     async def action(self, identity, body):
         lock = self.locks.setdefault(identity, asyncio.Lock())

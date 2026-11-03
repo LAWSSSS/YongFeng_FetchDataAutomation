@@ -28,6 +28,12 @@ def environment(tmp_path, monkeypatch):
     return app, manager
 
 
+def mark_verified(category, target):
+    count=category.get('actualImages') or 0
+    category.update(taskId='fixture-task-'+target, targetDatasetId=target,
+                    outputImageIds=[f'{target}-image-{i}' for i in range(count)])
+
+
 def pair(manager, tmp_path, states=('pending', 'pending')):
     bed = item_fixture(tmp_path, 'bed', states[0])
     bed.update(errorCode='', sourceVideoId='101')
@@ -36,6 +42,8 @@ def pair(manager, tmp_path, states=('pending', 'pending')):
     magnet.update(id='magnet', sourceDatasetId='27944', sourceVideoId='102', state=states[1])
     magnet['categories']['bed'] = {'state':'not_applicable'}
     magnet['categories']['magnet'] = {'state':states[1], 'intervals':[], 'actualImages':150 if states[1] == 'complete' else None}
+    if states[0] == 'complete': mark_verified(bed['categories']['bed'], '900')
+    if states[1] == 'complete': mark_verified(magnet['categories']['magnet'], '901')
     manager.store.save('items', bed)
     manager.store.save('items', magnet)
     return bed, magnet
@@ -184,7 +192,7 @@ async def test_archive_after_both_categories_updates_all_bindings(environment,tm
 
 
 @pytest.mark.asyncio
-async def test_cleanup_deletes_only_verified_original_and_program_photo_files(environment,tmp_path):
+async def test_legacy_cleanup_without_workspace_retains_user_original_and_photos(environment,tmp_path):
     app, manager = environment
     root = tmp_path / '视频'
     root.mkdir()
@@ -204,8 +212,13 @@ async def test_cleanup_deletes_only_verified_original_and_program_photo_files(en
     unrelated = output / 'keep.txt'
     unrelated.write_text('unrelated file')
     manager.store.settings['sliceOutputDirectory'] = str(output)
+    bed = manager.store.get('items', 'bed')
+    bed['categories']['bed'].update(packageId='verified-bed-package', actualImages=1)
+    manager.store.save('items', bed)
     manager.packages.store.save('items', {
-        'id': 'verified-bed-package', 'itemId': 'bed', 'category': 'bed', 'state': 'complete',
+        'id': 'verified-bed-package', 'itemId': 'bed', 'category': 'bed', 'dataset':'900', 'state': 'complete',
+        'jobId':'photo-job','verifiedJobId':'photo-job','imageCount':1,'actualImages':1,
+        'outputImageIds':['verified-photo'],'videoFileVersion':source_fingerprint(archive),
         'path': str(zip_file), 'fileVersion': source_fingerprint(zip_file),
         'imageDir': str(image_dir), 'images': [photo.name],
         'imageVersions': {photo.name: source_fingerprint(photo)},
@@ -213,10 +226,11 @@ async def test_cleanup_deletes_only_verified_original_and_program_photo_files(en
 
     files = app.state.files
     row = next(item for item in files.refresh() if item['path'] == str(archive))
-    await files.cleanup_confirmed(row['id'], 'cleanup-confirmed')
-    assert not archive.exists() and not photo.exists() and not zip_file.exists()
+    with pytest.raises(ValueError, match='工作区'):
+        await files.cleanup_confirmed(row['id'], 'cleanup-confirmed')
+    assert archive.exists() and photo.exists() and zip_file.exists()
     assert unrelated.read_text() == 'unrelated file'
-    assert next(item for item in files.rows('files') if item['id'] == row['id'])['cleanup']['state'] == 'complete'
+    assert not next(item for item in files.rows('files') if item['id'] == row['id']).get('cleanup')
     await close_app(app)
 
 
@@ -231,7 +245,7 @@ async def test_cleanup_holds_original_when_a_cut_category_has_no_verified_packag
     archive = root / '切片完成' / 'bed.mp4'
     row = next(item for item in app.state.files.refresh() if item['path'] == str(archive))
 
-    with pytest.raises(ValueError, match='缺少已核验的图片包'):
+    with pytest.raises(ValueError, match='工作区'):
         await app.state.files.cleanup_confirmed(row['id'], 'cleanup-without-package')
     assert archive.is_file()
     await close_app(app)
@@ -303,6 +317,7 @@ async def test_one_bound_record_can_archive_when_both_category_results_are_verif
     item.update(sourceDatasetId='27944',errorCode='')
     item['categories']['bed'].update(state='complete',actualImages=120,errorCode='')
     item['categories']['magnet'].update(state='complete',actualImages=150,errorCode='')
+    mark_verified(item['categories']['bed'], '900');mark_verified(item['categories']['magnet'], '901')
     manager.store.save('items',item)
     manager.store.settings['directories']=[str(root)]
 
@@ -439,6 +454,8 @@ async def test_full_backend_workflow_two_targets_unique_tasks_lost_response_and_
     first_run=manager.run['id']
     for cycle in range(20):
         await manager._tick()
+        if manager.platform_task:
+            await manager.platform_task
         if manager.analysis_task:
             await manager.analysis_task
         if app.state.files.task:
@@ -550,6 +567,7 @@ async def test_manual_reclassification_rearchives_from_empty_to_completed(enviro
     await files.tick()
     assert (tmp_path/'未检出目标'/'bed.mp4').exists()
     bed=manager.store.get('items','bed');bed['categories']['bed'].update(state='complete',actualImages=150)
+    mark_verified(bed['categories']['bed'], '900')
     bed['state']='complete';manager.store.save('items',bed)
     await files.tick()
     assert not (tmp_path/'未检出目标'/'bed.mp4').exists()
@@ -636,6 +654,7 @@ async def test_archive_scheduler_has_no_idle_wakeup_or_busy_file_spin(environmen
     for item in manager.store.list('items'):
         name='bed' if item['sourceDatasetId']=='27912' else 'magnet'
         item['categories'][name].update(state='complete',actualImages=150);item['state']='complete'
+        mark_verified(item['categories'][name], '900' if name=='bed' else '901')
         manager.store.save('items',item)
     with manager.leases.read(str(tmp_path/'bed.mp4')):
         files.schedule(lambda:wakeups.append(True))

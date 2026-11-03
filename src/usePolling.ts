@@ -8,12 +8,13 @@ type PollOptions = {
   clearTimer?: (timer: ReturnType<typeof setTimeout>) => void;
 };
 
-export function createPoller(task: () => Promise<unknown>, options: PollOptions) {
+export function createPoller(task: (signal:AbortSignal) => Promise<unknown>, options: PollOptions) {
   const setTimer: NonNullable<PollOptions['setTimer']> = options.setTimer || ((callback, delay) => setTimeout(callback, delay));
   const clearTimer: NonNullable<PollOptions['clearTimer']> = options.clearTimer || (timer => clearTimeout(timer));
   let stopped = false;
   let running = false;
   let requested = false;
+  let controller:AbortController|undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
   function cancelTimer() {if (timer !== undefined) {clearTimer(timer);timer = undefined;}}
   async function refresh() {
@@ -21,20 +22,23 @@ export function createPoller(task: () => Promise<unknown>, options: PollOptions)
     if (stopped || (options.visible && !options.visible())) return;
     if (running) {requested = true;return;}
     running = true;
-    try {await task();} catch (error) {if (!stopped) options.onError?.(error);}
+    controller=new AbortController();
+    const signal=controller.signal;
+    try {await task(signal);} catch (error) {if (!stopped&&!signal.aborted) options.onError?.(error);}
     finally {
       running = false;
-      if (!stopped) {
+      if (!stopped&&(!options.visible||options.visible())) {
         const delay = requested ? 0 : options.delay();
         requested = false;
         timer = setTimer(() => void refresh(), delay);
       }
     }
   }
-  return {refresh, stop() {stopped = true;cancelTimer();}};
+  return {refresh,suspend(){requested=false;cancelTimer();controller?.abort();},
+    stop() {stopped = true;cancelTimer();controller?.abort();}};
 }
 
-export function usePolling(task: () => Promise<unknown>, intervalMs: number | null,
+export function usePolling(task: (signal?:AbortSignal) => Promise<unknown>, intervalMs: number | null,
     options: {immediate?: boolean; onError?: (error: unknown) => void} = {}) {
   const taskRef = useRef(task);
   const errorRef = useRef(options.onError);
@@ -43,13 +47,16 @@ export function usePolling(task: () => Promise<unknown>, intervalMs: number | nu
   const immediate = options.immediate !== false;
   useEffect(() => {
     if (intervalMs === null) return;
-    const poller = createPoller(() => taskRef.current(), {
+    const poller = createPoller(signal => taskRef.current(signal), {
       delay: () => intervalMs,
       visible: () => !document.hidden,
       onError: error => errorRef.current?.(error),
     });
-    const visible = () => {if (!document.hidden) void poller.refresh();};
     let initial: ReturnType<typeof setTimeout> | undefined;
+    const visible = () => {
+      if(initial!==undefined){clearTimeout(initial);initial=undefined;}
+      if (!document.hidden) void poller.refresh();else poller.suspend();
+    };
     if (immediate) void poller.refresh();
     else initial = setTimeout(() => void poller.refresh(), intervalMs);
     document.addEventListener('visibilitychange', visible);

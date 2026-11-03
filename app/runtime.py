@@ -1,10 +1,10 @@
-"""Paths and identity for the relocatable distribution; development stays unchanged."""
+"""Application-relative tools and a single writable sibling data directory."""
 from __future__ import annotations
 
 import os
 from pathlib import Path
 
-VERSION = "1.1.0"
+VERSION = "1.3.2"
 BUNDLE_ID = "cn.yongfeng.video-gather.standalone"
 PROFILE_NAME = "InspectionVideoGatherStandalone"
 
@@ -18,8 +18,19 @@ def resources() -> Path:
 
 
 def profile_directory() -> Path:
-    return Path(os.environ.get("IVG_PROFILE_DIR") or
-                Path.home() / "Library" / "Application Support" / PROFILE_NAME).expanduser().resolve()
+    return Path(os.environ.get("IVG_PROFILE_DIR") or data_directory() / "系统").expanduser().resolve()
+
+
+def application_directory() -> Path:
+    # Resources is inside X.app/Contents. Mutable files belong beside X.app.
+    return resources().parents[2] if portable() else Path(__file__).resolve().parents[1]
+
+
+def data_directory() -> Path:
+    override = os.environ.get("IVG_PROFILE_DIR")
+    if override:
+        return Path(override).expanduser().resolve().parent / "数据" if Path(override).name != "系统" else Path(override).parent
+    return application_directory() / "数据"
 
 
 def credentials_directory() -> Path:
@@ -46,6 +57,21 @@ def slicing_paths() -> dict:
             "bedGeometryPath": str(root / "models" / "bed" / "geometry.npz"),
             "frameToolPath": str(root / "tools" / "bin" / "ffmpeg"),
             "workerPythonPath": str(root / "runtime" / "inference" / "bin" / "python3.11")}
+
+
+def source_model_paths() -> dict:
+    """Resolve source-bundle models relative to code, never a developer's disk."""
+    root = Path(__file__).resolve().parents[1]
+    models = root / "assets" / "models"
+    if not (models / "magnet" / "best.onnx").is_file() and (root / "build/models/magnet/best.onnx").is_file():
+        models = root / "build" / "models"
+    return {"magnetDeployDirectory": str(models / "magnet"),
+            "magnetModelPath": str(models / "magnet/best.onnx"),
+            "bedDeployDirectory": str(models / "bed"),
+            "bedModelPath": str(models / "bed/model.pt"),
+            "bedGeometryPath": str(models / "bed/geometry.npz"),
+            "frameToolPath": str(root / "build/ffmpeg-tools/bin/ffmpeg"),
+            "workerPythonPath": str(root / ".venv-slicing/bin/python")}
 
 
 def identity() -> dict:

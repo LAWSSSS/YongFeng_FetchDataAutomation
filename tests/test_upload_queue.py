@@ -203,6 +203,175 @@ async def test_two_targets_four_uploads_each_one_import_and_one_staged_batch(har
 
 
 @pytest.mark.asyncio
+async def test_ready_files_import_without_waiting_for_one_slow_upload_and_slots_refill(harness,tmp_path):
+    _, manager, platform, worker, _ = harness
+    items = add(manager, tmp_path / 'straggler', 8)
+    gate = asyncio.Event()
+    worker.gates = {f'truck_{i}.mp4': gate for i in range(3, 8)}
+    try:
+        await manager.tick(); await settle(manager)
+        slow = manager.store.get('items', items[3]['id'])
+        original_batch = slow['batchId']
+        assert slow['state'] == 'uploading'
+        await manager.tick()
+        assert len(platform.posts) == 1
+        assert len(platform.posts[0]['config']['source']['files']) == 3
+        slow = manager.store.get('items', items[3]['id'])
+        assert slow['batchId'] != original_batch and slow['state'] == 'uploading'
+        await manager.tick(); await settle(manager)
+        assert worker.active['27912'] == 4
+        assert worker.max_active['27912'] == 4
+        assert len([b for b in manager.store.list('batches') if b['state'] == 'preparing']) == 1
+        assert len(platform.posts) == 1
+    finally:
+        gate.set(); await settle(manager)
+
+
+@pytest.mark.asyncio
+async def test_new_correction_stops_only_its_old_source_upload_and_keeps_receipts(harness,tmp_path):
+    from tests.test_media_control import collection
+    app, manager, _, worker, _ = harness
+    items = add(manager, tmp_path / 'correction', 2)
+    row = collection(app, Path(items[0]['path']), 'being-corrected')
+    gate = asyncio.Event()
+    worker.gates = {item['name']: gate for item in items}
+    try:
+        await manager.tick(); await settle(manager)
+        receipt = manager.store.get('items', items[0]['id'])['uploadId']
+        row.update(activeRevision=1, acceptedRevision=1)
+        app.state.videos.store.save(row)
+        await manager.tick(); await settle(manager)
+        stopped = manager.store.get('items', items[0]['id'])
+        assert stopped['state'] == 'attention' and stopped['errorCode'] == 'source_superseded'
+        assert stopped['uploadId'] == receipt
+        assert manager.store.get('items', items[1]['id'])['state'] == 'uploading'
+    finally:
+        gate.set(); await settle(manager)
+
+
+@pytest.mark.asyncio
+async def test_restart_releases_empty_batch_without_resetting_manual_attention(harness,tmp_path):
+    from app.uploads import UploadManager
+    app, manager, _, worker, _ = harness
+    rows = add(manager, tmp_path / 'empty-batch', 2)
+    manager.store.save('batches', {'id': 'empty', 'dataset': '27912', 'state': 'empty', 'items': [r['id'] for r in rows]})
+    rows[0].update(batchId='empty', state='attention', phase='review', errorCode='worker_unavailable')
+    rows[1].update(batchId='empty', state='attention', phase='review', errorCode='verification')
+    for row in rows:
+        manager.store.save('items', row)
+    restored = UploadManager(app.state.store, manager.audit, manager.leases, remote=manager.remote,
+                             worker=worker, file_check=lambda *_: None)
+    assert restored.store.get('items', rows[0]['id'])['state'] == 'queued'
+    assert restored.store.get('items', rows[1]['id'])['state'] == 'attention'
+    assert all(not restored.store.get('items', r['id'])['batchId'] for r in rows)
+
+
+def test_video_probe_uses_configured_tool_when_background_path_is_empty(tmp_path,monkeypatch):
+    import subprocess
+    from app.uploads import inspect_video
+    path = tmp_path / 'video.mp4'; path.write_bytes(b'fixture-video')
+    probe = tmp_path / 'tools' / 'ffprobe'; probe.parent.mkdir(); probe.write_bytes(b'fixture'); probe.chmod(0o755)
+    calls = []
+    def execute(command, **_):
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0, json.dumps({'format': {'duration': '60', 'size': str(path.stat().st_size)}}).encode(), b'')
+    monkeypatch.setattr('app.uploads.shutil.which', lambda _: None)
+    monkeypatch.setattr('app.uploads.subprocess.run', execute)
+    inspect_video(str(path), fingerprint(path.stat()), str(probe.with_name('ffmpeg')))
+    assert calls[0][0] == str(probe)
+
+
+@pytest.mark.asyncio
+async def test_both_targets_share_one_probe_and_cache_still_checks_content(harness,tmp_path):
+    import os
+    _, manager, _, _, _ = harness
+    item = add(manager, tmp_path / 'shared-check')[0]
+    calls = []
+    def check(*_):
+        calls.append(True); time.sleep(.03)
+    manager.file_check = check
+    await asyncio.gather(manager.validate_upload_source(item), manager.validate_upload_source({**item, 'dataset': '27944'}))
+    assert len(calls) == 1
+    path = Path(item['path']); previous = path.stat()
+    path.write_bytes(b'changed!')
+    os.utime(path, ns=(previous.st_atime_ns, previous.st_mtime_ns))
+    with pytest.raises(ValueError, match='file_changed'):
+        await manager.validate_upload_source(item)
+
+
+@pytest.mark.asyncio
+async def test_saved_exact_version_recovers_false_probe_failure_without_another_probe(harness,tmp_path):
+    from tests.test_media_control import collection
+    app, manager, _, _, _ = harness
+    item = add(manager, tmp_path / 'saved-receipt')[0]
+    collection(app, Path(item['path']), 'verified-saved')
+    item.update(state='attention', phase='review', errorCode='incomplete_video')
+    manager.store.save('items', item)
+    def forbidden(*_):
+        raise AssertionError('Saved exact versions must reuse their existing verification')
+    manager.file_check = forbidden
+    await manager.restore_probe_timeouts()
+    restored = manager.store.get('items', item['id'])
+    assert restored['state'] == 'queued' and restored['errorCode'] == ''
+
+
+def test_probe_timeout_is_retriable_and_is_not_an_incomplete_video(tmp_path,monkeypatch):
+    import subprocess
+    from app.uploads import inspect_video
+    path = tmp_path / 'video.mp4'; path.write_bytes(b'fixture-video')
+    probe = tmp_path / 'ffprobe'; probe.write_bytes(b'fixture'); probe.chmod(0o755)
+    def timeout(command, **_):
+        raise subprocess.TimeoutExpired(command, 20)
+    monkeypatch.setattr('app.uploads.subprocess.run', timeout)
+    with pytest.raises(ValueError, match='media_check_busy'):
+        inspect_video(str(path), fingerprint(path.stat()), str(probe.with_name('ffmpeg')))
+
+
+@pytest.mark.asyncio
+async def test_slow_probe_recovery_does_not_block_other_uploads(harness,tmp_path,monkeypatch):
+    _, manager, _, worker, _ = harness
+    rows=add(manager,tmp_path/'background-recovery',2)
+    rows[0].update(state='attention',errorCode='incomplete_video')
+    manager.store.save('items',rows[0])
+    entered,release=asyncio.Event(),asyncio.Event()
+    async def recover():
+        entered.set();await release.wait()
+    monkeypatch.setattr(manager,'known_source_version',lambda item:rows[0]['fileVersion'] if item['id']==rows[0]['id'] else None)
+    monkeypatch.setattr(manager,'restore_probe_timeouts',recover)
+    try:
+        await asyncio.wait_for(manager.tick(),1)
+        await asyncio.wait_for(entered.wait(),1)
+        await settle(manager)
+        assert any(call['id']==rows[1]['id'] for call in worker.calls)
+    finally:
+        release.set()
+        if manager.probe_recovery_task:await manager.probe_recovery_task
+
+
+@pytest.mark.asyncio
+async def test_empty_probe_recovery_does_not_wake_a_busy_poll_loop(harness):
+    _,manager,_,_,_=harness
+    manager.wake.clear();manager.start_probe_recovery();await asyncio.sleep(0)
+    assert manager.probe_recovery_task is None and not manager.wake.is_set()
+
+
+@pytest.mark.asyncio
+async def test_resumed_parts_do_not_count_as_new_transfer_speed(harness,tmp_path):
+    _,manager,_,_,clock=harness
+    item=add(manager,tmp_path/'speed')[0]
+    item.update(state='uploading',phase='uploading',size=100,parts={})
+    manager.store.save('items',item)
+    manager.runtime[item['id']]={'bytes':0,'sampleBytes':0,'sampleAt':clock[0],'lastProgress':clock[0]}
+    await manager.worker_event(item['id'],{'event':'part','number':1,'size':60,'etag':'resumed'})
+    clock[0]+=.001
+    await manager.worker_event(item['id'],{'event':'progress','bytes':61})
+    assert manager.runtime[item['id']]['speed']==0
+    clock[0]+=1
+    await manager.worker_event(item['id'],{'event':'progress','bytes':70})
+    assert 9<manager.runtime[item['id']]['speed']<11
+
+
+@pytest.mark.asyncio
 async def test_human_import_blocks_only_its_target_but_allows_one_preupload(harness,tmp_path):
     _,manager,platform,worker,_ = harness
     platform.rows['27912'] = [{'id':55,'dataset':27912,'type':1,'status':2,'config':{'source':{'files':[{'key':'human'}]}}}]
@@ -371,16 +540,18 @@ async def test_scan_is_explicit_recursive_idempotent_and_keeps_uncertain_separat
     platform.logs={'71':['/data/magnet.mp4','/data/done.mp4'],'72':['/data/bed.mp4','/data/done.mp4']}
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://localhost') as http:
         data={'directory':str(folder),'requestId':'scan-one'}
-        assert (await http.post('/api/uploads/scan',json=data)).status_code==202
+        assert (await http.post('/api/uploads/scan',json=data)).status_code==409
+        manager.scan(data['directory'], data['requestId'])
         await manager.scan_task
         assert len(manager.store.list('items'))==4
-        assert (await http.post('/api/uploads/scan',json=data)).status_code==202
+        manager.scan(data['directory'], data['requestId'])
         assert len(manager.store.list('items'))==4
-        assert (await http.post('/api/uploads/scan',json={**data,'directory':str(tmp_path)})).status_code==409
+        with pytest.raises(Exception):
+            manager.scan(str(tmp_path), data['requestId'])
         (folder/'later.mp4').write_bytes(b'video123')
         await manager.tick(); await settle(manager)
         assert len(manager.store.list('items'))==4, 'No automatic scan for new files'
-        assert (await http.post('/api/uploads/scan',json={**data,'requestId':'scan-two'})).status_code==202
+        manager.scan(data['directory'], 'scan-two')
         await manager.scan_task
         assert len(manager.store.list('items'))==6
         public=(await http.get('/api/uploads')).text

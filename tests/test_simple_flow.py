@@ -283,7 +283,7 @@ async def preview_video(client):
 
 async def new_video(client, app, download_after_collection=False):
     plan = await preview_video(client)
-    submit = await client.post('/api/jobs', json={"planId": plan["id"],
+    submit = await client.post('/api/jobs', json={"confirmed": True, "planId": plan["id"],
                                                "downloadAfterCollection": download_after_collection})
     assert submit.status_code == 202
     jobs = app.state.jobs
@@ -319,7 +319,7 @@ async def test_collect_and_download_requires_directory_then_publishes_only_opted
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:8766") as client:
             app.state.videos.ffprobe = lambda path: asyncio.sleep(0, result=3600.0)
             plan = await preview_video(client)
-            body = {"planId": plan["id"], "downloadAfterCollection": True}
+            body = {"confirmed": True, "planId": plan["id"], "downloadAfterCollection": True}
             missing = await client.post('/api/jobs', json=body)
             assert missing.status_code == 400
             assert not app.state.jobs.store.list() and not platform.batch_sizes
@@ -410,14 +410,14 @@ async def test_existing_batch_replay_cannot_opt_into_download_and_remote_duplica
             row = await new_video(client, app)
             await client.post('/api/settings/directory', json={"directory": str(tmp_path / 'final')})
             first = app.state.jobs.store.list()[0]
-            replay = await client.post('/api/jobs', json={"planId": first['planId'], "downloadAfterCollection": True})
+            replay = await client.post('/api/jobs', json={"confirmed": True, "planId": first['planId'], "downloadAfterCollection": True})
             assert replay.json()['id'] == first['id'] and not replay.json()['downloadAfterCollection']
             app.state.videos.sync_jobs()
             assert not app.state.videos.store.get(row['id'])['versions'][0].get('downloadRequested')
             # A new preview of this time range must be deduplicated, not approved for download.
             plan = await preview_video(client)
             assert plan['tasks'][0]['status'] == 'duplicate'
-            duplicate = await client.post('/api/jobs', json={"planId": plan['id'], "downloadAfterCollection": True})
+            duplicate = await client.post('/api/jobs', json={"confirmed": True, "planId": plan['id'], "downloadAfterCollection": True})
             assert duplicate.status_code == 400
             assert len(app.state.videos.store.list()) == 1
 
@@ -461,6 +461,7 @@ async def test_capture_preview_correction_withdraw_and_final_replacement(app_fac
             withdrawn = await client.post(f'/api/videos/{original["id"]}/withdraw', json={
                 "version": 1, "expectedRevision": 1, "requestId": "withdraw-1"})
             assert withdrawn.status_code == 202, withdrawn.text
+            await wait_video_operation(app, withdrawn)
             assert candidate_id not in platform.parents
             assert old_file.is_file() and original_id in platform.parents
             second = await client.post(f'/api/videos/{original["id"]}/corrections', json={
@@ -719,8 +720,9 @@ async def test_withdraw_collecting_correction_keeps_original(app_factory, platfo
             withdrawn = await client.post(f'/api/videos/{row["id"]}/withdraw', json={
                 "version": 1, "expectedRevision": 1, "requestId": "withdraw"})
             assert withdrawn.status_code == 202, withdrawn.text
+            await wait_video_operation(app, withdrawn)
             assert candidate not in platform.parents and original_id in platform.parents
-            assert withdrawn.json()["activeRevision"] == 0
+            assert app.state.videos.store.get(row["id"])["activeRevision"] == 0
 
 
 @pytest.mark.asyncio
@@ -747,7 +749,8 @@ async def test_continuous_corrections_and_withdraw_restore_previous_version(app_
             withdrawn = await client.post(f'/api/videos/{row["id"]}/withdraw', json={
                 "version": 3, "expectedRevision": 3, "requestId": "withdraw-latest"})
             assert withdrawn.status_code == 202, withdrawn.text
-            assert withdrawn.json()["activeRevision"] == 2 and previous_id in platform.parents
+            await wait_video_operation(app, withdrawn)
+            assert app.state.videos.store.get(row["id"])["activeRevision"] == 2 and previous_id in platform.parents
             stale = await client.post(f'/api/videos/{row["id"]}/corrections', json={
                 "startTime": "2026-09-30 02:40:00", "durationSeconds": 1800,
                 "expectedRevision": 3, "requestId": "stale-draft"})
@@ -913,6 +916,7 @@ async def test_remove_protects_corrections_including_withdrawn_and_stale_request
             await app.state.videos.check_once()
             await client.post(f'/api/videos/{row["id"]}/withdraw', json={
                 "version": 1, "expectedRevision": 1, "requestId": "withdrawn"})
+            await asyncio.gather(*tuple(app.state.videos.operation_tasks.values()))
             refused = await client.post(f'/api/videos/{row["id"]}/remove-uncorrected', json={
                 "expectedRevision": 2, "requestId": "refuse-withdrawn-history"})
             assert refused.status_code == 400 and app.state.videos.store.get(row["id"])["activeRevision"] == 0
@@ -935,6 +939,7 @@ async def test_clear_withdrawn_record_verifies_cloud_files_and_never_resurrects(
             await app.state.videos.check_once()
             await client.post(f'/api/videos/{row["id"]}/withdraw', json={
                 "version": 1, "expectedRevision": 1, "requestId": "withdraw"})
+            await asyncio.gather(*tuple(app.state.videos.operation_tasks.values()))
             row = app.state.videos.store.get(row["id"])
             final = tmp_path / "own-final.mp4"
             final.write_bytes(platform.media)
@@ -1140,7 +1145,8 @@ async def test_partial_recovery_reuses_verified_cache_without_creating_a_platfor
                                for name in ('bed', 'magnet')}}
             for name in ('bed', 'magnet'):
                 self.packages.store.items[name] = {'id': name, 'itemId': identity, 'category': name, 'state': 'complete',
-                    'verifiedJobId': 'job-'+name, 'imageCount': 1, 'actualImages': 1, 'outputImageIds': ['image-'+name],
+                    'verifiedJobId': 'job-'+name, 'jobId': 'job-'+name,
+                    'imageCount': 1, 'actualImages': 1, 'outputImageIds': ['image-'+name],
                     'videoFileVersion': values['file_version']}
             self.values = values
             return self.store.items[identity]

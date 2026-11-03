@@ -1,9 +1,10 @@
-"""Private local configuration storage for optional platform auto-login."""
+"""Keychain credentials, with verified one-time import of legacy local secrets."""
 
 import json
 import os
 import tempfile
 from .runtime import credentials_directory
+from . import secure_store
 
 
 CONFIG_DIR = credentials_directory()
@@ -25,12 +26,18 @@ def _read_all() -> dict:
 def load(service: str) -> dict[str, str] | None:
     if service not in _SERVICES:
         raise ValueError("未知的登录平台。")
-    entry = _read_all().get(service)
+    entry = secure_store.load_payload(('platform-login-' + service).encode())
+    legacy = False
+    if entry is None:
+        entry = _read_all().get(service)
+        legacy = bool(entry)
     if not isinstance(entry, dict):
         return None
     account, password = entry.get("account"), entry.get("password")
     if not isinstance(account, str) or not account or not isinstance(password, str) or not password:
         return None
+    if legacy:
+        save(service, account, password)
     return {"account": account, "password": password}
 
 
@@ -40,10 +47,20 @@ def save(service: str, account: str, password: str) -> None:
     if not account.strip() or not password:
         raise ValueError("账号和密码不能为空。")
 
+    value = {"account": account.strip(), "password": password}
+    key = ('platform-login-' + service).encode()
+    secure_store.save_payload(key, value)
+    if secure_store.load_payload(key) != value:
+        raise secure_store.SecureStoreError('系统未能确认登录信息已保存，旧配置保持原样。')
+    if not CONFIG_FILE.exists():
+        return
     CONFIG_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(CONFIG_DIR, 0o700)
     data = _read_all()
-    data[service] = {"account": account.strip(), "password": password}
+    data.pop(service, None)
+    if not data:
+        CONFIG_FILE.unlink(missing_ok=True)
+        return
 
     fd, temporary = tempfile.mkstemp(prefix=".credentials-", suffix=".tmp", dir=CONFIG_DIR)
     try:

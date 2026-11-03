@@ -1,6 +1,14 @@
 type RecoverableVersion = {state:string;taskId?:string;resultId?:string;errorCode?:string;
   filePath?:string;sha256?:string;localCleanupState?:string;review?:{code:string};recovery?:{state:string;resultVerified?:boolean}};
 
+export function recoveryInProgress(video:{activeRevision:number;revision:number;operation?:{
+  kind:string;state:string;version?:number;expectedRevision?:number}}) {
+  const operation=video.operation;
+  return operation?.kind==='recover-decodable'&&operation.version===video.activeRevision
+    &&operation.expectedRevision===video.revision
+    &&['queued','running','waiting_connection','reconciling'].includes(operation.state);
+}
+
 export function partialComplete(version:RecoverableVersion) {
   return version.recovery?.state==='partial_complete'&&version.recovery.resultVerified===true;
 }

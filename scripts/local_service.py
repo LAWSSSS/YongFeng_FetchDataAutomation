@@ -65,14 +65,18 @@ def main():
             probe.bind(("127.0.0.1", port))
         except OSError:
             raise SystemExit("端口已被其他程序占用，请使用 PORT 指定其他端口。") from None
-    data = ROOT / "data"
-    data.mkdir(exist_ok=True)
+    data = ROOT / "数据" / "系统"
+    data.mkdir(parents=True, exist_ok=True)
     configuration = {
         "Label": label,
         "ProgramArguments": [str(ROOT / ".venv/bin/python"), "-u", "-m", "app.main"],
         "WorkingDirectory": str(ROOT),
         "EnvironmentVariables": {"PORT": str(port), "IVG_INSTANCE_ID": label},
         "RunAtLoad": True,
+        # The browser waits on this local HTTP server. launchd's default
+        # Standard class throttles disk I/O even for these foreground requests;
+        # XPC-based Adaptive promotion does not apply to HTTP connections.
+        "ProcessType": "Interactive",
         "KeepAlive": {"SuccessfulExit": False},
         "ThrottleInterval": 10,
         "StandardOutPath": str(data / "local-service.log"),
@@ -83,7 +87,7 @@ def main():
     path.chmod(0o600)
     result = subprocess.run(["launchctl", "bootstrap", domain, str(path)], capture_output=True)
     if result.returncode:
-        raise SystemExit("后台服务启动失败，请查看 data/local-service.log。")
+        raise SystemExit("后台服务启动失败，请查看 数据/系统/local-service.log。")
     print(f"后台服务启动中：http://127.0.0.1:{port}/")
 
 

@@ -35,14 +35,15 @@ def private_json(path, value):
 
 def read_json(path):
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
     except (OSError, ValueError):
         return {}
 
 
 def profile():
     return Path(os.environ.get("IVG_PROFILE_DIR") or
-                Path.home() / "Library" / "Application Support" / PROFILE_NAME).expanduser().resolve()
+                RESOURCES.parents[2] / "数据" / "系统").expanduser().resolve()
 
 
 @contextlib.contextmanager
@@ -59,7 +60,7 @@ def lock(path, blocking=True):
 def environment(home, manifest, profile_id, instance_id):
     env = os.environ.copy()
     for key in list(env):
-        if key.startswith(("PYTHON", "DYLD_", "LD_")):
+        if key.startswith(("PYTHON", "DYLD_", "LD_", "IVG_")):
             env.pop(key, None)
     env.update(IVG_PORTABLE="1", IVG_RESOURCES=str(RESOURCES), IVG_PROFILE_DIR=str(home),
                IVG_PROFILE_ID=profile_id, IVG_INSTANCE_ID=instance_id,
@@ -94,9 +95,28 @@ def open_browser(port, disabled=False):
         subprocess.run(["/usr/bin/open", f"http://127.0.0.1:{port}/"], check=False)
 
 
+def server_locked(home):
+    """A busy/unresponsive writer is still a writer; never spawn over it."""
+    try:
+        with lock(home / "server.lock", blocking=False):
+            return False
+    except BlockingIOError:
+        return True
+
+
+def release_manifest():
+    manifest = read_json(RESOURCES / "release.json")
+    if manifest.get("bundleId") != BUNDLE_ID or not manifest.get("packageId"):
+        raise RuntimeError("应用文件不完整，请重新解压完整包。")
+    return manifest
+
+
 def prepare_profile():
     home = profile()
-    home.mkdir(parents=True, mode=0o700, exist_ok=True)
+    try:
+        home.mkdir(parents=True, mode=0o700, exist_ok=True)
+    except OSError:
+        raise RuntimeError("程序所在位置不可写，请将整个程序文件夹移到可写的磁盘后再打开。") from None
     os.chmod(home, 0o700)
     path = home / "profile.json"
     with lock(home / "launch.lock"):
@@ -108,9 +128,7 @@ def prepare_profile():
 
 
 def launch(no_browser=False):
-    manifest = read_json(RESOURCES / "release.json")
-    if manifest.get("bundleId") != BUNDLE_ID or not manifest.get("packageId"):
-        raise RuntimeError("应用文件不完整，请重新解压完整包。")
+    manifest = release_manifest()
     home, profile_id = prepare_profile()
     with lock(home / "launch.lock"):
         state = read_json(home / "server.json")
@@ -120,6 +138,8 @@ def launch(no_browser=False):
                 raise RuntimeError("旧版采集助手仍在运行，请先使用旧版的停止入口，再打开新版。进度会保留。")
             open_browser(state["port"], no_browser)
             return state
+        if server_locked(home):
+            raise RuntimeError("采集助手正在启动、忙碌或安全停止中，请稍后再打开；未创建第二个后台实例。")
         instance_id = uuid4().hex
         executable = RESOURCES / "runtime" / "backend" / "bin" / "python3.13"
         logs = home / "logs"
@@ -174,10 +194,13 @@ def serve(instance_id):
 
 
 def stop():
+    manifest = release_manifest()
     home, profile_id = prepare_profile()
     with lock(home / "launch.lock"):
         state = read_json(home / "server.json")
-        if not verified_server(state, profile_id):
+        if not verified_server(state, profile_id, manifest["packageId"]):
+            if server_locked(home):
+                return {"stopped": False, "message": "已有实例运行但无法核实为本包，请稍后重试或使用运行版本的停止入口。未停止其他实例。"}
             return {"stopped": False, "message": "本包没有正在运行的实例。"}
         os.kill(state["pid"], signal.SIGTERM)
         for _ in range(160):

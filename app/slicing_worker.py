@@ -10,6 +10,7 @@ import hashlib
 from pathlib import Path
 
 from .media_validation import MediaValidationError, verify_video_tail
+from .frame_decode import decode_position
 
 
 class FrameExtractionError(RuntimeError):
@@ -69,7 +70,7 @@ def jpeg_frames(command):
 
 def probe(path, ffprobe):
     result = subprocess.run([ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries",
-        "format=duration,size:stream=width,height,avg_frame_rate,r_frame_rate", "-of", "json", path],
+        "format=duration,size:stream=width,height,avg_frame_rate,r_frame_rate,start_time", "-of", "json", path],
         capture_output=True, timeout=40, check=False)
     if result.returncode:
         raise RuntimeError("video_probe_failed")
@@ -87,7 +88,8 @@ def probe(path, ffprobe):
         frame_rate = 25.0
     return {"duration": float(fmt["duration"]), "size": int(fmt.get("size", 0)),
             "width": int(stream.get("width", 0)), "height": int(stream.get("height", 0)),
-            "frameRate": frame_rate if math.isfinite(frame_rate) and frame_rate > 0 else 25.0}
+            "frameRate": frame_rate if math.isfinite(frame_rate) and frame_rate > 0 else 25.0,
+            "streamStartTime": float(stream.get("start_time") or 0)}
 
 
 def verify_file_version(path, expected, *, check_edges=True):
@@ -125,35 +127,17 @@ def extract_requested_frames(path, ffmpeg, metadata, points, *, skip_undecodable
     if skip_undecodable:
         expected = metadata.get("_expectedFileVersion")
         verify_file_version(path, expected)
-        io_markers = ("input/output error", "permission denied", "device not configured", "no such file or directory",
-                      "read error", "i/o error", "error opening input")
+        details = metadata.setdefault("_decodeObservations", {})
         for timestamp in all_points:
             verify_file_version(path, expected, check_edges=False)
-            command = [ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-threads", "2",
-                       "-ss", f"{timestamp:.6f}", "-i", path, "-map", "0:v:0", "-an", "-sn",
-                       "-frames:v", "1", "-threads", "2", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"]
-            image_bytes = None
-            for attempt in range(2):
-                try:
-                    result = subprocess.run(command, capture_output=True, timeout=30, check=False)
-                except subprocess.TimeoutExpired:
-                    raise FrameExtractionError("frame_timeout", timestamp=timestamp) from None
-                except OSError:
-                    raise FrameExtractionError("frame_tool_error", timestamp=timestamp) from None
-                stderr = result.stderr.decode(errors="replace").lower()
-                if any(marker in stderr for marker in io_markers):
-                    raise FrameExtractionError("frame_io_error", timestamp=timestamp) from None
-                candidate = result.stdout
-                if (result.returncode == 0 and candidate.startswith(b"\xff\xd8")
-                        and candidate.endswith(b"\xff\xd9")):
-                    image_bytes = candidate
-                    break
+            try:
+                decoded = decode_position(path, ffmpeg, timestamp, metadata, expected=expected,
+                    tail=abs(timestamp - max(0, duration - 1 / frame_rate)) < 1e-5)
+            except RuntimeError as error:
+                raise FrameExtractionError(str(error), timestamp=timestamp) from None
             verify_file_version(path, expected, check_edges=False)
-            if image_bytes is None:
-                yield timestamp, None
-                continue
-            yield timestamp, image_bytes
-            del image_bytes
+            details[timestamp] = decoded.observation()
+            yield timestamp, decoded.image
         verify_file_version(path, expected)
         return
     regular_by_category = {
@@ -280,7 +264,11 @@ class Models:
                 raise RuntimeError("magnet_model_missing")
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
-            self.magnet = (module, ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"]))
+            options = ort.SessionOptions()
+            options.intra_op_num_threads = 2
+            options.inter_op_num_threads = 1
+            self.magnet = (module, ort.InferenceSession(str(model_path), sess_options=options,
+                                                       providers=["CPUExecutionProvider"]))
         if category == "bed":
             deploy = Path(self.settings["bedDeployDirectory"]).expanduser().resolve()
             model_path = Path(self.settings["bedModelPath"]).expanduser().resolve()
@@ -350,7 +338,17 @@ def process(request):
         emit({"event": "error", "category": "both", "code": "frame_tool_missing"})
         return
     ffprobe = str(Path(ffmpeg).with_name("ffprobe"))
-    metadata = probe(path, ffprobe)
+    emit({'event': 'stage', 'stage': 'preparing_video'})
+    cached = request.get('metadata') or {}
+    expected = request.get('expectedFileVersion') or {}
+    valid_cached = bool(expected and cached.get('size') == expected.get('size')
+            and isinstance(cached.get('duration'), (int, float)) and math.isfinite(cached['duration'])
+            and cached['duration'] > 0 and cached.get('width', 0) > 0 and cached.get('height', 0) > 0)
+    if valid_cached and (not request.get('skipUndecodableSamples') or 'streamStartTime' in cached):
+        verify_file_version(path, expected, check_edges=False)
+        metadata = dict(cached)
+    else:
+        metadata = probe(path, ffprobe)
     metadata["_expectedFileVersion"] = request.get("expectedFileVersion")
     settings = request["settings"]
     points = request["points"]
@@ -362,7 +360,7 @@ def process(request):
     emit({"event": "stage", "stage": "checking_media", "total": len(set(
         value for values in categories.values() for value in values))})
     skip_undecodable = bool(request.get("skipUndecodableSamples"))
-    if not skip_undecodable:
+    if not skip_undecodable and not (request.get('verifiedMedia') and valid_cached):
         try:
             verify_video_tail(path, ffmpeg, metadata["duration"])
         except MediaValidationError as error:
@@ -393,25 +391,29 @@ def process(request):
                                           skip_undecodable=skip_undecodable)
         for timestamp, image_bytes in frames:
             active = [category for category, values in categories.items()
-                      if any(abs(value - timestamp) < 0.05 for value in values)]
+                      if category in available and any(abs(value - timestamp) < 0.05 for value in values)]
             if image_bytes is None:
                 for category in active:
                     emit({"event": "observation", "category": category, "time": timestamp,
-                          "label": "unavailable", "score": None, "code": "decode_unavailable"})
+                          "label": "unavailable", "score": None, "code": "decode_unavailable",
+                          **metadata.get("_decodeObservations", {}).get(timestamp, {})})
                     observations += 1
                 continue
             for category in active:
                 try:
                     result = models.classify(image_bytes, category)
                 except Exception:
+                    available.discard(category)
                     emit({"event": "error", "category": category, "code": "inference_failed"})
                     continue
-                emit({"event": "observation", "category": category, "time": timestamp, **result})
+                emit({"event": "observation", "category": category, "time": timestamp, **metadata.get("_decodeObservations", {}).get(timestamp, {}), **result})
                 observations += 1
             del image_bytes
+            if not available:
+                break
     except RuntimeError as error:
         allowed = {"local_video_missing", "frame_tool_missing", "media_incomplete", "frame_timeout",
-                   "frame_tool_error", "frame_io_error", "source_changed"}
+                   "frame_tool_error", "frame_io_error", "source_changed", "frame_timestamp_missing"}
         code = str(error) if str(error) in allowed else "frame_extract_failed"
         emit({"event": "error", "category": "both", "code": code, "stage": "sampling",
               "time": getattr(error, "timestamp", None)})

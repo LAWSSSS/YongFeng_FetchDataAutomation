@@ -70,6 +70,10 @@ async def test_reused_result_does_not_accept_same_names_with_different_cloud_ids
     remote.rows[0]['id']='99'
     await manager.verify(manager.store.get('items','p5'),job('100','old-key'))
     saved=manager.store.get('items','p5')
+    assert saved['state']=='importing' and saved['actualImages']==1
+    assert saved['jobId']=='100' and saved['verificationAutoRetryForJob']=='100'
+    await manager.verify(saved,job('100','old-key'))
+    saved=manager.store.get('items','p5')
     assert saved['state']=='attention' and saved['actualImages']==1
     db.close()
 

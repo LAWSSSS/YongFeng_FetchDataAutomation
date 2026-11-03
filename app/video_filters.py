@@ -9,6 +9,12 @@ def record_status(row):
     active = next(v for v in row["versions"] if v["revision"] == row["activeRevision"])
     if partial_complete(active):
         return 'saved'
+    operation = row.get('operation') or {}
+    if (operation.get('kind') == 'recover-decodable'
+            and operation.get('version') == row['activeRevision']
+            and operation.get('expectedRevision') == row['revision']
+            and operation.get('state') in {'queued', 'running', 'waiting_connection', 'reconciling'}):
+        return 'processing'
     if active["state"] in ("attention", "failed", "uncertain"):
         return "review"
     if active["state"] == "saved":
@@ -31,7 +37,7 @@ def filter_records(rows, query):
     query = query or {}
     status, correction = query.get("status", "all"), query.get("correction", "all")
     basis = query.get("timeBasis", "quality")
-    if status not in ("all", "ready", "waiting", "review", "download", "saved", "complete", "deleting"):
+    if status not in ("all", "ready", "waiting", "review", "download", "saved", "complete", "deleting", "processing"):
         raise ValueError("视频状态筛选无效。")
     if correction not in ("all", "corrected", "withdrawn", "uncorrected") or basis not in ("quality", "capture"):
         raise ValueError("更正或时间依据筛选无效。")

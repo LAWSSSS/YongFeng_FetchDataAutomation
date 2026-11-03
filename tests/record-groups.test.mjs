@@ -1,9 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { batchDate, canDownload, completedPartialVideo, groupVideos, splitInspections, syncVideoSelection, videoCategory, videoStatusOptions, selectVideoScope } from '../src/record-groups.ts';
+import { batchDate, canDownload, completedPartialVideo, groupVideos, splitInspections, syncVideoSelection, videoCategory, videoStatusOptions, selectVideoScope, visibleVideoSelections } from '../src/record-groups.ts';
 
 const video = (id, jobId, state, extra = {}) => ({id, jobId, activeRevision: 0, revision: 0,
-  versions: [{revision: 0, state}], ...extra});
+  versions: [{revision: 0, state}], capabilities:{version:0,expectedRevision:0,canConfirmFinal:state==='ready'}, ...extra});
 
 test('bulk selection never silently adopts a newer revision or version', () => {
   const selection = new Map([['keep', {id:'keep', version:1, expectedRevision:2}],
@@ -15,14 +15,15 @@ test('bulk selection never silently adopts a newer revision or version', () => {
   ]);
   assert.equal(next.has('keep'),false);
   assert.equal(next.has('stale'), false);
-  assert.equal(next.get('hidden').expectedRevision, 1);
-  assert.equal(syncVideoSelection(selection,[{id:'keep',revision:2,activeRevision:1}]),selection);
+  assert.equal(next.has('hidden'),false);
+  const visible=syncVideoSelection(selection,[{id:'keep',revision:2,activeRevision:1}]);
+  assert.deepEqual([...visible.keys()],['keep']);
 });
 
 test('one selection control keeps the requested scope and excludes deleting records',()=>{
   const rows=[video('ready','j','ready'),video('review','j','failed'),video('done','j','failed',{
     versions:[{revision:0,state:'failed',recovery:{state:'partial_complete',resultVerified:true}}]}),
-    video('deleting','j','ready',{deletion:{state:'pending'}})];
+    video('deleting','j','ready',{deletion:{state:'pending'},capabilities:{version:0,expectedRevision:0,canConfirmFinal:false}})];
   assert.deepEqual(selectVideoScope(rows,'all').map(v=>v.id),['ready','review','done']);
   assert.deepEqual(selectVideoScope(rows,'downloadable').map(v=>v.id),['ready']);
   assert.deepEqual(selectVideoScope(rows,'partial').map(v=>v.id),['done']);
@@ -50,14 +51,14 @@ test('one group per immutable job ID; filtering never merges batches with identi
   assert.equal(before, JSON.stringify(rows));
 });
 
-test('batch download uses the current revision and excludes review, saved, queued and deleting records', () => {
+test('final confirmation only uses a current backend capability, never a ready or waiting guess', () => {
   const records = [video('current','j','saved',{activeRevision:2,revision:3,versions:[
-    {revision:0,state:'saved'}, {revision:2,state:'ready'}]}),
+    {revision:0,state:'saved'}, {revision:2,state:'ready'}],capabilities:{version:2,expectedRevision:3,canConfirmFinal:true}}),
     video('saved','j','saved'), video('review','j','attention'), video('unbound','j','pending'),
     video('uncertain','j','uncertain'), video('failed','j','failed'), video('waiting','j','waiting'),
-    video('submitted','j','submitted'),video('deleting','j','ready',{deletion:{state:'pending'}}),
-    video('queued','j','ready',{versions:[{revision:0,state:'ready',downloadRequested:true}]})];
-  assert.deepEqual(records.filter(canDownload).map(r => r.id), ['current','waiting','submitted']);
+    video('submitted','j','submitted'),video('deleting','j','ready',{deletion:{state:'pending'},capabilities:{version:0,expectedRevision:0,canConfirmFinal:false}}),
+    video('queued','j','ready',{capabilities:{version:0,expectedRevision:0,canConfirmFinal:false},versions:[{revision:0,state:'ready',downloadRequested:true}]})];
+  assert.deepEqual(records.filter(canDownload).map(r => r.id), ['current']);
   const counts = groupVideos(records,[])[0].counts;
   assert.equal(counts.review,3);
   assert.equal(counts.download,1);
@@ -78,4 +79,16 @@ test('verified partial results belong to saved and batch selection never include
   assert.deepEqual(groupVideos([row,video('normal','j','saved')],[])[0].counts,{saved:2});
   assert.ok(videoStatusOptions.some(o=>o.value==='saved'));
   assert.ok(!videoStatusOptions.some(o=>o.value==='complete'));
+});
+
+
+test('mutation selections intersect visible current rows and authoritative confirmation capabilities',()=>{
+  const current=video('ready','j','ready');
+  const denied=video('denied','j','ready',{capabilities:{version:0,expectedRevision:0,canConfirmFinal:false}});
+  const choices=['ready','denied','hidden'].map(id=>({id,version:0,expectedRevision:0}));
+  assert.deepEqual(visibleVideoSelections(choices,[current,denied]).map(row=>row.id),['ready','denied']);
+  assert.deepEqual(visibleVideoSelections(choices,[current,denied],true).map(row=>row.id),['ready']);
+  assert.deepEqual(visibleVideoSelections(choices,[{...current,revision:1}],true),[]);
+  assert.equal(canDownload({...current,capabilities:undefined}),false);
+  assert.equal(canDownload({...current,capabilities:{...current.capabilities,version:1}}),false);
 });

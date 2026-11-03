@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import subprocess
+import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,6 +25,22 @@ def issues(data, *, documentation=False):
             and not (documentation and kind == "embedded-url-password")]
 
 
+def archive_issues(path):
+    """Inspect bundled source text in place; never extract user archives."""
+    findings = []
+    with zipfile.ZipFile(path) as archive:
+        for info in archive.infolist():
+            name = Path(info.filename)
+            if name.name in PRIVATE_NAMES or name.suffix.lower() in {".sqlite3", ".db", ".mp4", ".mov", ".jpg", ".jpeg"}:
+                findings.append((info.filename, "private-runtime-file"))
+            if name.suffix.lower() in TEXT_SUFFIXES:
+                if info.file_size > 30 * 1024 ** 2:
+                    findings.append((info.filename, "unscanned-large-text"))
+                else:
+                    findings.extend((info.filename, kind) for kind in issues(archive.read(info)))
+    return findings
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--directory", type=Path)
@@ -38,6 +55,8 @@ def main():
             relative = str(path.relative_to(args.directory))
             if path.name in PRIVATE_NAMES or path.suffix in {".sqlite3", ".db", ".mp4", ".mov", ".jpg", ".jpeg"}:
                 failures.append((relative, "private-runtime-file"))
+            if path.suffix.lower() == ".zip":
+                failures.extend((relative + "!" + name, kind) for name, kind in archive_issues(path))
             if path.suffix.lower() in TEXT_SUFFIXES and path.stat().st_size < 30 * 1024 ** 2:
                 count += 1
                 data = path.read_bytes()

@@ -142,6 +142,9 @@ async def test_import_requires_every_exact_image_from_this_job(packages, tmp_pat
     packages.store.save("items", item)
     packages.remote.rows = rows
     await packages.verify(item, job_for(item))
+    assert packages.store.get("items", item["id"])["state"] == "importing"
+    assert item['verificationAutoRetryForJob'] == item['jobId']
+    await packages.verify(item, job_for(item))
     assert packages.store.get("items", item["id"])["state"] == "attention"
     assert Path(item["path"]).exists()
 
@@ -152,6 +155,8 @@ async def test_old_same_named_images_are_not_new_import_evidence(packages, tmp_p
     item["beforeImageIds"] = ["1", "2"]
     packages.store.save("items", item)
     packages.remote.rows = [{"id": str(i+1), "name": name} for i,name in enumerate(item["images"])]
+    await packages.verify(item, job_for(item))
+    assert item["state"] == "importing"
     await packages.verify(item, job_for(item))
     assert item["state"] == "attention"
     for row in packages.remote.rows:
@@ -166,6 +171,8 @@ async def test_legacy_job_without_snapshot_or_association_stays_for_review(packa
     item.pop("beforeImageIds")
     packages.store.save("items", item)
     packages.remote.rows = [{"id": str(i+1), "name": name} for i,name in enumerate(item["images"])]
+    await packages.verify(item, job_for(item))
+    assert item["state"] == "importing"
     await packages.verify(item, job_for(item))
     assert item["state"] == "attention"
 
@@ -199,7 +206,10 @@ async def test_serial_ticks_reconcile_lost_response_without_duplicate_submit(pac
     assert packages.remote.submits == 0
     gate.set()
     await first
+    await asyncio.wait_for(asyncio.gather(*packages.target_tasks.values()), 1)
+    packages.target_next_check.clear()  # Next independent platform poll.
     await packages.tick()
+    await asyncio.wait_for(asyncio.gather(*packages.target_tasks.values()), 1)
     saved = packages.store.get("items", item["id"])
     assert packages.remote.submits == 1 and saved["jobId"] == "901"
 
@@ -430,25 +440,39 @@ async def test_export_keeps_other_models_new_receipts_and_blocks_stale_manual_ed
     assert saved["categories"]["bed"]["packageId"]
 
 
-def test_cleanup_validates_all_versions_before_deleting_anything(packages, tmp_path):
-    source = tmp_path / 'video.mp4'
-    source.write_bytes(b'original')
-    for kind in ('bed','magnet'):
-        item = package(tmp_path, kind, kind, 'complete')
-        image_dir = tmp_path / kind / 'image'
-        image_dir.mkdir()
-        for name in item['images']: (image_dir/name).write_bytes(JPEG)
-        item.update(videoFileVersion=source_fingerprint(source), imageDir=str(image_dir),
-                    imageVersions={name:source_fingerprint(image_dir/name) for name in item['images']},
-                    actualImages=2,verifiedJobId='901')
-        packages.store.save('items',item)
-    # A newly replaced video at the same path is not the original we may clean.
-    source.write_bytes(b'user replacement')
-    item = packages.store.get('items','magnet')
-    packages.delete_if_both_complete(item)
-    assert source.read_bytes() == b'user replacement'
-    assert all(Path(row['path']).is_file() for row in packages.store.list('items'))
-    assert all(row['cleanupState'] == 'attention' for row in packages.store.list('items'))
+@pytest.mark.asyncio
+@pytest.mark.parametrize('replacement', ['original', 'last_photo'])
+async def test_cleanup_validates_all_versions_before_deleting_anything(tmp_path, replacement):
+    from tests.test_manual_completed_cleanup import prepared
+    from tests.test_slicing_performance import close_app
+    app, workspace, asset = await prepared(tmp_path)
+    packages = app.state.slicing.packages
+    try:
+        source = Path(asset['path'])
+        entries = workspace.media_entries(asset)
+        original_bytes = {entry['path']: Path(entry['path']).read_bytes() for entry in entries}
+        # Import completion grants no deletion permission, even with exact receipts.
+        for package_row in packages.store.list('items'):
+            packages.delete_if_both_complete(package_row)
+        assert all(Path(path).read_bytes() == data for path, data in original_bytes.items())
+        assert all(row['cleanupState'] == 'pending_manual' for row in packages.store.list('items'))
+        operation = await workspace.request_cleanup_completed(workspace.config['revision'], 'explicit-safe-cleanup')
+        assert operation['total'] == 1
+        # Validate the entire fixed manifest before unlinking its first original:
+        # the last photograph changing must protect all earlier valid files too.
+        changed = source if replacement == 'original' else Path(entries[-1]['path'])
+        changed.write_bytes(b'user replacement after manual snapshot')
+        await workspace.cleanup(workspace.get('assets', asset['id']))
+        current = workspace.get('assets', asset['id'])
+        assert current['cleanup']['state'] == 'attention'
+        assert '版本变化' in current['cleanup']['message']
+        assert workspace.cleanup_operation('explicit-safe-cleanup')['failed'] == 1
+        assert changed.read_bytes() == b'user replacement after manual snapshot'
+        assert all(Path(path).is_file() for path in original_bytes)
+        assert all(Path(path).read_bytes() == data for path, data in original_bytes.items() if Path(path) != changed)
+        assert not any(entry.get('state') == 'deleted' for entry in current['cleanup']['manifest'])
+    finally:
+        await close_app(app)
 
 
 @pytest.mark.asyncio

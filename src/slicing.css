@@ -96,3 +96,22 @@
 .slice-path-current {margin:10px 0;color:#52675a;font-size:13px;line-height:1.6;overflow-wrap:anywhere}
 .slice-path-current code {display:block;margin-top:4px;color:#315c45;overflow-wrap:anywhere;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
 @media(max-width:900px) {.slicing-management-grid {grid-template-columns:1fr}}
+
+/* Shared controls for current processing rows. */
+.attention-actions button {min-height:42px;font-size:14px}
+.attention-list {list-style:none;padding:0;margin:14px 0 0;border-top:1px solid #e3eae1}
+.attention-row {display:flex;align-items:center;justify-content:space-between;gap:18px;padding:15px 0;border-bottom:1px solid #e3eae1}
+.attention-copy {min-width:0;flex:1}
+.attention-name {display:flex;align-items:center;flex-wrap:wrap;gap:7px 11px;color:#233c2d}
+.attention-name strong {font-size:15px;overflow-wrap:anywhere}
+.attention-name>span:not(.attention-label) {font-size:13px;color:#53695a;font-variant-numeric:tabular-nums}
+.attention-actions {display:flex;justify-content:flex-end;flex-wrap:wrap;gap:8px;flex-shrink:0}
+.attention-empty {font-size:13px;line-height:1.55;color:#56685b}
+.sr-only {position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+.processing-history {padding-top:10px;color:#526b58;font-size:13px}
+.processing-history summary {cursor:pointer}
+@media(max-width:700px) {
+  .attention-row {align-items:stretch;flex-direction:column}
+  .attention-actions button {min-height:44px}
+  .attention-actions {justify-content:flex-start}
+}

@@ -9,6 +9,13 @@ from app.submissions import SubmissionLog
 from tests.test_slicing_performance import close_app
 
 
+async def delete_records(app, client, url, **kwargs):
+    response = await client.post(url, **kwargs)
+    if response.status_code == 202:
+        await app.state.record_deletion.tick()
+    return response
+
+
 def seed_slice(app, path, identity='bed', revision=3):
     category = 'bed' if identity != 'magnet' else 'magnet'
     item = {'id': identity, 'name': path.name, 'path': str(path), 'runId': 'run', 'revision': revision,
@@ -96,15 +103,15 @@ async def test_remove_card_is_atomic_idempotent_and_keeps_all_processing_evidenc
     payload = {'requestId': 'remove-pair', 'selections': [{'id': r['id'], 'expectedRevision': r['revision']} for r in before]}
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://127.0.0.1') as client:
         stale = copy.deepcopy(payload); stale['selections'][1]['expectedRevision'] = 2
-        assert (await client.post('/api/slicing/records/remove', json=stale)).status_code == 409
+        assert (await delete_records(app, client, '/api/slicing/records/remove', json=stale)).status_code == 409
         assert len((await client.get('/api/slicing')).json()['items']) == 2
-        response = await client.post('/api/slicing/records/remove', json=payload)
-        assert response.status_code == 200 and response.json()['items'] == []
-        assert response.json()['hiddenRecordCount'] == 2
-        assert (await client.post('/api/slicing/records/remove', json=payload)).status_code == 200
+        response = await delete_records(app, client, '/api/slicing/records/remove', json=payload)
+        assert response.status_code == 202 and (await client.get('/api/slicing')).json()['items'] == []
+        assert (await client.get('/api/slicing')).json()['hiddenRecordCount'] == 2
+        assert (await delete_records(app, client, '/api/slicing/records/remove', json=payload)).status_code == 202
         different = {**payload, 'selections': payload['selections'][:1]}
-        assert (await client.post('/api/slicing/records/remove', json=different)).status_code == 409
-        assert (await client.post('/api/slicing/records/remove', json={**payload, 'selections': []})).status_code == 422
+        assert (await delete_records(app, client, '/api/slicing/records/remove', json=different)).status_code == 409
+        assert (await delete_records(app, client, '/api/slicing/records/remove', json={**payload, 'selections': []})).status_code == 422
     assert store.list('items') == before and path.read_bytes() == b'keep-video'
     assert store.get('observations', 'observation')['label'] == 'target'
     await close_app(app)
@@ -128,8 +135,8 @@ async def test_hidden_items_survive_worker_save_restart_and_restore_without_recr
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://127.0.0.1') as client:
         body = {'requestId': 'undo', 'removalId': 'hide'}
         response = await client.post('/api/slicing/records/restore', json=body)
-        assert response.status_code == 200 and response.json()['items'][0]['revision'] == 4
-        assert (await client.post('/api/slicing/records/restore', json=body)).status_code == 200
+        assert response.status_code == 410 and manager.state()['items'] == []
+        assert (await client.post('/api/slicing/records/restore', json=body)).status_code == 410
         assert manager.store.get('items', 'bed')['sourceVideoId'] == 'source-bed'
         assert path.exists()
     await close_app(app)
@@ -147,8 +154,8 @@ async def test_stale_undo_cannot_restore_a_more_recent_deletion(tmp_path):
     manager.visibility.hide(manager.store, 'second-hide', choices)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://127.0.0.1') as client:
         response = await client.post('/api/slicing/records/restore', json={'requestId': 'late-undo', 'removalId': 'first-hide'})
-        assert response.status_code == 409 and manager.state()['items'] == []
-        assert (await client.post('/api/slicing/records/restore', json={'requestId': 'missing', 'removalId': 'absent'})).status_code == 400
+        assert response.status_code == 410 and manager.state()['items'] == []
+        assert (await client.post('/api/slicing/records/restore', json={'requestId': 'missing', 'removalId': 'absent'})).status_code == 410
     await close_app(app)
 
 
@@ -198,13 +205,13 @@ async def test_collection_record_remove_and_undo_work_offline_without_touching_c
     monkeypatch.setattr(manager, 'file_operation', forbid_io)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://127.0.0.1') as client:
         body = {'requestId': 'hide-collection', 'expectedRevision': 9}
-        response = await client.post(f'/api/videos/{row["id"]}/hide-record', json=body)
-        assert response.status_code == 200
+        response = await delete_records(app, client, f'/api/videos/{row["id"]}/hide-record', json=body)
+        assert response.status_code == 202
         assert (await client.get('/api/videos')).json()['totalCount'] == 0
-        assert (await client.post(f'/api/videos/{row["id"]}/hide-record', json=body)).status_code == 200
+        assert (await delete_records(app, client, f'/api/videos/{row["id"]}/hide-record', json=body)).status_code == 202
         assert (await client.post('/api/videos/records/restore', json={
-            'requestId': 'undo-collection', 'removalId': 'hide-collection'})).status_code == 200
-        assert (await client.get('/api/videos')).json()['totalCount'] == 1
+            'requestId': 'undo-collection', 'removalId': 'hide-collection'})).status_code == 410
+        assert (await client.get('/api/videos')).json()['totalCount'] == 0
     assert manager.store.get(row['id']) == before
     assert path.read_bytes() == b'preserve-uploaded-final' and (cache / 'v2.part').read_bytes() == b'keep-checkpoint'
     await close_app(app)
@@ -241,26 +248,27 @@ async def test_date_delete_receipts_and_children_is_soft_exact_and_survives_rest
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://127.0.0.1') as client:
         item = (await client.get('/api/submissions/' + row['id'])).json()['detail']['items'][0]
         removal = {'requestId': 'child-remove', 'selections': [{'id': item['deletionKey'], 'expectedRevision': 0}]}
-        assert (await client.post('/api/submissions/items/remove', json=removal)).status_code == 200
-        assert (await client.post('/api/submissions/items/remove', json=removal)).status_code == 200
+        assert (await delete_records(app, client, '/api/submissions/items/remove', json=removal)).status_code == 202
+        assert (await delete_records(app, client, '/api/submissions/items/remove', json=removal)).status_code == 202
         assert (await client.get('/api/submissions/' + row['id'])).json()['total'] == 0
         assert store.get(job['id'])['items'][0]['taskId'] == 'real-task'
         date = {'requestId': 'date-remove', 'selections': [{'id': row['id'], 'expectedRevision': 0}]}
-        assert (await client.post('/api/submissions/records/remove', json=date)).status_code == 200
+        assert (await delete_records(app, client, '/api/submissions/records/remove', json=date)).status_code == 202
         newer = log.add('collection', '新到记录', {}, submitted_at=job['createdAt'])
-        assert (await client.post('/api/submissions/records/remove', json=date)).status_code == 200
+        assert (await delete_records(app, client, '/api/submissions/records/remove', json=date)).status_code == 202
         assert [r['id'] for r in (await client.get('/api/submissions')).json()] == [newer['id']]
         assert (await client.get('/api/submissions/' + row['id'])).status_code == 404
         restore = {'requestId': 'date-restore', 'removalId': 'date-remove'}
-        assert (await client.post('/api/submissions/records/restore', json=restore)).status_code == 200
-        assert (await client.get('/api/submissions/' + row['id'])).json()['total'] == 0
-        assert (await client.post('/api/submissions/items/restore', json={'requestId': 'child-restore', 'removalId': 'child-remove'})).status_code == 200
-        assert (await client.get('/api/submissions/' + row['id'])).json()['detail']['items'][0]['deletionKey'] == item['deletionKey']
+        assert (await client.post('/api/submissions/records/restore', json=restore)).status_code == 410
+        assert (await client.get('/api/submissions/' + row['id'])).status_code == 404
+        assert (await client.post('/api/submissions/items/restore', json={'requestId': 'child-restore', 'removalId': 'child-remove'})).status_code == 410
+        assert (await client.get('/api/submissions/' + row['id'])).status_code == 404
         videos = (await client.get('/api/videos')).json()['videos']
         assert videos[0]['submittedAt'] == job['createdAt']  # not capture or sync time
     await close_app(app)
     app = create_app(data_dir=tmp_path / 'db')
     assert len(SubmissionLog(app.state.store.db).list('collection')) == 2
+    assert len(SubmissionLog(app.state.store.db).visibility.hidden()) == 1
     await close_app(app)
 
 
@@ -280,20 +288,17 @@ async def test_merged_slice_date_removal_and_restore_are_atomic_without_changing
         assert state['items'][0]['submittedAt'] == row['submittedAt']
         assert state['submissionReceipts'][0]['itemIds'] == [item['id']]
         stale = {**body, 'receipts': [{'id': row['id'], 'expectedRevision': 1}]}
-        assert (await client.post('/api/slicing/records/remove-group', json=stale)).status_code == 409
+        assert (await delete_records(app, client, '/api/slicing/records/remove-group', json=stale)).status_code == 409
         assert len((await client.get('/api/slicing')).json()['items']) == 1
-        result = await client.post('/api/slicing/records/remove-group', json=body)
-        assert result.status_code == 200 and result.json()['items'] == [] and result.json()['submissionReceipts'] == []
-        assert (await client.post('/api/slicing/records/remove-group', json=body)).status_code == 200
+        result = await delete_records(app, client, '/api/slicing/records/remove-group', json=body)
+        assert result.status_code == 202
+        assert (await client.get('/api/slicing')).json()['items'] == []
+        assert (await client.get('/api/slicing')).json()['submissionReceipts'] == []
+        assert (await delete_records(app, client, '/api/slicing/records/remove-group', json=body)).status_code == 202
         restore = {'requestId': 'merged-restore', 'removalId': body['requestId']}
-        assert (await client.post('/api/slicing/records/restore-group', json=restore)).status_code == 200
-        assert (await client.post('/api/slicing/records/restore-group', json=restore)).status_code == 200
-        # A newer deletion of one child prevents partially restoring an older date.
-        await client.post('/api/slicing/records/remove-group', json={**body, 'requestId': 'second-remove'})
-        await client.post('/api/submissions/records/restore', json={'requestId': 'only-receipt', 'removalId': 'second-remove'})
-        await client.post('/api/submissions/records/remove', json={'requestId': 'new-hide', 'selections': body['receipts']})
-        bad = await client.post('/api/slicing/records/restore-group', json={'requestId': 'old-restore', 'removalId': 'second-remove'})
-        assert bad.status_code == 409 and (await client.get('/api/slicing')).json()['items'] == []
+        assert (await client.post('/api/slicing/records/restore-group', json=restore)).status_code == 410
+        assert (await client.post('/api/slicing/records/restore-group', json=restore)).status_code == 410
+        assert (await client.get('/api/slicing')).json()['items'] == []
     assert app.state.slicing.store.list('items') == before and path.read_bytes() == b'original'
     await close_app(app)
 
@@ -314,15 +319,15 @@ async def test_video_date_snapshot_delete_and_exact_submit_dates_do_not_change_c
         assert all(not row['submittedAt'] for row in (await client.get('/api/videos')).json()['videos'])
         selections = [{'id': r['id'], 'expectedRevision': 2} for r in rows]
         stale = [selections[0], {**selections[1], 'expectedRevision': 1}]
-        assert (await client.post('/api/videos/records/remove', json={'requestId': 'date', 'selections': stale})).status_code == 409
+        assert (await delete_records(app, client, '/api/videos/records/remove', json={'requestId': 'date', 'selections': stale})).status_code == 409
         assert len(manager.state()['videos']) == 2
         body = {'requestId': 'date', 'selections': selections}
-        assert (await client.post('/api/videos/records/remove', json=body)).status_code == 200
+        assert (await delete_records(app, client, '/api/videos/records/remove', json=body)).status_code == 202
         assert manager.state()['videos'] == []
         assert manager.store.list() == original
         # Independent visibility ledger allows a legitimate worker progress update.
         row = manager.store.get('second'); row['revision'] = 3; manager.store.save(row)
-        assert (await client.post('/api/videos/records/restore', json={'requestId': 'undo-date', 'removalId': 'date'})).status_code == 200
+        assert (await client.post('/api/videos/records/restore', json={'requestId': 'undo-date', 'removalId': 'date'})).status_code == 410
         assert manager.store.get('second')['versions'][1]['startTime'] == '2026-10-01 03:23:45'
     await close_app(app)
 
@@ -345,4 +350,39 @@ async def test_submit_dates_use_exact_operations_not_capture_last_update_or_late
     assert public['bed']['categories']['bed']['submittedAt'] == '2026-10-20T16:00:00Z'
     assert public['no-submit']['submittedAt'] == ''
     assert app.state.slicing.store.get('items', 'bed')['fileVersion'] == item['fileVersion']
+    await close_app(app)
+
+
+@pytest.mark.asyncio
+async def test_mixed_collection_record_batch_is_atomic_replayable_and_reversible(tmp_path):
+    app = create_app(data_dir=tmp_path / 'db')
+    store = app.state.store
+    job = {'id': 'batch-job', 'createdAt': '2026-10-25T16:00:00Z', 'status': 'complete', 'events': [],
+           'items': [{'key': 'car-a', 'videoName': 'car-a', 'startTime': '2026-10-25 08:00:00',
+                      'endTime': '2026-10-25 09:00:00', 'status': 'submitted', 'taskId': 'task-a'},
+                     {'key': 'car-b', 'videoName': 'car-b', 'startTime': '2026-10-25 09:00:00',
+                      'endTime': '2026-10-25 10:00:00', 'status': 'submitted', 'taskId': 'task-b'}]}
+    store.save(job)
+    log = SubmissionLog(store.db)
+    first = log.add('collection', '采集一', {'jobId': job['id']})
+    second = log.add('collection', '采集二', {'items': []})
+    original = copy.deepcopy(store.get(job['id']))
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://127.0.0.1') as client:
+        item = (await client.get('/api/submissions/' + first['id'])).json()['detail']['items'][0]
+        body = {'requestId': 'mixed-delete',
+                'selections': [{'id': item['deletionKey'], 'expectedRevision': item['revision']}],
+                'receipts': [{'id': second['id'], 'expectedRevision': 0}]}
+        stale = {**body, 'receipts': [{'id': second['id'], 'expectedRevision': 1}]}
+        assert (await delete_records(app, client, '/api/submissions/remove-group', json=stale)).status_code == 409
+        assert (await client.get('/api/submissions/' + first['id'])).json()['total'] == 2
+        assert (await delete_records(app, client, '/api/submissions/remove-group', json=body)).status_code == 202
+        assert (await delete_records(app, client, '/api/submissions/remove-group', json=body)).status_code == 202
+        assert (await client.get('/api/submissions/' + first['id'])).json()['total'] == 1
+        assert (await client.get('/api/submissions/' + second['id'])).status_code == 404
+        undo = {'requestId': 'mixed-undo', 'removalId': 'mixed-delete'}
+        assert (await client.post('/api/submissions/restore-group', json=undo)).status_code == 410
+        assert (await client.post('/api/submissions/restore-group', json=undo)).status_code == 410
+        assert (await client.get('/api/submissions/' + first['id'])).json()['total'] == 1
+        assert (await client.get('/api/submissions/' + second['id'])).status_code == 404
+    assert store.get(job['id']) == original
     await close_app(app)

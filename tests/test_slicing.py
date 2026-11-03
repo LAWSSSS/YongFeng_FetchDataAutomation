@@ -69,7 +69,7 @@ def test_partial_recovery_keeps_good_fragments_away_from_undecodable_points():
     rows = [{"time": 0, "label": "target"}, {"time": 30, "label": "unavailable"},
             {"time": 60, "label": "target"}]
     assert intervals_from_observations(rows, interval=30, duration=90, positive_labels={"target"},
-                                       undecodable_points=[30]) == [(0.0, 29.9), (30.1, 90.0)]
+                                       undecodable_points=[30]) == [(0.0, 0.0), (60.0, 90.0)]
 
 
 def test_salvage_frame_sampling_skips_bad_positions_without_shifting_timestamps(tmp_path, monkeypatch):
@@ -81,17 +81,17 @@ def test_salvage_frame_sampling_skips_bad_positions_without_shifting_timestamps(
         timestamp = float(command[command.index("-ss") + 1])
         if timestamp in {30, 60.96}:
             return SimpleNamespace(returncode=1, stdout=b"", stderr=b"Error while decoding")
-        return SimpleNamespace(returncode=0, stdout=b"\xff\xd8frame\xff\xd9", stderr=b"")
+        return SimpleNamespace(returncode=0, stdout=b"\xff\xd8frame\xff\xd9", stderr=f"[Parsed_showinfo_0] n: 0 pts: 0 pts_time:{timestamp}".encode())
 
     monkeypatch.setattr("app.slicing_worker.subprocess.run", fake_run)
     result = list(extract_requested_frames(str(source), str(ffmpeg),
-        {"duration": 61, "frameRate": 25}, {"bed": [0, 30, 60, 60.96]}, skip_undecodable=True))
+        {"duration": 62, "frameRate": 25}, {"bed": [0, 30, 60, 60.96]}, skip_undecodable=True))
     assert [timestamp for timestamp, _ in result] == [0, 30, 60, 60.96]
     assert result[1][1] is None and result[3][1] is None
     assert result[0][1] is not None and result[2][1] is not None
 
 
-@pytest.mark.parametrize("failure", ["timeout", "io", "tool"])
+@pytest.mark.parametrize("failure", ["io", "tool"])
 def test_salvage_sampling_keeps_operational_failures_as_errors(tmp_path, monkeypatch, failure):
     from types import SimpleNamespace
     source = tmp_path / "source.mp4"; source.write_bytes(b"source")

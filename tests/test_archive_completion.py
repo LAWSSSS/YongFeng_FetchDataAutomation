@@ -1,4 +1,8 @@
 import io
+import hashlib
+import os
+import asyncio
+import threading
 import zipfile
 from pathlib import Path
 
@@ -41,7 +45,7 @@ def seed(app, tmp_path, identity='collection'):
         app.state.slicing.packages.store.save('items', {'id':name,'itemId':item['id'],'category':name,'state':'complete',
             'name':archive.name,'path':str(archive),'fileVersion':source_fingerprint(archive),'imageDir':str(folder),
             'images':[picture.name],'imageVersions':{picture.name:source_fingerprint(picture)},'imageCount':1,
-            'actualImages':1,'outputImageIds':['image-'+name],'verifiedJobId':'job-'+name,
+            'actualImages':1,'outputImageIds':['image-'+name],'verifiedJobId':'job-'+name,'jobId':'job-'+name,
             'videoPath':str(path),'videoFileVersion':item['fileVersion']})
     app.state.slicing.store.save('items',item)
     app.state.media_control.refresh()
@@ -163,6 +167,147 @@ async def test_mismatching_photo_is_not_rebound_to_verified_zip(app,tmp_path):
     assert app.state.slicing.packages.store.get('items','magnet')['imageVersions']==p['imageVersions']
 
 
+def simulate_remount_receipts(package):
+    archive=Path(package['path']); content=archive.read_bytes()
+    split=max(1,len(content)//2)
+    chunks=[content[:split],content[split:]]
+    digests=[hashlib.md5(chunk,usedforsecurity=False).hexdigest() for chunk in chunks]
+    package['parts']={str(i):{'number':i,'size':len(chunk),'etag':f'"{digest}"'}
+        for i,(chunk,digest) in enumerate(zip(chunks,digests),1)}
+    package['etag']='"'+hashlib.md5(b''.join(bytes.fromhex(d) for d in digests),usedforsecurity=False).hexdigest()+'-2"'
+    package['fileVersion']['device']+=999
+    for version in package['imageVersions'].values():version['device']+=999
+
+
+@pytest.mark.asyncio
+async def test_remounted_photo_package_revalidates_all_uploaded_bytes(app,tmp_path):
+    original=seed(app,tmp_path);w=app.state.workspace
+    await w.discover();asset=w.rows('assets')[0]
+    store=app.state.slicing.packages.store;p=store.get('items','magnet')
+    simulate_remount_receipts(p);store.save('items',p)
+    await w.refresh_archive_photos(asset)
+    current=store.get('items','magnet');picture=Path(current['imageDir'])/'image.jpg'
+    assert current['fileVersion']==source_fingerprint(Path(current['path']))
+    assert current['imageVersions'][picture.name]==source_fingerprint(picture)
+    assert current['verifiedJobId']==p['verifiedJobId'] and original.is_file()
+
+
+@pytest.mark.asyncio
+async def test_archive_retry_continues_after_a_verified_remount(app,tmp_path):
+    seed(app,tmp_path);w=app.state.workspace
+    preview=await w.preview(str(tmp_path),0,'preview-remount')
+    await w.apply(preview['id'],0,'apply-remount');await w.task
+    asset=w.rows('assets')[0]
+    store=app.state.slicing.packages.store;p=store.get('items','magnet')
+    simulate_remount_receipts(p);store.save('items',p)
+    asset.update(status='attention',message='压缩包版本已变化，保留原文件。');w.save('assets',asset)
+    app.state.slicing.files.refresh()
+    file=next(row for row in app.state.slicing.files.rows('files') if row['path']==asset['path'])
+    await app.state.slicing.files.retry(file['id'],'retry-remount')
+    await w.reconcile(only=asset['id'],cleanup=False)
+    current=w.get('assets',asset['id'])
+    assert current['status']=='managed' and current['archiveRetry']['state']=='complete'
+    assert Path(current['path']).is_file() and Path(store.get('items','magnet')['path']).is_file()
+
+
+@pytest.mark.asyncio
+async def test_retry_arriving_during_disk_discovery_is_not_overwritten(app,tmp_path,monkeypatch):
+    import app.workspace as workspace_module
+    seed(app,tmp_path);w=app.state.workspace
+    preview=await w.preview(str(tmp_path),0,'preview-discover')
+    await w.apply(preview['id'],0,'apply-discover');await w.task
+    asset=w.rows('assets')[0];entered=threading.Event();release=threading.Event()
+    inspect=workspace_module.file_version
+    def slow(*args,**kwargs):
+        entered.set();assert release.wait(5)
+        return inspect(*args,**kwargs)
+    monkeypatch.setattr(workspace_module,'file_version',slow)
+    task=asyncio.create_task(w.discover())
+    assert await asyncio.to_thread(entered.wait,5)
+    w.request_archive_retry(asset['id'],'retry-during-discovery')
+    release.set();await task
+    current=w.get('assets',asset['id'])
+    assert current['archiveRetry']['requestId']=='retry-during-discovery'
+    assert current['archiveRetry']['state']=='queued'
+
+
+@pytest.mark.asyncio
+async def test_retry_arriving_during_photo_validation_is_not_lost(app,tmp_path,monkeypatch):
+    seed(app,tmp_path);w=app.state.workspace
+    preview=await w.preview(str(tmp_path),0,'preview-check')
+    await w.apply(preview['id'],0,'apply-check');await w.task
+    asset=w.rows('assets')[0];entered=asyncio.Event();release=asyncio.Event()
+    original=w.refresh_archive_photos
+    async def slow(value):
+        entered.set();await release.wait();await original(value)
+    monkeypatch.setattr(w,'refresh_archive_photos',slow)
+    task=asyncio.create_task(w._reconcile_asset(asset))
+    await entered.wait();w.request_archive_retry(asset['id'],'retry-during-check')
+    release.set();await task
+    current=w.get('assets',asset['id'])
+    assert current['archiveRetry']['requestId']=='retry-during-check'
+    assert current['archiveRetry']['state']=='queued'
+    assert w.get('requests','retry-during-check')['state']=='queued'
+
+
+@pytest.mark.asyncio
+async def test_previously_orphaned_retry_is_recovered_on_next_pass(app,tmp_path):
+    seed(app,tmp_path);w=app.state.workspace
+    preview=await w.preview(str(tmp_path),0,'preview-orphan')
+    await w.apply(preview['id'],0,'apply-orphan');await w.task
+    asset=w.rows('assets')[0];asset.update(status='attention',archiveRetry={'state':'complete','requestId':'old'})
+    w.save('assets',asset)
+    w.save('requests',{'id':'orphan-retry','kind':'archive-retry','assetId':asset['id'],'state':'queued'})
+    w.save('requests',{'id':'second-orphan','kind':'archive-retry','assetId':asset['id'],'state':'queued'})
+    await w.reconcile(only=asset['id'],cleanup=False)
+    assert w.get('requests','orphan-retry')['state']=='complete'
+    assert w.get('requests','second-orphan')['state']=='complete'
+    assert w.get('assets',asset['id'])['status']=='managed'
+
+
+@pytest.mark.asyncio
+async def test_failed_older_validation_does_not_fail_a_new_retry(app,tmp_path,monkeypatch):
+    seed(app,tmp_path);w=app.state.workspace
+    preview=await w.preview(str(tmp_path),0,'preview-failure-race')
+    await w.apply(preview['id'],0,'apply-failure-race');await w.task
+    asset=w.rows('assets')[0];entered=asyncio.Event();release=asyncio.Event()
+    original=w.refresh_archive_photos
+    async def old_failure(_value):
+        entered.set();await release.wait();raise ValueError('旧检查失败')
+    monkeypatch.setattr(w,'refresh_archive_photos',old_failure)
+    task=asyncio.create_task(w.reconcile(only=asset['id'],cleanup=False))
+    await entered.wait();w.request_archive_retry(asset['id'],'new-retry-after-old-check')
+    release.set();await task
+    assert w.get('requests','new-retry-after-old-check')['state']=='queued'
+    monkeypatch.setattr(w,'refresh_archive_photos',original)
+    await w.reconcile(only=asset['id'],cleanup=False)
+    assert w.get('requests','new-retry-after-old-check')['state']=='complete'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('problem',['missing_parts','wrong_part','wrong_composite','not_imported','different_inode','changed_archive','different_photo'])
+async def test_remount_never_rebinds_unverified_or_changed_media(app,tmp_path,problem):
+    original=seed(app,tmp_path);w=app.state.workspace
+    await w.discover();asset=w.rows('assets')[0]
+    store=app.state.slicing.packages.store;p=store.get('items','magnet')
+    simulate_remount_receipts(p)
+    if problem=='missing_parts':p.pop('parts')
+    elif problem=='wrong_part':p['parts']['1']['etag']='"'+'0'*32+'"'
+    elif problem=='wrong_composite':p['etag']='"'+'0'*32+'-2"'
+    elif problem=='not_imported':p['verifiedJobId']='different-job'
+    elif problem=='different_inode':p['fileVersion']['inode']+=1
+    elif problem=='changed_archive':
+        archive=Path(p['path']);before=archive.stat();data=bytearray(archive.read_bytes());data[10]^=1
+        archive.write_bytes(data);os.utime(archive,ns=(before.st_atime_ns,before.st_mtime_ns))
+    else:
+        picture=Path(p['imageDir'])/'image.jpg';before=picture.stat()
+        picture.write_bytes(b'x'*before.st_size);os.utime(picture,ns=(before.st_atime_ns,before.st_mtime_ns))
+    store.save('items',p)
+    with pytest.raises(ValueError):await w.refresh_archive_photos(asset)
+    assert store.get('items','magnet')['fileVersion']==p['fileVersion']
+    assert original.is_file() and Path(p['path']).is_file()
+
+
 @pytest.mark.asyncio
 async def test_archive_button_and_recheck_register_once_without_waiting_for_disk_work(app,tmp_path,monkeypatch):
     seed(app,tmp_path);w=app.state.workspace
@@ -179,6 +324,8 @@ async def test_archive_button_and_recheck_register_once_without_waiting_for_disk
         url='/api/video-processing/'+group['id']+'/actions'
         response=await c.post(url,json=body)
         assert response.status_code==200 and response.json()['groups'][0]['files'][0]['archiveState']=='waiting'
+        visible=next(row for row in app.state.slicing.state()['archive']['items'] if row['id']==body['fileId'])
+        assert visible['archiveRetry']['state']=='queued'
         assert (await c.post(url,json=body)).status_code==200
         assert sum(r.get('kind')=='archive-retry' for r in w.rows('requests'))==1
         assert (await c.post(url,json={**body,'fileId':'wrong','requestId':'wrong'})).status_code==409

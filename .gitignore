@@ -42,6 +42,8 @@ htmlcov/
 coverage/
 test-results/
 playwright-report/
+.playwright-cli/
+/output/
 blob-report/
 *.tsbuildinfo
 
@@ -67,6 +69,7 @@ temp/
 /outputs/*
 !/outputs/.gitkeep
 /out/
+/数据/
 
 # 用户视频、模型与运行数据库（任何目录）
 *.mp4

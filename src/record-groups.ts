@@ -1,4 +1,4 @@
-import {partialComplete} from './video-recovery.ts';
+import {partialComplete,recoveryInProgress} from './video-recovery.ts';
 
 export type InspectionRecord = {
   id: string; plate: string; checkStartTime: string; checkCompleteTime: string;
@@ -12,18 +12,22 @@ export type CollectionJob = {
 
 export type BatchVideo = {
   id: string; jobId: string; submittedAt?:string; activeRevision: number; revision: number;
+  capabilities?:{version:number;expectedRevision:number;canConfirmFinal:boolean;confirmFinalReason?:string};
   versions: {revision: number; state: string; downloadRequested?: boolean;recovery?:{state:string;resultVerified?:boolean}}[];
   deletion?: {state: string};
+  operation?:{kind:string;state:string;version?:number;expectedRevision?:number};
 };
 
 export const categoryLabels = {
   ready: '可查看', waiting: '等待平台结果', download: '下载中', saved: '已保存', complete:'已完成', review: '待核对', deleting: '清理中',
+  processing:'恢复处理中',
 };
 export type VideoCategory = keyof typeof categoryLabels;
 export const videoStatusOptions: {value: 'all' | VideoCategory; label: string}[] = [
   {value:'all',label:'全部记录'}, {value:'saved',label:categoryLabels.saved},
   {value:'ready',label:categoryLabels.ready}, {value:'download',label:categoryLabels.download},
   {value:'waiting',label:categoryLabels.waiting}, {value:'review',label:categoryLabels.review},
+  {value:'processing',label:categoryLabels.processing},
   {value:'deleting',label:categoryLabels.deleting},
 ];
 
@@ -37,8 +41,7 @@ export function syncVideoSelection<T extends {id: string; revision: number; acti
   const next = new Map(selection);
   for (const [id, chosen] of selection) {
     const video = videos.find(row => row.id === id);
-    if (!video) continue;
-    if (video.activeRevision !== chosen.version || video.revision !== chosen.expectedRevision) {
+    if (!video || video.activeRevision !== chosen.version || video.revision !== chosen.expectedRevision) {
       next.delete(id);
       changed = true;
     }
@@ -59,6 +62,7 @@ export function videoCategory(video: BatchVideo): VideoCategory {
   if (['pending', 'error'].includes(video.deletion?.state || '')) return 'deleting';
   const active = video.versions.find(version => version.revision === video.activeRevision);
   if(active&&partialComplete(active))return 'saved';
+  if(recoveryInProgress(video))return 'processing';
   if (!active || ['attention', 'failed', 'uncertain'].includes(active.state)) return 'review';
   if (active.state === 'saved') return 'saved';
   if (active.downloadRequested || ['downloading', 'publishing'].includes(active.state)) return 'download';
@@ -71,9 +75,19 @@ export function completedPartialVideo(video: BatchVideo) {
 }
 
 export function canDownload(video: BatchVideo) {
-  const active = video.versions.find(version => version.revision === video.activeRevision);
-  return !['pending', 'error'].includes(video.deletion?.state || '') && !!active && !active.downloadRequested
-    && ['ready', 'waiting', 'submitted'].includes(active.state);
+  const capability=video.capabilities;
+  return capability?.canConfirmFinal===true&&capability.version===video.activeRevision
+    &&capability.expectedRevision===video.revision;
+}
+
+/** Reconcile again at the mutation boundary, not only after the last poll. */
+export function visibleVideoSelections<T extends BatchVideo>(selection:Iterable<VideoSelection>,videos:T[],confirm=false) {
+  const visible=new Map(videos.map(video=>[video.id,video]));
+  return [...selection].filter(choice=>{
+    const video=visible.get(choice.id);
+    return !!video&&video.activeRevision===choice.version&&video.revision===choice.expectedRevision
+      &&(!confirm||canDownload(video));
+  });
 }
 
 export function groupVideos<T extends BatchVideo>(videos: T[], jobs: CollectionJob[]) {

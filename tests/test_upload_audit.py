@@ -485,3 +485,11 @@ async def test_successful_task_with_errors_or_expired_logs_needs_review():
     missing = await client.job_evidence("27944", {"id": 2, "type": 1, "status": 3})
     assert missing["reason"] and not missing["evidence"]
     await client.close()
+
+
+@pytest.mark.parametrize('status', [429, 500, 502, 503, 504])
+def test_transient_platform_status_is_a_retryable_network_failure(status):
+    from app.upload_audit import AthenaClient, AuditError
+    with pytest.raises(AuditError) as found:
+        AthenaClient.unpack(httpx.Response(status, json={'message': 'temporary'}))
+    assert found.value.code == 'network' and found.value.status == status

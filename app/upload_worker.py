@@ -37,6 +37,20 @@ def version(info):
     return {"device": info.st_dev, "inode": info.st_ino, "size": info.st_size, "modifiedNs": info.st_mtime_ns}
 
 
+def edge_hash(stream, size):
+    position = stream.tell()
+    try:
+        digest = hashlib.sha256()
+        stream.seek(0)
+        digest.update(stream.read(65536))
+        if size > 65536:
+            stream.seek(max(0, size - 65536))
+            digest.update(stream.read(65536))
+        return digest.hexdigest()
+    finally:
+        stream.seek(position)
+
+
 def error_code(error):
     from httpx import HTTPError
     from botocore.exceptions import (ClientError, ConnectionClosedError, ConnectTimeoutError,
@@ -246,7 +260,9 @@ class Multipart:
         with os.fdopen(os.open(path, flags), "rb") as file:
             info = os.fstat(file.fileno())
             source_version = self.item.get("sourceFileVersion", self.item["fileVersion"])
-            if not stat.S_ISREG(info.st_mode) or version(info) != source_version:
+            source_stat = {key: source_version.get(key) for key in version(info)}
+            if (not stat.S_ISREG(info.st_mode) or version(info) != source_stat
+                    or ('edgeHash' in source_version and edge_hash(file, info.st_size) != source_version['edgeHash'])):
                 raise WorkerError("file_changed")
             if not self.upload_id and self.item.get("createAttempted"):
                 self.discover()
@@ -287,7 +303,7 @@ class Multipart:
                 if not part:
                     file.seek(base)
                     body = file.read(length)
-                    if len(body) != length or version(os.fstat(file.fileno())) != source_version:
+                    if len(body) != length or version(os.fstat(file.fileno())) != source_stat:
                         raise WorkerError("file_changed")
                     result = self.request("upload_part", **self.base, UploadId=self.upload_id, PartNumber=number,
                         Body=ProgressBody(body, base, self.event), ContentLength=length)
@@ -296,7 +312,8 @@ class Multipart:
                 base += length
                 self.event("part", critical=True, number=number, etag=part["ETag"], size=length, bytes=base)
                 number += 1
-            if version(os.fstat(file.fileno())) != source_version:
+            if (version(os.fstat(file.fileno())) != source_stat
+                    or ('edgeHash' in source_version and edge_hash(file, info.st_size) != source_version['edgeHash'])):
                 raise WorkerError("file_changed")
             self.event("completing", critical=True)
             try:

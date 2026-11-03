@@ -94,6 +94,29 @@ def test_lost_complete_response_is_verified_not_uploaded_or_deleted_twice(tmp_pa
     assert s3.creates==s3.completes==1 and not s3.aborts
 
 
+def test_strong_moved_source_version_keeps_the_original_object_marker(tmp_path):
+    from app.slicing import source_version
+    item=item_for(tmp_path); original=copy.deepcopy(item['fileVersion'])
+    item['sourceFileVersion']=source_version(item['path'])
+    s3=S3();events=[]
+    Multipart(s3,item,journal(item,events)).run()
+    assert events[-1][0]=='complete'
+    assert s3.metadata['file-version']==hashlib.sha256(json.dumps(original,sort_keys=True).encode()).hexdigest()
+
+
+def test_edge_change_with_identical_stat_is_rejected_before_upload(tmp_path):
+    import os
+    from app.slicing import source_version
+    item=item_for(tmp_path);path=Path(item['path']);before=path.stat()
+    item['sourceFileVersion']=source_version(path)
+    path.write_bytes(b'X'*before.st_size)
+    os.utime(path,ns=(before.st_atime_ns,before.st_mtime_ns))
+    s3=S3()
+    with pytest.raises(WorkerError,match='file_changed'):
+        Multipart(s3,item,journal(item,[])).run()
+    assert not s3.creates
+
+
 @pytest.mark.parametrize('stage',['creating','created','part','completing','complete'])
 def test_restart_at_each_critical_stage_keeps_exact_multipart_and_object(tmp_path,stage):
     item=item_for(tmp_path);s3=S3();events=[]

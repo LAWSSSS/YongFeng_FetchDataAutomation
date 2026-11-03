@@ -46,6 +46,22 @@ def _archive_version(value):
                     for key in ('device', 'inode', 'size', 'modifiedNs')))
 
 
+def image_identity(value):
+    """Platform IDs are opaque strings or integers, never null/bool/containers."""
+    if type(value) not in {str, int}:
+        return None
+    return str(value).strip() or None
+
+
+def unique_image_ids(value):
+    if not isinstance(value, list):
+        return None
+    identities = [image_identity(identity) for identity in value]
+    if None in identities:
+        return None
+    return identities if len(set(identities)) == len(identities) else None
+
+
 def reuse_image_ids(package, resolve_archive=None):
     """Return an exact image-ID receipt; a present but invalid receipt fails closed."""
     if 'reusedImport' not in package:
@@ -67,7 +83,8 @@ def reuse_image_ids(package, resolve_archive=None):
             or not _archive_version(receipt.get('currentArchiveVersion'))
             or not _archive_version(receipt.get('sourceArchiveVersion'))
             or not isinstance(ids, dict) or set(ids) != {name_key(name) for name in names}
-            or any(not isinstance(value, str) or not value.strip() for value in ids.values())
+            or unique_image_ids(list(ids.values())) is None
+            or any(not isinstance(value, str) or value != value.strip() for value in ids.values())
             or len(set(ids.values())) != len(names)):
         raise ValueError('照片复用凭证不完整，保留文件待核对。')
     path = receipt.get('currentArchivePath', package.get('path'))
@@ -92,8 +109,8 @@ def reuse_candidates(current, packages):
                 or peer.get('state') != 'complete' or not peer.get('verifiedJobId')
                 or str(peer.get('jobId')) != str(peer['verifiedJobId'])
                 or peer.get('actualImages') != current.get('imageCount')
-                or len(peer.get('outputImageIds') or []) != current['imageCount']
-                or len(set(map(str, peer.get('outputImageIds') or []))) != current['imageCount']
+                or unique_image_ids(peer.get('outputImageIds')) is None
+                or len(peer['outputImageIds']) != current['imageCount']
                 or not peer.get('keys') or not isinstance(peer.get('beforeImageIds'), list)):
             continue
         try:
@@ -170,7 +187,7 @@ def prepare_import_reuse(current, peer, equality):
     result['reusedImport'] = {**copy.deepcopy(equality), 'sourcePackageId': peer['id'],
         'sourcePackageRevision': peer['revision'], 'sourceIdentity': peer.get('sourceIdentity'),
         'sourceJobId': str(peer['verifiedJobId']), 'preparedAt': now_iso(),
-        'imageIdsByName': dict(zip(sorted(name_key(n) for n in peer['images']), map(str, peer['outputImageIds']))),
+        'imageIdsByName': dict(zip(sorted(name_key(n) for n in peer['images']), unique_image_ids(peer['outputImageIds']))),
         'originalAttempt': {k:copy.deepcopy(current.get(k)) for k in ('jobId', 'keys', 'beforeJobs', 'beforeImageIds')}}
     # Keep the new upload object and all local/video identities unchanged. The
     # existing job and its original pre-import snapshot are the reused receipt.

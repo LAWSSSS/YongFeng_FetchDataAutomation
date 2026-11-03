@@ -22,9 +22,11 @@ import httpx
 
 from .domain import DEFAULT_TARGET, approval_issue, format_time, gather_payload, now_iso, parse_time
 from .download_slots import DownloadSlots
+from .file_leases import FileEnvironmentError
 from .jobs import JobManager
 from .media import (DownloadFailure, download_url, file_digest, publish_file,
-                    prepare_directory, valid_video_header, video_filename)
+                    prepare_directory, valid_video_header, video_filename,
+                    publish_with_reservation, transfer_reservation_identity)
 from .remote import RemoteClient, RemoteError
 from .media_validation import MediaValidationError, verify_video_tail
 from .source import page_records
@@ -64,15 +66,54 @@ def inspect_recovery_cache(source: Path, root: Path, total_bytes: int, received_
     return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns), digest
 
 
-def publish_recovery_cache(source: Path, destination: Path, expected_identity, expected_digest: str):
+def recovery_destination(destination: Path, total_bytes: int, digest: str, reservation: dict):
+    """Keep an unowned/incomplete old copy intact; use a stable separate name."""
+    if destination.is_symlink() or any(parent.is_symlink() for parent in destination.parents):
+        raise Conflict('恢复文件路径是符号链接，文件保留，不能自动替换。')
+    if not destination.exists():
+        return destination, None
+    try:
+        transfer_reservation_identity(destination, reservation)
+        return destination, None
+    except OSError:
+        pass
+    info = destination.lstat()
+    if not stat.S_ISREG(info.st_mode):
+        raise Conflict('恢复位置不是普通文件，原文件保留。')
+    if info.st_size == total_bytes:
+        return destination, None  # Full content is checked before reuse below.
+    conflict = {'path': str(destination), 'size': info.st_size, 'device': info.st_dev,
+                'inode': info.st_ino, 'modifiedNs': info.st_mtime_ns}
+    stem = destination.stem
+    suffix = '__恢复_' + digest[:12] + destination.suffix
+    while len(os.fsencode(stem + suffix)) > 240:
+        stem = stem[:-1]
+    return destination.with_name(stem + suffix), conflict
+
+
+def publish_recovery_cache(source: Path, destination: Path, expected_identity, expected_digest: str,
+                           reservation: dict | None = None):
     """Move a validated recovery cache and validate the published file once."""
+    if destination.is_symlink() or any(parent.is_symlink() for parent in destination.parents):
+        raise Conflict('恢复文件路径是符号链接，文件保留，不能自动替换。')
     current = source.lstat()
     if (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns) != expected_identity:
         raise Conflict("转移前缓存版本发生变化；原文件保留。")
-    if destination.exists():
+    owned_marker = False
+    if reservation and destination.exists():
+        try:
+            transfer_reservation_identity(destination, reservation)
+            owned_marker = True
+        except OSError:
+            pass
+    if destination.exists() and not owned_marker:
         if destination.is_symlink() or file_digest(destination) != expected_digest:
             raise FileExistsError("恢复目录存在不同内容的同名文件；原文件保留。")
         source.unlink()
+    elif reservation and current.st_dev == destination.parent.stat().st_dev:
+        # ExFAT does not support RENAME_EXCL. A persisted exclusive marker lets
+        # the existing guarded publisher rename on this volume without a copy.
+        publish_with_reservation(source, destination, reservation=reservation)
     else:
         published_digest = publish_file(source, destination, expected_digest)
         if published_digest != expected_digest:
@@ -154,11 +195,12 @@ class VideoStore:
                         (json.dumps(settings),))
         self.db.commit()
 
-    def save_operation(self, operation):
+    def save_operation(self, operation, *, commit=True):
         operation["updatedAt"] = now_iso()
         self.db.execute("INSERT INTO simple_video_operations VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload",
                         (operation["id"], operation["videoId"], json.dumps(operation, ensure_ascii=False)))
-        self.db.commit()
+        if commit:
+            self.db.commit()
 
     def get_operation(self, identity):
         row = self.db.execute("SELECT payload FROM simple_video_operations WHERE id=?", (identity,)).fetchone()
@@ -322,21 +364,30 @@ class VideoManager:
         if self.operation_tasks:
             await asyncio.gather(*self.operation_tasks.values(), return_exceptions=True)
 
-    def state(self, query=None):
-        self.sync_jobs()
+    def state(self, query=None, *, identity=None):
+        if identity is None:
+            self.sync_jobs()
+        final_processing = getattr(self, 'final_processing', None)
+        final_operations = {(entry['videoId'], entry['version'], entry['expectedRevision']): entry
+                            for entry in final_processing.presentations()} if final_processing else {}
         hidden = self.record_visibility.hidden()
+        histories = {(r['videoId'], r['version']): {k:r.get(k) for k in ('state','message','receivedBytes','totalBytes')}
+                     for r in self.history_downloads.rows()} if hasattr(self, 'history_downloads') else {}
         active_operations = {}
         for operation in self.store.list_operations():
-            if operation.get('state') in {'queued', 'running', 'waiting_connection', 'reconciling', 'paused'}:
-                active_operations[operation.get('videoId')] = operation
+            if operation.get('state') in {'queued', 'running', 'waiting_connection', 'reconciling', 'paused'} or (operation.get('kind') == 'withdraw' and operation.get('state') == 'attention'):
+                active_operations[(operation.get('videoId'), operation.get('version'),
+                                   operation.get('expectedRevision'))] = operation
         rows = []
-        for row in self.store.list():
-            if row['id'] in hidden:
+        source_rows = self.store.list() if identity is None else [self.store.get(identity)]
+        for row in source_rows:
+            if not row or row.get('deletedAt') or (row['id'] in hidden and identity is None):
                 continue
-            active_operation = active_operations.get(row['id'])
+            active_operation = active_operations.get((row['id'], row.get('activeRevision'), row.get('revision')))
             visible_operation = ({key: active_operation.get(key) for key in
                 ('id', 'kind', 'state', 'stage', 'message', 'errorCode', 'progress',
-                 'successfulSamples', 'skippedSamples', 'createdAt', 'updatedAt', 'slicingItemId')}
+                 'successfulSamples', 'skippedSamples', 'createdAt', 'updatedAt', 'slicingItemId',
+                 'version', 'expectedRevision')}
                 if active_operation else None)
             recovery = None
             active = self.version(row, row.get('activeRevision'))
@@ -345,13 +396,30 @@ class VideoManager:
                 slicing = getattr(self, 'slicing', None)
                 if slicing and recovery.get('slicingItemId'):
                     item = slicing.store.get('items', recovery['slicingItemId'])
-                    if item:
+                    if (item and item.get('collectionVideoId') == row['id']
+                            and item.get('collectionRevision') == row['activeRevision']
+                            and not item.get('superseded')):
                         recovery.update(slicingState=item.get('state'), slicingMessage=item.get('message'),
                                        errorCode=item.get('errorCode'), progress=item.get('progress'))
                         recovery['categories'] = {name: {key: value.get(key) for key in
                             ('state', 'message', 'errorCode', 'observations', 'skippedSamples', 'imageCount', 'actualImages', 'packageId')}
                             for name, value in (item.get('categories') or {}).items()}
-            row = {**row, 'operation': visible_operation, 'recovery': recovery,
+                        # Surface the current stage, not a stale recovered error.
+                        recovery['message'] = item.get('message') or recovery.get('message', '')
+                        if item.get('state') == 'platform_processing':
+                            pending = [slicing.packages.store.get('items', value.get('packageId'))
+                                       for value in (item.get('categories') or {}).values() if value.get('packageId')]
+                            if slicing.packages.paused and any(p and p.get('state') in {'queued', 'uploaded', 'uploading'} for p in pending):
+                                recovery.update(stage='photos_paused', message='照片上传已暂停；继续照片上传后会自动导入、核验并整理。')
+                            else:
+                                recovery.update(stage='photos_processing', message='正在上传或导入照片，核验完成后自动归入已保存。')
+                        elif item.get('state') in {'pending', 'analyzing'}:
+                            recovery['stage'] = 'analyzing'
+            row = {**row, 'versions': [{**v, 'historyDownload': histories.get((row['id'],v['revision']))} for v in row['versions']],
+                   'operation': visible_operation, 'recovery': recovery,
+                   'finalProcessing': final_operations.get((row['id'], row.get('activeRevision'), row.get('revision'))),
+                   'capabilities': {**(final_processing.capabilities(row) if final_processing else {}),
+                                    **self.withdraw_capabilities(row)},
                    'submittedAt': (self.jobs.store.get(row.get('jobId', '')) or {}).get('createdAt') or ''}
             rows.append(row)
         found = filter_records(rows, query)
@@ -359,11 +427,19 @@ class VideoManager:
                 "filteredCount": len(found), "byJob": {job_id: sum(r["jobId"] == job_id for r in rows)
                     for job_id in {r["jobId"] for r in rows}},
                 "counts": {kind: sum(matches_status(row, kind) for row in rows)
-                           for kind in ("ready", "waiting", "review", "download", "saved", "complete", "deleting")},
+                           for kind in ("ready", "waiting", "review", "download", "saved", "complete", "deleting", "processing")},
                 "lastCheck": self.last_check, "checkError": self.storage_error or self.check_error,
                 "hiddenRecordCount": len(hidden), "downloadWorkers": self.download_workers()}
 
     def download_candidate(self, row):
+        if any(operation.get('kind') == 'restart-download' and operation.get('version') == row.get('activeRevision')
+               and operation.get('expectedRevision') == row.get('revision')
+               and operation.get('state') in {'queued', 'running', 'waiting_connection', 'reconciling'}
+               for operation in self.store.list_operations(row['id'])):
+            return False
+        flow = getattr(self, 'final_processing', None)
+        if flow and not flow.download_allowed(row):
+            return False
         if row.get("deletedAt") or row.get("deletion", {}).get("state") in ("pending", "error"):
             return False
         active = self.version(row, row.get("activeRevision"))
@@ -487,6 +563,13 @@ class VideoManager:
             folder.rmdir()
         self.legacy_work.rmdir()
 
+    @staticmethod
+    def initial_duration(item):
+        start, end = parse_time(item.get('startTime')), parse_time(item.get('endTime'))
+        if start and end and end > start:
+            return round((end-start).total_seconds())
+        return int(item.get('durationSeconds') or round(item.get('durationMinutes', 60)*60))
+
     def sync_jobs(self):
         for job in self.jobs.store.list():
             for item in job["items"]:
@@ -504,13 +587,18 @@ class VideoManager:
                            "admissionRule": item.get("admissionRule") or job.get("admissionRule"),
                            "revision": 0, "acceptedRevision": None, "activeRevision": 0,
                            "versions": [{"revision": 0, "startTime": item["startTime"], "endTime": item["endTime"],
-                                         "durationSeconds": 3600, "name": item["videoName"], "taskId": "", "resultId": "",
+                                         "durationSeconds": self.initial_duration(item), "name": item["videoName"], "taskId": "", "resultId": "",
                                          "state": "pending", "createdAt": now_iso()}],
                            "requests": {}, "createdAt": now_iso(), "error": ""}
                 original = row["versions"][0]
                 changed = False
                 if item.get("remoteId") and not original.get("taskId") and item.get("bindingVerified"):
                     original["taskId"] = str(item["remoteId"])
+                    # A capture submitted after a cached inventory must not be
+                    # reported missing from that older ten-second snapshot.
+                    if original["taskId"] not in self.inventory_cache:
+                        self.inventory_cached_at = 0
+                        self.inventory_generation = getattr(self, "inventory_generation", 0) + 1
                     changed = True
                 if original["state"] in ("pending", "submitting", "uncertain", "submitted", "waiting"):
                     next_state = "uncertain" if item["status"] == "uncertain" else "submitted" if item["status"] == "submitted" else item["status"]
@@ -606,10 +694,15 @@ class VideoManager:
             async with self.inventory_lock:
                 if not fresh and self.inventory_cache and time.monotonic() - self.inventory_cached_at < 10:
                     return copy.deepcopy(self.inventory_cache)
-                parents = await self.jobs.remote_parents(self.target_config)
-                self.inventory_cache = copy.deepcopy(parents)
-                self.inventory_cached_at = time.monotonic()
-                return copy.deepcopy(parents)
+                for _ in range(3):
+                    generation = getattr(self, "inventory_generation", 0)
+                    parents = await self.jobs.remote_parents(self.target_config)
+                    if generation != getattr(self, "inventory_generation", 0):
+                        continue
+                    self.inventory_cache = copy.deepcopy(parents)
+                    self.inventory_cached_at = time.monotonic()
+                    return copy.deepcopy(parents)
+                raise RemoteError("新采集任务仍在登记，等待下一次完整核对。", "NETWORK")
 
     def remember_remote_parents(self, parents):
         """Refresh the shared view immediately after a confirmed platform write."""
@@ -778,11 +871,15 @@ class VideoManager:
             return None
         return {key: operation.get(key) for key in (
             "id", "videoId", "kind", "state", "stage", "message", "errorCode",
+            "failedStage", "failureType", "failureErrno",
             "expectedRevision", "version", "slicingItemId", "progress", "successfulSamples",
             "skippedSamples", "resultRevision", "createdAt", "updatedAt")}
 
     def launch_operation(self, operation_id):
         if self.stopping:
+            return
+        allowed = getattr(self, 'automatic_operation_allowed', None)
+        if allowed and not allowed(self.store.get_operation(operation_id) or {}):
             return
         task = self.operation_tasks.get(operation_id)
         if task and not task.done():
@@ -802,6 +899,9 @@ class VideoManager:
                              if key in {"startTime", "durationSeconds", "repair"}}
         operation_id = self.operation_identity(identity, kind, request_id)
         existing = self.store.get_operation(operation_id)
+        if kind == 'restart-download' and not existing:
+            existing = next((saved for saved in self.store.list_operations(identity)
+                if saved.get('kind') == kind and request_id in saved.get('requestAliases', [])), None)
         version = payload.get("version", existing.get("version") if existing else row.get("activeRevision"))
         if existing:
             same_request = (
@@ -811,12 +911,70 @@ class VideoManager:
             )
             if not same_request:
                 raise Conflict("请求编号已用于不同的操作内容；请刷新后使用新的请求编号。")
-            return {"operationId": operation_id, "state": existing["state"], "videoId": identity}
+            return {"operationId": existing['id'], "state": existing["state"], "videoId": identity}
+        legacy_restart = row.get('requests', {}).get(request_id)
+        if kind == 'restart-download' and legacy_restart:
+            if (legacy_restart.get('kind') != kind or legacy_restart.get('version') != version
+                    or legacy_restart.get('expectedRevision') != expected_revision):
+                raise Conflict('请求编号已用于其他版本或操作。')
+            if legacy_restart.get('state') == 'complete':
+                operation = {'id': operation_id, 'videoId': identity, 'requestId': request_id,
+                    'kind': kind, 'state': 'complete', 'stage': 'download_queued',
+                    'expectedRevision': expected_revision, 'version': version, 'payload': operation_payload,
+                    'message': '这次完整重下已登记，保留后续下载进度。', 'createdAt': now_iso()}
+                self.store.save_operation(operation)
+                return {'operationId': operation_id, 'state': 'complete', 'videoId': identity}
         if type(expected_revision) is not int or expected_revision != row.get("revision"):
             raise Conflict("记录已变化，请刷新后重新核对。")
         if version != row.get("activeRevision"):
             raise Conflict("当前采集版本已变化，请刷新后重试。")
         self.require_editable(row)
+        if kind == 'withdraw':
+            from .video_withdrawal import capability
+            eligibility = capability(self, row)
+            if not eligibility['canWithdraw']:
+                raise Conflict(eligibility['withdrawReason'])
+            pending = next((entry for entry in self.store.list_operations(identity) if entry.get('kind') == 'withdraw'
+                and entry.get('version') == version and entry.get('expectedRevision') == expected_revision
+                and entry.get('state') in {'queued','running','waiting_connection','reconciling'}), None)
+            if pending:
+                return {'operationId':pending['id'], 'state':pending['state'], 'videoId':identity}
+        if kind in {'correction', 'recapture'}:
+            current = self.version(row, version)
+            if kind == 'correction':
+                start = parse_time(payload.get('startTime'))
+                seconds = payload.get('durationSeconds')
+                if not start or type(seconds) is not int or not 60 <= seconds <= 7200:
+                    raise ValueError('请填写有效的采集开始时间和 1–120 分钟时长。')
+                validator = getattr(self, 'validate_capture_interval', None)
+                if validator:
+                    validator(format_time(start), seconds)
+                if (format_time(start) == current.get('startTime') and
+                        format_time(start + timedelta(seconds=seconds)) == current.get('endTime')):
+                    raise ValueError('采集区间未变化，可直接确认当前视频。')
+            if ((current or {}).get('recovery', {}).get('state') in {'queued', 'moving', 'slicing'}
+                    and not (current or {}).get('finalConfirmation')):
+                # Reject before reserving a new media generation: an invalid
+                # correction must not supersede/cancel the working recovery.
+                raise Conflict('当前版本正在处理可解码部分，请先暂停此条再更正。')
+        if kind == 'restart-download':
+            current = self.version(row, version)
+            if (not current or current.get('state') not in {'failed', 'ready'}
+                    or current.get('publishing') or current.get('transferWorkerPid')
+                    or not current.get('taskId') or not current.get('resultId')):
+                raise ValueError('当前版本不能完整重下，已有成果和保存进度保留。')
+        if kind in {'recover-decodable', 'restart-download'}:
+            active = next((old for old in self.store.list_operations(identity)
+                           if old.get('kind') == kind and old.get('version') == version
+                           and old.get('expectedRevision') == expected_revision
+                           and old.get('state') in {'queued', 'running', 'waiting_connection', 'reconciling', 'paused'}), None)
+            if active:
+                if active.get('payload', {}) != operation_payload:
+                    raise Conflict('此视频已有不同的恢复操作，请等待或暂停原操作。')
+                if kind == 'restart-download':
+                    active['requestAliases'] = list(dict.fromkeys([*active.get('requestAliases', []), request_id]))
+                    self.store.save_operation(active)
+                return {'operationId': active['id'], 'state': active['state'], 'videoId': identity}
         operation = {"id": operation_id, "videoId": identity, "requestId": request_id,
                      "kind": kind, "state": "queued", "stage": "queued",
                      "expectedRevision": expected_revision, "version": version,
@@ -824,7 +982,18 @@ class VideoManager:
                      "message": "已登记，后台马上处理。", "createdAt": now_iso()}
         if kind in {"correction", "recapture"} and getattr(self, "control", None):
             operation["mediaGeneration"] = self.control.reserve(identity, operation_id)
-        self.store.save_operation(operation)
+        if kind == 'restart-download':
+            current = self.version(row, version)
+            operation['source'] = {key: current.get(key) for key in ('taskId', 'resultId')}
+            control = self.control.get('collection:' + identity) if getattr(self, 'control', None) else {}
+            operation['sourceGeneration'] = int((control or {}).get('generation') or 0)
+        if kind == 'withdraw' and getattr(self, 'control', None):
+            self.control.refresh()
+            with self.store.db:
+                operation['mediaGeneration'] = self.control.reserve(identity, operation_id, commit=False, refresh=False)
+                self.store.save_operation(operation, commit=False)
+        else:
+            self.store.save_operation(operation)
         self.launch_operation(operation_id)
         return {"operationId": operation_id, "state": "queued", "videoId": identity}
 
@@ -845,6 +1014,12 @@ class VideoManager:
                 await self._execute_check_operation(operation)
             elif operation["kind"] == "recover-decodable":
                 await self._execute_recovery_operation(operation)
+            elif operation["kind"] == "restart-download":
+                from .video_restart import execute
+                await execute(self, operation)
+            elif operation['kind'] == 'withdraw':
+                from .video_withdrawal import execute
+                await execute(self, operation)
             elif operation["kind"] in {"correction", "recapture"}:
                 await self._execute_correction_operation(operation)
         except asyncio.CancelledError:
@@ -857,17 +1032,35 @@ class VideoManager:
             latest = self.store.get_operation(operation_id)
             if latest:
                 code = getattr(error, "code", "network")
-                latest.update(state="waiting_connection" if not self.target.connected or code in {"401", "network"} else "attention",
-                              stage="waiting_connection" if not self.target.connected or code in {"401", "network"} else "attention",
+                latest.update(state="waiting_connection" if not self.target.connected or str(code).upper() in {"401", "403", "NETWORK", "408", "429", "500", "502", "503", "504"} else "attention",
+                              stage="waiting_connection" if not self.target.connected or str(code).upper() in {"401", "403", "NETWORK", "408", "429", "500", "502", "503", "504"} else "attention",
                               errorCode=code, message="平台暂时不可达，操作和媒体均保留；连接恢复后继续。")
+                if latest.get('kind') == 'restart-download' and latest['state'] == 'waiting_connection':
+                    latest['nextAttemptAt'] = time.time() + 30
                 self.store.save_operation(latest)
         except (OSError, ValueError, Conflict) as error:
             latest = self.store.get_operation(operation_id)
             if latest:
+                failure_stage = latest.get('stage')
+                code = 'recovery_file_conflict' if isinstance(error, FileExistsError) else (
+                    'disk_full' if getattr(error, 'errno', None) == errno.ENOSPC else 'operation_failed')
+                message = ('恢复位置已有不同内容的文件，完整缓存保留；请核对恢复位置。'
+                           if isinstance(error, FileExistsError) else
+                           '磁盘空间不足，完整缓存和恢复进度保留。' if code == 'disk_full' else
+                           str(error) if isinstance(error, (ValueError, Conflict)) else
+                           '本地文件或工具暂不可用，原文件与进度已保留。')
                 latest.update(state="conflict" if isinstance(error, Conflict) else "attention",
-                              stage="attention", errorCode="conflict" if isinstance(error, Conflict) else "operation_failed",
-                              message=str(error) if isinstance(error, (ValueError, Conflict)) else "本地文件或工具暂不可用，原文件与进度已保留。")
+                              failedStage=failure_stage, failureType=type(error).__name__,
+                              failureErrno=getattr(error, 'errno', None),
+                              stage="attention", errorCode="conflict" if isinstance(error, Conflict) else code,
+                              message=message)
                 self.store.save_operation(latest)
+                if (latest.get('kind') == 'restart-download'
+                        and isinstance(error, (FileEnvironmentError, OSError)) and not isinstance(error, FileExistsError)):
+                    latest.update(state='waiting_connection', stage='waiting_disk', nextAttemptAt=time.time() + 30,
+                                  errorCode=getattr(error, 'code', code),
+                                  message='等待文件目录恢复，原文件与断点保留。')
+                    self.store.save_operation(latest)
                 if latest.get("kind") == "recover-decodable":
                     try:
                         await self._update_recovery_version(
@@ -891,7 +1084,7 @@ class VideoManager:
                 self.store.save_operation(latest)
         finally:
             latest = self.store.get_operation(operation_id)
-            if (getattr(self, "control", None) and latest and latest.get("kind") in {"correction", "recapture"}
+            if (getattr(self, "control", None) and latest and latest.get("kind") in {"correction", "recapture", "restart-download", "withdraw"}
                     and latest.get("state") in {"complete", "attention", "conflict"}):
                 self.control.release_review(latest["videoId"], operation_id)
 
@@ -989,8 +1182,16 @@ class VideoManager:
             source_identity, digest = await asyncio.to_thread(
                 inspect_recovery_cache, source, self.work, version["totalBytes"],
                 version.get("receivedBytes"), recovery.get("sha256"))
+            reservation = operation.get('recoveryReservation') or {'token': uuid4().hex}
+            operation['recoveryReservation'] = reservation
+            self.store.save_operation(operation)
+            destination, conflict = await self.file_operation(
+                recovery_destination, destination, version['totalBytes'], digest, reservation)
+            if conflict:
+                operation['preservedConflict'] = conflict
             await self._update_recovery_version(identity, version["revision"], operation["expectedRevision"],
-                {"sha256": digest, "destination": str(destination), "state": "moving"})
+                {"sha256": digest, "destination": str(destination), "state": "moving",
+                 **({'preservedConflict': conflict} if conflict else {})})
             operation.update(stage="moving_cache", message="文件完整性已核验，正在移入受管理目录。",
                              destination=str(destination), sourceSha256=digest)
             self.store.save_operation(operation)
@@ -998,7 +1199,7 @@ class VideoManager:
                 if getattr(self, "file_leases", None):
                     guards.enter_context(self.file_leases.write(source))
                     guards.enter_context(self.file_leases.write(destination))
-                await self.file_operation(publish_recovery_cache, source, destination, source_identity, digest)
+                await self.file_operation(publish_recovery_cache, source, destination, source_identity, digest, reservation)
         elif await asyncio.to_thread(destination.is_file) and not await asyncio.to_thread(destination.is_symlink):
             digest = recovery.get("sha256") or operation.get("sourceSha256")
             if not digest:
@@ -1024,6 +1225,13 @@ class VideoManager:
         item = self.slicing.queue_collection_recovery(video_id=identity, revision=version["revision"],
             path=destination, file_version=file_version, metadata=metadata, name=destination.name,
             request_id=operation["requestId"])
+        current = self.store.get(identity)
+        approved = self.version(current, version['revision']) if current else None
+        if (current and current.get('revision') == operation['expectedRevision']
+                and current.get('activeRevision') == version['revision']
+                and (approved or {}).get('finalConfirmation')):
+            item['finalProcessingIntent'] = approved['finalConfirmation']['operationId']
+            self.slicing.store.save('items', item)
         await self._update_recovery_version(identity, version["revision"], operation["expectedRevision"],
                                             {"state": "slicing", "slicingItemId": item["id"]})
         operation.update(state="running", stage="partial_slicing", slicingItemId=item["id"],
@@ -1061,7 +1269,7 @@ class VideoManager:
                                        for category in category_rows.values()),
                     slicingState=item.get("state"), slicingItemId=slicing_item_id)
                 await self._update_recovery_version(identity, operation["version"], operation["expectedRevision"], values)
-            if item.get("state") in {"complete", "no_target"}:
+            if item.get("state") in {"complete", "no_target", "uncuttable"}:
                 self.reconcile_recovery_results(slicing_item_id)
                 current = self.store.get(identity)
                 current_version = self.version(current, operation['version']) if current else None
@@ -1070,7 +1278,7 @@ class VideoManager:
                 if version:
                     await self._update_recovery_version(identity, operation["version"], operation["expectedRevision"],
                         {"state": "partial_complete", "finishedAt": now_iso(), "errorCode": "",
-                         "message": "可解码部分已处理；原视频仍标记为不完整，坏位置已跳过。"})
+                         "message": current_version['recovery']['message']})
                 operation.update(state="complete", stage="partial_complete", message="可解码部分已处理；未生成替代视频。",
                                  successfulSamples=(version or {}).get("recovery", {}).get("successfulSamples", 0),
                                  skippedSamples=(version or {}).get("recovery", {}).get("skippedSamples", 0))
@@ -1121,6 +1329,8 @@ class VideoManager:
         self.reconcile_recovery_results()
         for operation in self.store.list_operations():
             if operation.get("state") in {"queued", "waiting_connection", "reconciling"}:
+                if operation.get('nextAttemptAt', 0) > time.time():
+                    continue
                 if operation.get("state") == "waiting_connection":
                     if not self.target.connected:
                         continue
@@ -1161,8 +1371,14 @@ class VideoManager:
     def finish_recovery_result(self, row, version, proof):
         recovery = version.get('recovery') or {}
         if not partial_complete(version) or recovery.get('results') != proof:
+            has_images = any(value.get('images', 0) > 0 for value in proof.values())
+            no_frames = all(value.get('state') == 'uncuttable' for value in proof.values())
+            end_reason = 'partial_complete' if has_images else 'no_usable_frames' if no_frames else 'no_target'
+            message = ('可用部分处理完成，照片已导入核验，坏位置已跳过。' if has_images else
+                       '按配置抽样未找到可用画面，处理已结束；未上传空照片包。' if no_frames else
+                       '可用画面未检出目标，处理已结束；未上传空照片包。')
             recovery.update(state='partial_complete', resultVerified=True, results=proof, errorCode='',
-                            finishedAt=now_iso(), message='可用部分已保存：切片、图片上传及导入已核验；原片不完整，坏位置已跳过。')
+                            endReason=end_reason, finishedAt=now_iso(), message=message)
             version.update(recovery=recovery, downloadRequested=False, processingState='complete')
             self.store.save(row)
         for operation in self.store.list_operations(row['id']):
@@ -1418,7 +1634,7 @@ class VideoManager:
                 current = self.version(row, row["activeRevision"])
                 if not current or current["state"] not in ("ready", "saved", "waiting", "submitted", "attention", "failed"):
                     raise ValueError("当前版本正在提交、下载或保存；请完成核对后再更正。")
-                if current.get("writeAttempted") and not current.get("taskId"):
+                if current.get("writeAttempted") and not current.get("taskId") and current.get('submissionOutcome') != 'rejected':
                     raise ValueError("上次提交的任务ID尚未确认，请先核对平台，避免重复提交。")
                 if current.get("recovery", {}).get("state") in {"queued", "moving", "slicing"}:
                     raise Conflict("当前版本正在处理可解码部分，请等待该操作结束后再更正。")
@@ -1523,9 +1739,18 @@ class VideoManager:
             try:
                 await self.target.request("/data-acquisition/batchSave", method="POST",
                                           body=[gather_payload(task, self.target_config)], write=True)
-            except (RemoteError, httpx.HTTPError):
+            except (RemoteError, httpx.HTTPError) as error:
                 # The pre-submit snapshot and request ID are durable. Reconciliation
                 # below is the only safe next action; never replay this write blindly.
+                if isinstance(error, RemoteError) and not error.ambiguous and error.code not in {'NETWORK','RESPONSE','401','403','11015'}:
+                    async with self.row_lock(identity):
+                        latest = self.store.get(identity)
+                        rejected = self.version(latest, version['revision']) if latest else None
+                        if rejected and not rejected.get('taskId'):
+                            rejected.update(state='attention', submissionOutcome='rejected', errorCode='capture_rejected',
+                                            message='平台明确拒绝本次采集，可修改区间或撤回更正。')
+                            self.store.save(latest)
+                    raise ValueError('平台明确拒绝本次采集，可修改区间或撤回更正。') from None
                 pass
             try:
                 after = await self.jobs.remote_parents(self.target_config)
@@ -1555,46 +1780,11 @@ class VideoManager:
         return latest
 
     async def withdraw(self, identity, payload):
-        before = self.store.get(identity)
-        if (getattr(self, "control", None) and before and payload["requestId"] not in before.get("requests", {})
-                and before.get("revision") == payload["expectedRevision"] and before.get("activeRevision") == payload["version"]
-                and before.get("acceptedRevision") != payload["version"] and payload["version"] != 0):
-            await self.control.take_over(identity, payload["requestId"])
-            self.control.release_review(identity, payload["requestId"])
-        async with self.row_lock(identity):
-            row = self.store.get(identity)
-            if not row or row.get("deletedAt"):
-                raise ValueError("视频记录不存在。")
-            request_id = payload["requestId"]
-            existing = row["requests"].get(request_id)
-            if existing:
-                if existing["kind"] == "withdraw" and existing["version"] == payload["version"]:
-                    return row
-                raise Conflict("请求ID已用于其他操作。")
-            if payload["expectedRevision"] != row["revision"]:
-                raise Conflict("记录已变化，请刷新后重试。")
-            self.require_editable(row)
-            version = self.version(row, payload["version"])
-            if not version or payload["version"] == 0 or row["activeRevision"] != payload["version"]:
-                raise ValueError("只能撤回当前更正版本。")
-            if row["acceptedRevision"] == payload["version"] or version["state"] in ("saved", "downloading", "publishing"):
-                raise ValueError("新版已确认或正在下载，不能撤回；可以再次更正。")
-            if version.get("writeAttempted") and not version.get("taskId"):
-                raise ValueError("提交结果尚未确定，请先核对平台任务，暂不能安全撤回。")
-            if version.get("taskId"):
-                await self.cleanup_cloud(row, version, protected={v.get("taskId") for v in row["versions"] if v is not version})
-            version["state"] = "withdrawn"
-            previous = self.version(row, version.get("previousActiveRevision"))
-            if not previous or previous["state"] in TERMINAL:
-                previous = next((item for item in reversed(row["versions"])
-                                 if item["revision"] < version["revision"] and item["state"] not in TERMINAL), None)
-            if not previous:
-                raise ValueError("没有可恢复的上一版本，请人工核对。")
-            row["activeRevision"] = previous["revision"]
-            row["revision"] += 1
-            row["requests"][request_id] = {"kind": "withdraw", "version": payload["version"]}
-            self.store.save(row)
-            return row
+        return self.queue_video_operation(identity, 'withdraw', payload)
+
+    def withdraw_capabilities(self, row):
+        from .video_withdrawal import capability
+        return capability(self, row)
 
     async def confirm(self, identity, payload):
         async with self.row_lock(identity):
@@ -1649,65 +1839,17 @@ class VideoManager:
                 raise Conflict("视频版本已变化，未重试其他版本。")
             version.update(state="ready", downloadRequested=True)
             version.pop("message", None)
-            self.store.save(row)
+            flow = getattr(self, 'final_processing', None)
+            if flow and version.get('finalConfirmation'):
+                flow.rebind_confirmed_retry(row, version, takeover_request)
+            else:
+                self.store.save(row)
             self.schedule(row)
             return row
 
     async def restart_download(self, identity, payload):
-        """Explicitly discard only this version's checkpoint, with replay protection."""
-        if self.row_lock(identity).locked():
-            current = self.store.get(identity)
-            operation = (current or {}).get("requests", {}).get(payload["requestId"], {})
-            if (current and not current.get("deletedAt") and operation.get("kind") == "restart-download"
-                    and operation.get("state") == "complete" and operation.get("version") == payload["version"]
-                    and operation.get("expectedRevision") == payload["expectedRevision"]):
-                return current
-            raise Conflict("本条仍在下载或保存，请先停止本条下载后再重新下载。")
-        current = self.store.get(identity)
-        if getattr(self, "control", None) and current and current.get("revision") == payload["expectedRevision"]:
-            if payload["requestId"] not in current.get("requests", {}):
-                await self.control.take_over(identity, payload["requestId"])
-                self.control.release_review(identity)
-        async with self.row_lock(identity):
-            row = self.store.get(identity)
-            if not row or row.get("deletedAt"):
-                raise ValueError("视频记录不存在。")
-            existing = row["requests"].get(payload["requestId"])
-            signature = {"kind": "restart-download", "version": payload["version"],
-                         "expectedRevision": payload["expectedRevision"]}
-            if existing:
-                if any(existing.get(key) != value for key, value in signature.items()):
-                    raise Conflict("请求ID已用于其他操作。")
-                if existing.get("state") == "complete":
-                    return row
-            if row["revision"] != payload["expectedRevision"] or row["activeRevision"] != payload["version"]:
-                raise Conflict("当前版本已变化，未清除其他版本的断点。")
-            self.require_editable(row)
-            version = self.version(row, payload["version"])
-            if not version or version["state"] not in ("failed", "ready") or version.get("publishing") or version.get("transferWorkerPid"):
-                raise ValueError("当前版本不能重新下载，已保留保存进度。")
-            if not self.store.directory():
-                raise ValueError("请先设置保存目录。")
-            if getattr(self, 'workspace', None) and self.workspace.enabled:
-                self.workspace.require_root()
-            await self.bound_result(version)
-            part = self.work / row["id"] / f"v{version['revision']}.part"
-            if (part.is_symlink() or part.parent.is_symlink()
-                    or not part.resolve().is_relative_to(self.work.resolve())):
-                raise ValueError("断点路径异常，未清除任何文件。")
-            guard = self.file_leases.write(part) if getattr(self, "file_leases", None) else nullcontext()
-            with guard:
-                row["requests"][payload["requestId"]] = {**signature, "state": "pending"}
-                self.store.save(row)
-                await self.file_operation(part.unlink, True)
-                for key in ("etag", "totalBytes", "receivedBytes", "attempts", "errorCode", "message"):
-                    version.pop(key, None)
-                version.update(state="ready", downloadRequested=True,
-                               outputDirectory=version.get("outputDirectory") or self.store.directory())
-                row["requests"][payload["requestId"]]["state"] = "complete"
-                self.store.save(row)
-            self.schedule(row)
-            return row
+        """Register first; offline checks never change approval or checkpoints."""
+        return self.queue_video_operation(identity, 'restart-download', payload)
 
     async def cancel_download(self, identity, payload):
         row = self.store.get(identity)
@@ -1732,6 +1874,9 @@ class VideoManager:
             self.require_editable(row)
             version = self.version(row, payload["version"])
             version["downloadRequested"] = False
+            flow = getattr(self, 'final_processing', None)
+            if flow and version.get('finalConfirmation'):
+                flow.pause_download(row, version)
             row["requests"][payload["requestId"]] = {"kind": "cancel-download", "version": payload["version"]}
             self.store.save(row)
             return row
@@ -1978,20 +2123,40 @@ class VideoManager:
             return {"id": identity, "deleted": True, "cacheBytes": cleared}
 
     async def ffprobe(self, path):
+        configured = getattr(getattr(self, 'slicing', None), 'store', None)
+        frame_tool = (configured.settings.get('frameToolPath') if configured else None) or shutil.which('ffmpeg')
+        probe_tool = str(Path(frame_tool).with_name('ffprobe')) if frame_tool else None
+        if not frame_tool or not probe_tool or not all(
+                Path(tool).is_file() and os.access(tool, os.X_OK) for tool in (frame_tool, probe_tool)):
+            raise DownloadFailure('视频检查工具不可用，请检查已配置的抽帧工具；缓存保留，未判定视频损坏。', 'media_tool_missing')
+        process = None
         try:
-            process = await asyncio.create_subprocess_exec("ffprobe", "-v", "error", "-show_entries", "format=duration",
+            process = await asyncio.create_subprocess_exec(probe_tool, "-v", "error", "-show_entries", "format=duration",
                                                              "-of", "default=noprint_wrappers=1:nokey=1", str(path),
                                                              stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
-            output, _ = await process.communicate()
+            output, _ = await asyncio.wait_for(process.communicate(), 40)
             duration = float(output.strip())
             if process.returncode or not math.isfinite(duration) or duration <= 0:
                 raise ValueError()
-            await asyncio.to_thread(verify_video_tail, path, shutil.which("ffmpeg") or "ffmpeg", duration)
+            await self.file_operation(verify_video_tail, path, frame_tool, duration)
             return duration
-        except MediaValidationError:
+        except MediaValidationError as error:
+            if str(error) == 'media_check_timeout':
+                raise DownloadFailure('视频检查超时，缓存保留；未判定视频损坏。', 'media_check_timeout') from None
             raise DownloadFailure("视频末段缺失或无法解码，尚未替换旧版。请使用完整视频重新采集或下载。", "invalid_video") from None
-        except (OSError, ValueError):
+        except TimeoutError:
+            raise DownloadFailure('视频元数据检查超时，缓存保留；未判定视频损坏。', 'media_check_timeout') from None
+        except OSError:
+            raise DownloadFailure('视频检查工具无法启动或访问，缓存保留；未判定视频损坏。', 'media_tool_missing') from None
+        except ValueError:
             raise DownloadFailure("文件无法作为完整视频播放，旧版已保留。", "invalid_video") from None
+        finally:
+            if process and process.returncode is None:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+                await process.wait()
 
     @staticmethod
     async def file_operation(function, *args):
@@ -2171,18 +2336,25 @@ class VideoManager:
                     version.update(etag=etag, totalBytes=total, receivedBytes=offset)
                     self.store.save(row)
                     received, saved_at = offset, time.monotonic()
-                    with part.open("ab" if offset else "wb") as output:
+                    output = part.open("ab" if offset else "wb")
+                    try:
                         async for block in response.aiter_bytes(chunk_size=1024 * 1024):
                             if received == 0 and not valid_video_header(block[:512]):
                                 raise DownloadFailure("下载内容不是视频。", "invalid_content")
-                            output.write(block)
+                            # Removable-volume writes and fsync may stall for
+                            # seconds. Keep API handling off that filesystem
+                            # wait, and finish an in-flight write before close
+                            # when the user pauses this download.
+                            await self.file_operation(output.write, block)
                             received += len(block)
                             version["receivedBytes"] = received
                             if time.monotonic() - saved_at >= 1:
                                 self.store.save(row)
                                 saved_at = time.monotonic()
-                        output.flush()
-                        os.fsync(output.fileno())
+                        await self.file_operation(output.flush)
+                        await self.file_operation(os.fsync, output.fileno())
+                    finally:
+                        await self.file_operation(output.close)
                     if expected and received - offset != expected:
                         raise DownloadFailure("下载连接中断，将续传。", "incomplete", retryable=True)
                     if received != total:
@@ -2283,8 +2455,18 @@ class VideoManager:
                 previous = row["acceptedRevision"]
                 row["acceptedRevision"] = revision
                 row["cleanupPending"] = revision > 0 and previous != revision
+                if self._manual_media_policy(version):
+                    self._retain_replacement_history(row, version)
                 self.store.save(row)
-                if row.get("cleanupPending"):
+                on_saved = getattr(self, 'on_saved', None)
+                if on_saved:
+                    try:
+                        on_saved(identity, revision)
+                    except Exception:
+                        # Publication already succeeded. Startup's accepted-file
+                        # reconciliation repairs a lost advisory notification.
+                        pass
+                if row.get("cleanupPending") and not self._manual_media_policy(version):
                     try:
                         await self._finish_cleanup_locked(row)
                     except (RemoteError, ValueError, OSError):
@@ -2316,7 +2498,22 @@ class VideoManager:
                 version["state"] = "failed"
                 version["message"] = str(error) if isinstance(error, DownloadFailure) else "视频保存暂时失败，旧版已保留。"
                 version["errorCode"] = error.code if isinstance(error, DownloadFailure) else "filesystem" if isinstance(error, OSError) else "media_unavailable"
+                marker = None
+                prepare = getattr(self, 'prepare_recovery_event', None)
+                if prepare:
+                    try:
+                        marker = prepare(row, version)
+                    except Exception:
+                        pass  # Keep the original download failure intact.
+                if marker:
+                    version['automaticRecoveryEvent'] = marker
                 self.store.save(row)
+                notify = getattr(self, 'on_media_failure', None)
+                if marker and notify:
+                    try:
+                        notify(identity, revision)
+                    except Exception:
+                        pass  # The durable marker is reconciled on restart.
 
     async def finish_cleanup(self, identity):
         async with self.row_lock(identity):
@@ -2332,6 +2529,24 @@ class VideoManager:
         latest = self.version(row, row["acceptedRevision"])
         if not latest or latest["state"] != "saved" or not latest.get("filePath"):
             raise ValueError("新版文件尚未发布，不能清理旧版。")
+        if self._manual_media_policy(latest):
+            self._retain_replacement_history(row, latest)
+            self.store.save(row)
+            for version in row['versions']:
+                journal = version.get('cleanup') or {}
+                if (version['revision'] >= latest['revision'] or not journal.get('started')
+                        or journal.get('complete')):
+                    continue
+                # A previously dispatched deletion cannot be revoked. Reconcile
+                # only its exact persisted cloud journal; never add local files.
+                await self.cleanup_cloud(row, version, protected={v.get('taskId') for v in row['versions']
+                    if v['revision'] >= latest['revision']})
+                version['state'] = 'cloud_deleted'
+                version['cloudCleanupReconciledAt'] = now_iso()
+                self.store.save(row)
+            row.update(cleanupPending=False, error='')
+            self.store.save(row)
+            return
         for version in row["versions"]:
             if version["revision"] >= latest["revision"] or version["state"] in TERMINAL:
                 continue
@@ -2365,6 +2580,28 @@ class VideoManager:
         row["error"] = ""
         self.store.save(row)
 
+    @staticmethod
+    def _manual_media_policy(version):
+        confirmation = version.get('finalConfirmation') or {}
+        return bool(confirmation.get('operationId') and confirmation.get('version') == version.get('revision'))
+
+    @staticmethod
+    def _retain_replacement_history(row, latest):
+        retained, reconciling = [], False
+        for version in row.get('versions', []):
+            if version['revision'] >= latest['revision']:
+                continue
+            cleanup = version.get('cleanup') or {}
+            reconciling = reconciling or bool(cleanup.get('started') and not cleanup.get('complete'))
+            if version['state'] not in TERMINAL:
+                retained.append(version['revision'])
+                version['replacementRetention'] = {
+                    'policy': 'manual-local-keep-cloud', 'acceptedRevision': latest['revision'],
+                    'message': '旧版文件与云端任务保留；本次确认不自动删除。'}
+        row['cleanupPending'] = reconciling
+        row['replacementRetention'] = {'policy': 'manual-local-keep-cloud', 'versions': retained,
+                                       'acceptedRevision': latest['revision']}
+
     async def cleanup_cloud(self, row, version, protected, allow_incomplete=False):
         guard = (self.file_leases.write(self.cloud_lease_key(version.get("taskId")))
                  if getattr(self, "file_leases", None) else nullcontext())
@@ -2372,6 +2609,8 @@ class VideoManager:
             return await self._cleanup_cloud(row, version, protected, allow_incomplete)
 
     async def _cleanup_cloud(self, row, version, protected, allow_incomplete=False):
+        from .video_withdrawal import cleanup_checkpoint
+        checkpoint = lambda: cleanup_checkpoint(self, row, version)
         parent_id = version.get("taskId")
         if not parent_id or parent_id in protected:
             raise ValueError("旧任务ID无效或指向保留版本，已阻止删除。")
@@ -2388,12 +2627,12 @@ class VideoManager:
                 for result in results:
                     await self.target.request("/data-acquisition/delete", method="POST",
                                               body={"id": str(result["id"]), "type": "acInfo"}, write=True)
-                await self._delete_objects(cleanup, parent_id, lambda: self.store.save(row))
+                await self._delete_objects(cleanup, parent_id, lambda: checkpoint())
                 await self._verify_objects(cleanup)
                 if await self.results(parent_id):
                     raise ValueError("旧结果记录仍存在，清理尚未完成。")
                 cleanup["complete"] = True
-                self.store.save(row)
+                checkpoint()
                 return
             if not self.matches(parent, version, self.target_config["cameraId"]):
                 raise ValueError("旧任务身份已变化，已阻止删除。")
@@ -2403,13 +2642,13 @@ class VideoManager:
             if not results and not version.get("resultId") and (version["revision"] > 0 or allow_incomplete):
                 # A withdrawn correction can still be collecting. Recheck the result after removing its exact task.
                 cleanup.update(started=True, pendingTaskOnly=True)
-                self.store.save(row)
+                checkpoint()
                 await self.target.request("/data-acquisition/delete", method="POST",
                                           body={"id": parent_id, "type": "task"}, write=True)
                 if parent_id in await self.jobs.remote_parents(self.target_config) or await self.results(parent_id):
                     raise ValueError("更正任务仍存在，暂不能确认撤回完成。")
                 cleanup.update(started=True, complete=True)
-                self.store.save(row)
+                checkpoint()
                 return
             if not version.get("resultId") and len(results) == 1 and (allow_incomplete or cleanup.get("pendingTaskOnly")):
                 version["resultId"] = str(results[0]["id"])
@@ -2427,13 +2666,13 @@ class VideoManager:
                     cleanup["checks"][version["resultId"]] = {"etag": version["etag"],
                                                                     "length": version["totalBytes"]}
                 cleanup["started"] = True
-                self.store.save(row)
+                checkpoint()
             if set(cleanup["objects"]) != {version["resultId"]} or any(str(r["id"]) != version["resultId"] for r in results):
                 raise ValueError("旧任务出现未绑定的视频结果，已阻止删除。")
             for result in results:
                 await self.target.request("/data-acquisition/delete", method="POST",
                                           body={"id": str(result["id"]), "type": "acInfo"}, write=True)
-            await self._delete_objects(cleanup, parent_id, lambda: self.store.save(row))
+            await self._delete_objects(cleanup, parent_id, lambda: checkpoint())
             await self._verify_objects(cleanup)
             if await self.results(parent_id):
                 raise ValueError("旧结果记录仍存在，稍后继续核对。")
@@ -2442,7 +2681,7 @@ class VideoManager:
             if parent_id in await self.jobs.remote_parents(self.target_config):
                 raise ValueError("旧任务仍存在，稍后继续核对。")
             cleanup["complete"] = True
-            self.store.save(row)
+            checkpoint()
 
     async def _delete_objects(self, cleanup, parent_id, persist=None):
         for result_id, reference in cleanup["objects"].items():

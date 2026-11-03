@@ -24,7 +24,13 @@ def package_fixture(app, tmp_path, *, extra_file=False):
                "sourceDatasetId": "27912", "sourceVideoId": "42", "videoPath": str(video),
                "name": archive.name, "state": "complete", "path": str(archive), "imageDir": str(image_dir),
                "images": [image.name], "imageCount": 1, "fileVersion": source_fingerprint(archive),
-               "imageVersions": {image.name: source_fingerprint(image)}}
+               "imageVersions": {image.name: source_fingerprint(image)}, "actualImages": 1,
+               "verifiedJobId": "verified-job", "jobId": "verified-job", "outputImageIds": ["verified-image"],
+               "videoFileVersion": source_fingerprint(video)}
+    app.state.slicing.store.save('items', {'id':'item-1','path':str(video), 'fileVersion':source_fingerprint(video),
+        'name':video.name,'sourceDatasetId':'27912','sourceVideoId':'42','state':'complete', 'revision':0,
+        'categories':{'bed':{'state':'complete','packageId':'package-1','actualImages':1,'targetDatasetId':'27892'},
+                      'magnet':{'state':'no_target'}}})
     app.state.slicing.packages.store.save("items", package)
     return video, folder, archive, image
 
@@ -97,3 +103,27 @@ async def test_output_organizer_rejects_preview_after_directory_settings_change(
                          app.state.videos.shutdown(), app.state.jobs.shutdown(),
                          app.state.upload_audit.shutdown())
     app.state.store.close()
+
+
+@pytest.mark.asyncio
+async def test_output_organizer_holds_every_photo_until_both_categories_finish(tmp_path):
+    app=create_app(data_dir=tmp_path/'data')
+    video,old,archive,image=package_fixture(app,tmp_path)
+    item=app.state.slicing.store.get('items','item-1')
+    item['categories']['magnet']={'state':'uploading'}
+    app.state.slicing.store.save('items',item)
+    organizer=app.state.slice_output_organizer
+    held=organizer.preview({'expectedRevision':0,'requestId':'waiting-for-photo'})
+    assert held['items'][0]['state']=='held' and '尚未全部' in held['items'][0]['message']
+    assert old.is_dir() and archive.is_file() and image.is_file() and video.is_file()
+    item['categories']['magnet']={'state':'no_target'}
+    app.state.slicing.store.save('items',item)
+    plan=organizer.preview({'expectedRevision':0,'requestId':'before-proof-changes'})
+    assert plan['items'][0]['state']=='planned'
+    package=app.state.slicing.packages.store.get('items','package-1');package['outputImageIds']=[]
+    app.state.slicing.packages.store.save('items',package)
+    with pytest.raises(Exception,match='尚未全部'):
+        await organizer.confirm(plan['id'],{'expectedRevision':plan['revision'],'requestId':'do-not-move'})
+    assert old.is_dir() and archive.is_file() and image.is_file() and video.is_file()
+    from tests.test_slicing_performance import close_app
+    await close_app(app)

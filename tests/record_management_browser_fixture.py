@@ -17,12 +17,15 @@ def run():
         root = Path(folder).resolve()
         if os.environ.get('RECORD_UI_DIST'):
             from app import main as app_main
-            app_main.ROOT = Path(os.environ['RECORD_UI_DIST']).resolve().parent
+            (root / 'dist').symlink_to(Path(os.environ['RECORD_UI_DIST']).resolve(), target_is_directory=True)
+            app_main.ROOT = root
         app = create_app(data_dir=root / 'db', video_directory=root / '视频')
         media = root / '视频'
         media.mkdir(exist_ok=True)
         tasks = []
         fixture_names = ('鲁Q09501D', 'VIRTUAL_001') if os.environ.get('RECORD_UI_DAMAGED') else ('鲁DJ1397', 'VIRTUAL_001')
+        if os.environ.get('RECORD_UI_COUNT'):
+            fixture_names = tuple(f'鲁测试{i:03d}' for i in range(int(os.environ['RECORD_UI_COUNT'])))
         for index, name in enumerate(fixture_names):
             tasks.append({'key': f'key-{index}', 'recordId': f'inspection-{index}', 'plate': name, 'videoName': name,
                           'checkStartTime': '2026-09-30 08:00:00', 'checkCompleteTime': '2026-09-30 09:00:00',
@@ -75,6 +78,11 @@ def run():
             log.add('collection', '采集提交', {'jobId': record['id']}, submitted_at=record['createdAt'])
         log.add('slicing', '全部切片', {'itemIds': identities, 'runId': 'fixture-run', 'message': '示例切片已核验。'},
                 submitted_at='2026-10-23T08:30:00Z')
+        for index in range(2):
+            app.state.collection_runs._save({'id':f'date-fixture-{index}','requestId':f'date-fixture-request-{index}',
+                'revision':0,'status':'complete','stage':'complete','message':'日期采集已结束。',
+                'filters':{'dateFrom':'2026-09-29','dateTo':'2026-10-08'},'counts':{'submitted':2,'ready':2},
+                'scanned':2,'total':2,'createdAt':'2026-10-23T08:00:00Z','records':[]})
 
         @app.middleware('http')
         async def test_frame(request, call_next):

@@ -31,3 +31,17 @@ button:focus-visible,summary:focus-visible,select:focus-visible{outline:2px soli
 .job-list>div{flex-wrap:wrap}
 .job-list>div .table-scroll{flex:1 0 100%;margin-top:8px}
 .more-video-actions,.correction{border-top:1px solid #e8eee6;margin-top:14px;padding-top:12px}.more-video-actions>summary{cursor:pointer;color:#58715f;font-size:12px;font-weight:600}.recovery-progress{display:grid;gap:6px;margin:12px 0;padding:13px 15px;border:1px solid #d7e6d7;border-radius:10px;background:#f1f8f1;color:#315c45;font-size:12px}.recovery-progress p{margin:0;line-height:1.55}.recovery-progress>span{color:#718276;font-size:11px}.recovery-progress.needs-review{background:#fff8ef;border-color:#ecddc8;color:#825f34}.primary-video-actions{margin-top:13px}
+/* A single, task-focused navigation keeps global settings separate. */
+.site-header{position:relative;align-items:center;gap:18px;padding-block:12px}
+.site-header nav button{min-height:42px}
+.site-header nav button.selected{box-shadow:inset 0 -2px #315c45}
+.hero.compact{margin-bottom:16px}.hero.compact>div:first-child{padding:4px 0}.hero.compact h1{font-size:25px;margin-bottom:6px}.hero.compact p{font-size:14px}
+.connections{grid-template-columns:repeat(auto-fit,minmax(min(100%,290px),1fr));margin:0}
+.login-card .login-form{flex-wrap:wrap;align-items:center}.login-card .login-form .notice{flex-basis:100%;margin:0}
+.login-card .login-form input:not([type=checkbox]){min-width:125px;flex:1 1 125px}
+.submission-records>.secondary,.slice-records>.secondary{margin:4px 0 12px}
+@media(max-width:700px){.site-header{align-items:flex-start;flex-direction:column;gap:12px}.site-header nav{grid-template-columns:repeat(2,minmax(0,1fr));width:100%}.site-header nav button{white-space:normal}.hero.compact h1{font-size:22px}.login-card .login-form input:not([type=checkbox]){flex-basis:100%}}
+.collection-runs { margin-top: 1rem; }
+.collection-runs > details + details { margin-top: .6rem; }
+.collection-runs summary { padding: .65rem 0; cursor: pointer; }
+.collection-runs summary > span { display: block; margin-top: .3rem; color: var(--text-secondary, #52685b); font-size: .875rem; line-height: 1.5; }

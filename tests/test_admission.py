@@ -182,7 +182,7 @@ async def test_changed_rule_blocks_stale_search_and_unsubmitted_preview(admissio
     plan = (await client.post('/api/preview',json=body)).json()
     await save(client,{'matchMode':'all'})
     assert (await client.post('/api/preview',json=body)).status_code == 409
-    response = await client.post('/api/jobs',json={'planId':plan['id']})
+    response = await client.post('/api/jobs',json={'confirmed':True,'planId':plan['id']})
     assert response.status_code == 409 and not platform.parents
     assert not app.state.jobs.store.list()
     invalid_search = await client.post('/api/settings/admission',json={'rule':DEFAULT,'expectedRevision':1,'searchId':'expired'})
@@ -199,7 +199,7 @@ async def test_lowered_rule_is_used_for_submission_and_later_manual_corrections(
     assert not result['records'][0].get('issue')
     plan = (await client.post('/api/preview',json={'searchId':result['id'],'recordIds':['F001']})).json()
     assert plan['tasks'][0]['status'] == 'ready' and plan['tasks'][0]['videoName']=='VIRTUAL_001'
-    response = await client.post('/api/jobs',json={'planId':plan['id']})
+    response = await client.post('/api/jobs',json={'confirmed':True,'planId':plan['id']})
     assert response.status_code == 202
     job_id = response.json()['id']
     await wait_until(lambda:not app.state.jobs.running)
@@ -211,7 +211,7 @@ async def test_lowered_rule_is_used_for_submission_and_later_manual_corrections(
     await save(client,DEFAULT)
     # Existing batches and replayed submissions keep their original approved snapshot.
     assert app.state.videos.store.get(row['id'])==original
-    replay = await client.post('/api/jobs',json={'planId':plan['id']})
+    replay = await client.post('/api/jobs',json={'confirmed':True,'planId':plan['id']})
     assert replay.status_code==202 and replay.json()['id']==job_id and len(platform.parents)==1
     correction = await client.post(f"/api/videos/{row['id']}/corrections",json={
         'startTime':'2026-09-30 02:10:00','durationSeconds':1800,'expectedRevision':0,'requestId':'new-manual-correction'})

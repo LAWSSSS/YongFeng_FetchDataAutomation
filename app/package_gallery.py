@@ -3,6 +3,7 @@ import asyncio
 from collections import OrderedDict
 from contextlib import ExitStack
 import io
+import json
 import os
 from pathlib import Path, PurePosixPath
 import stat
@@ -23,6 +24,7 @@ class PackageGallery:
     def __init__(self, packages, leases):
         self.packages, self.leases = packages, leases
         self.sessions, self.thumbnails = {}, OrderedDict()
+        self.remounted_archives = OrderedDict()
         self.thumbnail_lock = RLock()
         self.task = None
 
@@ -82,6 +84,41 @@ class PackageGallery:
                 paths[name] = raw
         archive = package.get("path") or ""
         valid_archive = bool(archive and self.valid_file(archive, package.get("fileVersion")))
+        if archive and not valid_archive:
+            # A mounted volume can receive a new device number. Reuse only
+            # the exact uploaded ZIP bytes, never accept a stat-only match.
+            # This is a read-session copy; cleanup and upload receipts stay
+            # unchanged in the database.
+            expected = package.get('fileVersion') or {}
+            try:
+                current = source_fingerprint(Path(archive))
+            except FileNotFoundError:
+                current = {}
+            keys = ('device', 'inode', 'size', 'modifiedNs')
+            if (all(key in expected and key in current for key in keys)
+                    and expected['device'] != current['device']
+                    and all(expected[key] == current[key] for key in keys[1:])
+                    and package.get('parts') and package.get('etag')):
+                from .workspace_archive import _verify_remounted_archive
+                from .audit_moves import fingerprint
+                archive_info = Path(archive).stat(follow_symlinks=False)
+                if fingerprint(archive_info) != current:
+                    raise ValueError('压缩包正在变化，请重新打开。')
+                receipt = json.dumps([package.get('parts'), package.get('etag')], sort_keys=True)
+                cache_key = (package['id'], archive, tuple(sorted(expected.items())),
+                             tuple(sorted(current.items())), archive_info.st_ctime_ns, receipt)
+                with self.thumbnail_lock:
+                    verified = cache_key in self.remounted_archives
+                if not verified:
+                    _verify_remounted_archive(package, Path(archive), current)
+                    if Path(archive).stat(follow_symlinks=False).st_ctime_ns != archive_info.st_ctime_ns:
+                        raise ValueError('压缩包在核验期间发生变化，请重新打开。')
+                    with self.thumbnail_lock:
+                        self.remounted_archives[cache_key] = True
+                        while len(self.remounted_archives) > 16:
+                            self.remounted_archives.popitem(last=False)
+                package['fileVersion'] = current
+                valid_archive = True
         zip_names = {}
         if valid_archive:
             with zipfile.ZipFile(archive) as opened:

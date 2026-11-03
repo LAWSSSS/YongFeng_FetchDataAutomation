@@ -193,12 +193,13 @@ def test_photos_and_video_stay_until_both_categories_are_imported(tmp_path):
     for row in packages.store.list("items"):
         row.update(videoFileVersion=source_fingerprint(video), fileVersion=source_fingerprint(archive),
                    images=["a.jpg"], imageVersions={"a.jpg": source_fingerprint(photo / "a.jpg")},
-                   imageCount=1, actualImages=1, verifiedJobId="7")
+                   imageCount=1, actualImages=1, verifiedJobId="7", jobId="7", outputImageIds=["verified-image"])
         packages.store.save("items", row)
     unrelated = photo / "user.jpg"
     unrelated.write_bytes(JPEG)
     packages.delete_if_both_complete(packages.store.get("items", "magnet"))
-    assert video.exists() and not archive.exists() and not (photo / "a.jpg").exists()
+    assert video.exists() and archive.exists() and (photo / "a.jpg").exists()
+    assert packages.store.get('items', 'magnet')['cleanupState'] == 'pending_manual'
     assert unrelated.exists()
 
 
@@ -294,17 +295,27 @@ async def test_disabled_review_enqueues_immediately_and_imports_one_at_a_time(ma
     if slicing.packages.running:
         await __import__("asyncio").gather(*slicing.packages.running.values())
     await slicing.packages.tick()
+    await __import__('asyncio').wait_for(__import__('asyncio').gather(*slicing.packages.target_tasks.values()), 1)
+    if slicing.packages.running:
+        await __import__('asyncio').gather(*slicing.packages.running.values())
+    # Completion wakes the independent upload admission loop; it no longer
+    # runs as part of the same awaited platform-poll call.
+    await slicing.packages.tick()
+    if slicing.packages.running:
+        await __import__('asyncio').gather(*slicing.packages.running.values())
     assert len(slicing.packages.remote.submitted) == 1
     assert "/simple-" in slicing.packages.remote.submitted[0][1]
     waiting = [row for row in slicing.packages.store.list("items") if row["state"] == "uploaded"]
     importing = [row for row in slicing.packages.store.list("items") if row["state"] == "importing"]
-    assert len(importing) == 1 and len(waiting) == 1
+    assert len(importing) == 1 and len(waiting) == 1, [(row.get('state'), row.get('errorCode')) for row in slicing.packages.store.list('items')]
     job = slicing.packages.remote.jobs_by_dataset["27892"][0]
     job["status"] = "3"
     stem = Path(importing[0]["name"]).stem
     slicing.packages.remote.rows = [{"id": str(900+i), "name": name, "taskId": job["id"]}
                                    for i,name in enumerate(importing[0]["images"])]
+    slicing.packages.target_next_check.clear()  # Simulate the next platform poll.
     await slicing.packages.tick()
+    await __import__('asyncio').wait_for(__import__('asyncio').gather(*slicing.packages.target_tasks.values()), 1)
     assert slicing.packages.store.get("items", importing[0]["id"])["state"] == "complete"
     assert name_key(stem)
     await app.state.slicing.shutdown()

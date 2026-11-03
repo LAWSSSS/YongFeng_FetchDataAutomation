@@ -8,11 +8,14 @@ import os
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from scripts.package_safety import verify_tree
 
 
 def read(url):
@@ -23,10 +26,7 @@ def read(url):
 
 def verify_files(folder):
     manifest = json.loads((folder / "文件校验.json").read_text())
-    for entry in manifest["files"]:
-        path = folder / entry["path"]
-        with path.open("rb") as stream:
-            assert hashlib.file_digest(stream, "sha256").hexdigest() == entry["sha256"], entry["path"]
+    verify_tree(folder, manifest)
     print(f'Verified {len(manifest["files"])} packaged file checksums.')
 
 
@@ -44,7 +44,7 @@ def invoke(folder, profile, *arguments):
 
 def smoke(folder):
     with tempfile.TemporaryDirectory(prefix="ivg-isolated-") as temporary:
-        work = Path(temporary)
+        work = Path(temporary).resolve()
         profile = work / "独立数据 中文 空格"
         # An unrelated program already owning 8786 must survive launch and stop.
         blocker = socket.socket()
@@ -61,7 +61,7 @@ def smoke(folder):
             base = f'http://127.0.0.1:{first["port"]}'
             assert read(base + "/api/health")["instanceId"] == first["instanceId"]
             assert not read(base + "/api/videos")["videos"]
-            assert not read(base + "/api/videos")["directory"]
+            assert Path(read(base + "/api/videos")["directory"]).is_relative_to(work / "数据")
             for endpoint in ("/api/session", "/api/uploads", "/api/slicing", "/api/workspace"):
                 assert isinstance(read(base + endpoint), dict), endpoint
             second = invoke(folder, profile, "launch", "--no-browser")

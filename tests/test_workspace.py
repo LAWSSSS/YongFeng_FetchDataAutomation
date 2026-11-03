@@ -56,7 +56,7 @@ def proofs(w, path, tmp_path):
         archive.write_bytes(b'zip-fixture')
         photo.write_bytes(b'photo-fixture')
         package = {'id': 'p-' + category, 'itemId': item['id'], 'category': category,
-                   'dataset': category, 'state': 'complete', 'verifiedJobId': 'image-job-' + category,
+                   'dataset': category, 'state': 'complete', 'verifiedJobId': 'image-job-' + category, 'jobId': 'image-job-' + category,
                    'path': str(archive), 'fileVersion': source_fingerprint(archive),
                    'imageDir': str(folder), 'images': [photo.name],
                    'imageVersions': {photo.name: source_fingerprint(photo)}, 'outputImageIds': [category + '-image'],
@@ -66,6 +66,14 @@ def proofs(w, path, tmp_path):
     async def inventory(dataset):
         return [{'id': dataset + '-result', 'size': version['size']}]
     w.uploads.remote.videos = inventory
+
+
+def downloaded_original(w, path, identity='cleanup-download'):
+    """Exact isolated capture receipt; not authority for an arbitrary user source."""
+    w.videos.store.save({'id': identity, 'name': path.name, 'revision': 0,
+        'activeRevision': 0, 'acceptedRevision': 0, 'versions': [{
+            'revision': 0, 'state': 'saved', 'filePath': str(path), 'fileVersion': source_version(path),
+            'taskId': identity + '-task', 'resultId': identity + '-result'}]})
 
 
 async def enable(w, parent, pilot=False):
@@ -212,6 +220,13 @@ def test_root_collision_and_no_nested_workspaces(tmp_path):
 async def test_single_copy_stage_and_identity_survive(env, tmp_path, states, stage):
     app, w = env
     path = pair(w, tmp_path / 'old', states)
+    # A completed legacy platform task needs its actual output receipt.
+    for item in w.slicing.store.list('items'):
+        name = 'bed' if item['sourceDatasetId'] == '27912' else 'magnet'
+        category = item['categories'][name]
+        if category['state'] == 'complete':
+            category.update(taskId='verified-task', targetDatasetId='verified-dataset', outputImageIds=['verified-photo'])
+            w.slicing.store.save('items', item)
     old = w.slicing.store.list('items')
     p = await enable(w, tmp_path)
     assert len(p['items']) == 1
@@ -276,8 +291,10 @@ async def test_verified_cleanup_exact_manifest_and_tombstones(env, tmp_path):
     app, w = env
     path = pair(w, tmp_path / 'old', ('complete', 'complete'))
     proofs(w, path, tmp_path)
+    downloaded_original(w, path)
     await enable(w, tmp_path)
     asset = w.rows('assets')[0]
+    await w.request_cleanup_completed(w.config['revision'], 'manual-cleanup')
     extra = Path(asset['path']).parent / '用户说明.txt'
     extra.write_text('keep')
     await w.reconcile()
@@ -297,8 +314,10 @@ async def test_lease_delays_move_and_cleanup(env, tmp_path):
     app, w = env
     path = pair(w, tmp_path / 'old', ('complete', 'complete'))
     proofs(w, path, tmp_path)
+    downloaded_original(w, path)
     await enable(w, tmp_path)
     asset = w.rows('assets')[0]
+    await w.request_cleanup_completed(w.config['revision'], 'manual-cleanup')
     with w.leases.read(asset['path']):
         await w.reconcile()
         assert Path(asset['path']).exists()
@@ -464,7 +483,9 @@ async def test_restart_after_publication_replays_bindings_not_bytes(env,tmp_path
 async def test_cleanup_restarts_after_unlink_before_acknowledgement(env,tmp_path,monkeypatch,interrupt_at):
     app,w=env
     path=pair(w,tmp_path/'old',('complete','complete'));proofs(w,path,tmp_path)
+    downloaded_original(w, path)
     await enable(w,tmp_path)
+    await w.request_cleanup_completed(w.config['revision'], 'interrupted-cleanup')
     original=Path(w.rows('assets')[0]['path'])
     saved=w.videos.file_operation
     deletions=0
@@ -528,13 +549,15 @@ async def test_unverified_photos_stay_hidden_then_flow_to_category_branch(env,tm
     w.slicing.packages.store.save('items',package)
     await enable(w,tmp_path)
     assert (w.root/'.处理中'/'truck'/'bed'/'图片'/'one.jpg').is_file()
-    assert (w.root/'磁盘吊已切片'/'truck'/'压缩包.zip').is_file()
+    assert (w.root/'.处理中'/'truck'/'magnet'/'压缩包.zip').is_file()
+    assert not (w.root/'磁盘吊已切片'/'truck'/'压缩包.zip').exists()
     item=w.slicing.store.list('items')[0];item['categories']['bed']['state']='complete';item['state']='complete'
     w.slicing.store.save('items',item)
     package=w.slicing.packages.store.get('items','p-bed');package['state']='complete'
     w.slicing.packages.store.save('items',package)
     await w.reconcile(cleanup=False)
     assert (w.root/'车斗已切片'/'truck'/'图片'/'one.jpg').is_file()
+    assert (w.root/'磁盘吊已切片'/'truck'/'压缩包.zip').is_file()
     assert not (w.root/'.处理中'/'truck'/'bed'/'图片'/'one.jpg').exists()
     assert len(list(w.root.rglob('*.mp4')))==1
     await close_app(app)

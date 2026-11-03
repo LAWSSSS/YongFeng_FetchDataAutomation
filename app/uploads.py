@@ -2,6 +2,7 @@
 import asyncio
 import base64
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -16,6 +17,8 @@ from .domain import now_iso
 from .file_leases import FileLeases
 from .upload_audit import AuditError, DATASETS, name_key
 from .upload_remote import UploadRemote, source_keys, video_names
+from .upload_preflight import UploadPreflight, same_stat
+from .workspace_files import compatible
 from .videos import Conflict
 from . import runtime
 from . import file_locations
@@ -27,7 +30,7 @@ RETRY_DELAYS = (10, 30, 60)
 MAX_FILE_BYTES = 10 * 1024 ** 3
 MAX_BATCH_BYTES = 20 * 1024 ** 3  # Strictly smaller than this bound.
 DEFAULT_DIRECTORY = "" if runtime.portable() else "/Volumes/out/视频"
-PAUSE_CODES = {"auth", "network", "disk", "authorization"}
+PAUSE_CODES = {"auth", "network", "disk", "authorization", 'media_check_busy'}
 TERMINAL = {"complete", "attention"}
 MESSAGES = {
     "auth": "视觉AI会话已失效，请重新连接；断点已保留。",
@@ -41,6 +44,9 @@ MESSAGES = {
     "stalled": "连续10分钟没有真实上传进展，正在清理本条未完成分片。",
     "upload_failed": "本条上传失败，其他视频继续处理。",
     "worker_unavailable": "上传工作进程未能启动，请检查依赖后重试。",
+    "ffprobe_unavailable": "视频校验工具不可用，请检查切片设置中的 FFmpeg 路径。",
+    "source_superseded": "采集版本已变更或尚未确认保存，本条上传已停止；原片和断点保留。",
+    'media_check_busy': '视频检查超时，保留文件和断点，稍后自动重试。',
     "completion_unknown": "上传完成响应尚未确认，先核对对象与分片。",
     "cleanup_pending": "未完成分片的清理尚未确认，将继续对账。",
     "multipart_missing": "原分片上传已不存在，正在核对完整对象。",
@@ -56,13 +62,26 @@ def safe_message(code):
     return MESSAGES.get(code, "操作未完成，进度已保留，请核对后重试。")
 
 
-def inspect_video(path, expected):
+def inspect_video(path, expected, frame_tool_path=None):
     """Read metadata only; reject growing/unfinished containers and unsafe paths."""
-    if source_fingerprint(Path(path)) != expected:
+    if not same_stat(source_fingerprint(Path(path)), expected):
         raise ValueError("file_changed")
-    executable = shutil.which("ffprobe")
+    candidates = []
+    if frame_tool_path:
+        candidates.append(Path(frame_tool_path).expanduser().with_name("ffprobe"))
+    if runtime.portable():
+        try:
+            candidates.append(runtime.resources() / "tools" / "bin" / "ffprobe")
+        except (KeyError, OSError, ValueError):
+            pass
+    found = shutil.which("ffprobe")
+    if found:
+        candidates.append(Path(found))
+    candidates.extend((Path("/opt/homebrew/bin/ffprobe"), Path("/usr/local/bin/ffprobe")))
+    executable = next((str(candidate) for candidate in candidates
+                       if candidate.is_file() and os.access(candidate, os.X_OK)), None)
     if not executable:
-        raise ValueError("worker_unavailable")
+        raise ValueError("ffprobe_unavailable")
     try:
         result = subprocess.run([executable, "-v", "error", "-show_entries", "format=duration,size",
             "-of", "json", path], capture_output=True, timeout=20, check=False)
@@ -70,10 +89,16 @@ def inspect_video(path, expected):
         info = data.get("format", {})
         if float(info.get("duration", 0)) <= 0 or int(info.get("size", 0)) != expected["size"]:
             raise ValueError("incomplete_video")
-    except (subprocess.TimeoutExpired, json.JSONDecodeError, TypeError, OverflowError):
+    except subprocess.TimeoutExpired:
+        raise ValueError('media_check_busy') from None
+    except (json.JSONDecodeError, TypeError, OverflowError):
         raise ValueError("incomplete_video") from None
-    if source_fingerprint(Path(path)) != expected:
+    if not same_stat(source_fingerprint(Path(path)), expected):
         raise ValueError("file_changed")
+    if expected.get('edgeHash'):
+        from .slicing import source_version
+        if source_version(path) != expected:
+            raise ValueError('file_changed')
 
 
 class UploadStore:
@@ -107,6 +132,18 @@ class UploadStore:
         assert kind in ("items", "batches", "requests")
         row = self.db.execute(f"SELECT payload FROM simple_upload_{kind} WHERE id=?", (identity,)).fetchone()
         return json.loads(row[0]) if row else None
+
+    def save_membership(self, values):
+        """Atomically seal a submit manifest and rebind its unfinished workers."""
+        with self.db:
+            for kind, value in values:
+                assert kind in ('items', 'batches')
+                if kind == 'items':
+                    file_locations.field(self.db, value, 'path', 'fileVersion')
+                    file_locations.keep_cleanup(self.get(kind, value['id']), value)
+                value['updatedAt'] = now_iso()
+                self.db.execute(f'INSERT INTO simple_upload_{kind} VALUES(?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload',
+                                (value['id'], json.dumps(value, ensure_ascii=False)))
 
     def list(self, kind):
         assert kind in ("items", "batches", "requests")
@@ -152,7 +189,7 @@ class ProcessWorker:
             self.processes.pop(item["id"], None)
 
 
-class UploadManager:
+class UploadManager(UploadPreflight):
     def __init__(self, store, audit, leases=None, remote=None, worker=None, file_check=None, clock=None):
         self.store = UploadStore(store.db)
         self.audit, self.remote = audit, remote or UploadRemote(audit.client)
@@ -169,11 +206,29 @@ class UploadManager:
         self.stopping = False
         self.tick_lock = asyncio.Lock()
         self.scan_lock = asyncio.Lock()
+        self.setup_preflight()
         # Additive migration only: never touch collection/video tables.
+        batches = {row['id']: row for row in self.store.list('batches')}
         for item in self.store.list("items"):
+            batch = batches.get(item.get('batchId') or '')
+            if (item.get('batchId') and (not batch or batch.get('state') == 'empty')
+                    and item.get('state') not in {'uploaded', 'importing', 'complete', 'dismissed'}):
+                item.update(batchId='', message='已解除结束批次绑定，重新进入单条队列。')
             if item["state"] == "uploading":
                 item.update(state="queued", phase="reconciling", message="程序重启，先核对已完成对象及分片。")
                 self.store.save("items", item)
+            elif (item.get("state") == "attention" and item.get("errorCode") == "worker_unavailable"
+                    and item.get("phase") == "review" and not item.get("uploadId")
+                    and not item.get("createAttempted") and not item.get("completionAttempted")
+                    and not item.get("parts") and not item.get("retries", 0)):
+                # This is a pre-upload local worker/tool startup failure. No
+                # remote object or multipart request exists, so it is safe to
+                # retry once the configured runtime is repaired.
+                item.update(state="queued", phase="queued", errorCode="",
+                            message="本地检查工具已修复，自动恢复上传。")
+                self.store.save("items", item)
+            elif item.get('batchId') != (self.store.get('items', item['id']) or {}).get('batchId'):
+                self.store.save('items', item)
         scan = self.store.settings.get("scan")
         if scan and scan["state"] == "scanning":
             scan.update(state="interrupted", message="扫描被中断，请用同一请求继续；已入队记录保留。")
@@ -203,6 +258,11 @@ class UploadManager:
 
     def state(self):
         items, batches = self.store.list("items"), self.store.list("batches")
+        scan = self.store.settings.get("scan") or {}
+        public_scan = {key: scan.get(key) for key in
+                       ("id", "directory", "state", "createdAt", "updatedAt", "message", "added", "review")}
+        if scan.get("scopeIssues"):
+            public_scan["scopeIssueCount"] = len(scan["scopeIssues"])
         targets = []
         validated = all(self.store.settings.get("validated", {}).get(d["id"]) for d in DATASETS)
         for dataset in DATASETS:
@@ -232,7 +292,7 @@ class UploadManager:
                     for b in batches if b["dataset"] == dataset["id"] and b["state"] not in ("complete", "empty")]})
         return {"enabled": self.store.settings["enabled"], "connected": self.audit.client.connected,
             "workspaceManaged": bool(getattr(self, 'workspace', None) and self.workspace.enabled),
-            "directory": self.store.settings.get("directory", DEFAULT_DIRECTORY), "scan": self.store.settings.get("scan"),
+            "directory": self.store.settings.get("directory", DEFAULT_DIRECTORY), "scan": public_scan if scan else None,
             "validationMode": not validated, "parallelFilesPerTarget": 4 if validated else 1,
             "checkSeconds": CHECK_SECONDS, "stallSeconds": STALL_SECONDS, "targets": targets}
 
@@ -268,15 +328,27 @@ class UploadManager:
                 return ACTIVE_POLL_SECONDS
         return CHECK_SECONDS
 
-    def scan(self, directory, request_id):
+    def scan(self, directory, request_id, asset_scope=None):
         if getattr(self, 'workspace', None) and self.workspace.enabled:
             self.workspace.require_directory(directory)
         if getattr(self, 'workspace', None) and self.workspace.maintenance:
             raise Conflict('工作区正在整理，请稍后扫描。')
         directory = str(Path(directory or DEFAULT_DIRECTORY).expanduser())
+        scope = None
+        if asset_scope is not None:
+            if not isinstance(asset_scope, dict) or len(asset_scope) > 20000:
+                raise ValueError("工作区视频范围无效，请重新整理。")
+            scope = {}
+            for relative, expected in asset_scope.items():
+                relative_path = Path(str(relative))
+                if relative_path.is_absolute() or ".." in relative_path.parts or not expected:
+                    raise ValueError("工作区视频范围无效，请重新整理。")
+                scope[relative_path.as_posix()] = dict(expected)
         old = self.store.get("requests", request_id)
         if old and old["directory"] != directory:
             raise Conflict("请求ID已用于另一个目录，请使用新的请求。")
+        if old and old.get("assetScope") != scope:
+            raise Conflict("请求ID已用于其他视频范围，请重新整理。")
         if old and old["state"] not in ("interrupted", "failed"):
             return self.state()
         if self.scan_task and not self.scan_task.done():
@@ -286,7 +358,8 @@ class UploadManager:
         if not self.audit.client.connected:
             raise AuditError("请先连接视觉AI平台。", "auth", 401)
         value = {"id": request_id, "directory": directory, "state": "scanning", "createdAt": now_iso(),
-                 "message": "正在核对完整文件及两个目标的缺失情况…", "added": 0, "review": 0}
+                 "message": "正在核对完整文件及两个目标的缺失情况…", "added": 0, "review": 0,
+                 "assetScope": scope}
         self.store.save("requests", value)
         self.store.settings.update(directory=directory, enabled=True, scan=value)
         self.store.save_settings()
@@ -306,14 +379,27 @@ class UploadManager:
                 existing = self.store.list("items")
                 for file in report["files"]:
                     relative = Path(file["relativePath"])
+                    path = str(Path(run["directory"]) / relative)
+                    scope = run.get("assetScope")
+                    if scope is not None:
+                        expected = scope.get(relative.as_posix())
+                        if not expected:
+                            continue
+                        from .slicing import source_version
+                        try:
+                            actual_version = await asyncio.to_thread(source_version, path)
+                        except (OSError, ValueError):
+                            actual_version = None
+                        if not actual_version or not compatible(actual_version, expected):
+                            run.setdefault("scopeIssues", []).append(relative.as_posix())
+                            continue
                     if any(p.casefold() in ("cache", "tmp", "temp", "work", "node_modules") for p in relative.parts[:-1]):
                         continue
                     if re.search(r"\.(?:part|partial|download|tmp|moving)(?:\.|$)", file["name"], re.I):
                         continue
-                    path = str(Path(run["directory"]) / relative)
                     for dataset in DATASETS:
                         previous = [i for i in existing if i["dataset"] == dataset["id"] and
-                            ((i["path"] == path and i["fileVersion"] == file["fileVersion"]) or
+                            ((i["path"] == path and compatible(i["fileVersion"], file["fileVersion"])) or
                              i.get("originalFileVersion") == file["fileVersion"])]
                         if previous:
                             continue
@@ -326,7 +412,7 @@ class UploadManager:
                         if not re.fullmatch(r"[a-zA-Z0-9_~!.#@&+=$%\-()（）+\u4e00-\u9fa5]{1,100}", file["name"]):
                             issue = "文件名超出平台允许的字符或100字符限制，请核对后重命名。"
                         if any(i["dataset"] == dataset["id"] and name_key(i["name"]) == name_key(file["name"])
-                               and i["fileVersion"] != file["fileVersion"] for i in existing):
+                               and not compatible(i["fileVersion"], file["fileVersion"]) for i in existing):
                             issue = "同名视频已有其他文件版本，不能自动重复提交。"
                         review = bool(issue) or result["status"] not in ("missing",)
                         item = {"id": uuid4().hex, "dataset": dataset["id"], "name": file["name"], "path": path,
@@ -355,6 +441,7 @@ class UploadManager:
     async def pause(self):
         self.store.settings["enabled"] = False
         self.store.save_settings()
+        await self.stop_probe_recovery()
         # Drain selectors before cancelling workers: an in-flight inventory read
         # must not launch a new process after this endpoint has returned.
         async with self.tick_lock:
@@ -452,9 +539,17 @@ class UploadManager:
         if getattr(self, 'workspace', None) and self.workspace.blocked:
             return
         async with self.tick_lock:
+            if self.store.settings.get('enabled'):
+                self.start_probe_recovery()
             now = self.clock()
             for identity, task in list(self.running.items()):
                 runtime = self.runtime.get(identity, {})
+                if getattr(self, 'workspace', None):
+                    item = self.store.get('items', identity)
+                    if item and self.workspace.collection_source_binding(item)[1]:
+                        runtime['stopCode'] = 'source_superseded'
+                        task.cancel()
+                        continue
                 if not task.done() and now - runtime.get("lastProgress", now) >= STALL_SECONDS:
                     runtime["stopCode"] = "stalled"
                     task.cancel()
@@ -511,7 +606,7 @@ class UploadManager:
                     continue
                 if item["state"] == "checking":
                     await self.check_one(item, jobs)
-                elif item["state"] in ("waiting_connection", "waiting_auth", "waiting_disk"):
+                elif item["state"] in ("waiting_connection", "waiting_auth", "waiting_disk", 'waiting_local'):
                     item.update(state="cleanup" if item.get("cleanupNeeded") else "queued", phase="reconciling")
                     self.store.save("items", item)
                 elif item["state"] == "retry_wait":
@@ -528,6 +623,11 @@ class UploadManager:
                     and self.store.get("items", identity)["state"] != "attention" for identity in preparing["items"]):
                 preparing.update(state="empty", message="本批各条已独立恢复，准备下一批。")
                 self.store.save("batches", preparing)
+                for identity in preparing['items']:
+                    item = self.store.get('items', identity)
+                    if item and item.get('batchId') == preparing['id'] and item.get('state') not in {'uploaded', 'importing', 'complete'}:
+                        item.update(batchId='', message=item.get('message') or '已从结束批次释放，等待单条重试。')
+                        self.store.save('items', item)
                 preparing = None
             if not preparing and not info.get("blocked"):
                 queued = [i for i in self.store.list("items") if i["dataset"] == dataset and i["state"] in ("queued", "uploaded")
@@ -565,6 +665,25 @@ class UploadManager:
                             item["batchId"] = preparing["id"]
                             self.store.save("items", item)
             if preparing:
+                # A sealed import may leave a slow worker in the next staged
+                # batch. Fill its free places without touching that worker.
+                members = [self.store.get('items', i) for i in preparing['items']]
+                members = [i for i in members if i and i.get('batchId') == preparing['id']]
+                cap = 4 if all(self.store.settings.get('validated', {}).get(d['id']) for d in DATASETS) else 1
+                size = sum(i['size'] for i in members)
+                for candidate in self.store.list('items'):
+                    if len(members) >= cap:
+                        break
+                    if (candidate.get('dataset') == dataset and candidate.get('state') in {'queued', 'uploaded'}
+                            and not candidate.get('batchId') and candidate.get('nextAttempt', 0) <= now
+                            and candidate['id'] not in self.running and size + candidate['size'] < MAX_BATCH_BYTES):
+                        candidate['batchId'] = preparing['id']
+                        self.store.save('items', candidate)
+                        preparing['items'].append(candidate['id'])
+                        members.append(candidate)
+                        size += candidate['size']
+                preparing['bytes'] = size
+                self.store.save('batches', preparing)
                 for identity in preparing["items"]:
                     item = self.store.get("items", identity)
                     if (item["batchId"] == preparing["id"] and item["state"] == "queued"
@@ -574,12 +693,17 @@ class UploadManager:
                 current = [self.store.get("items", i) for i in preparing["items"]]
                 waiting = [i for i in current if i["batchId"] == preparing["id"] and i["state"] not in ("uploaded", "attention")]
                 uploaded = [i for i in current if i["batchId"] == preparing["id"] and i["state"] == "uploaded"]
-                if not waiting:
+                if uploaded and not active and not info.get('blocked'):
+                    await self.submit_batch(preparing, uploaded)
+                elif not waiting:
                     if not uploaded:
                         preparing.update(state="empty", message="本批没有已完成上传的文件，失败项单独恢复。")
                         self.store.save("batches", preparing)
-                    elif not active and not info.get("blocked"):
-                        await self.submit_batch(preparing, uploaded)
+                        for identity in preparing['items']:
+                            item = self.store.get('items', identity)
+                            if item and item.get('batchId') == preparing['id'] and item.get('state') not in {'uploaded', 'importing', 'complete'}:
+                                item.update(batchId='', message=item.get('message') or '本批未提交，已释放回单条队列。')
+                                self.store.save('items', item)
             self.store.save_settings()
         except AuditError as error:
             info.update(message=safe_message(error.code), errorCode=error.code)
@@ -622,7 +746,7 @@ class UploadManager:
             if matches or found.get("reason") or str(job["status"]) in ("1", "2"):
                 self.attention(item, "scan_review", "平台仍有相关记录、未结束导入或不完整日志，未重复提交。")
                 return
-        if source_fingerprint(Path(item["path"])) != item["fileVersion"]:
+        if not same_stat(source_fingerprint(Path(item["path"])), item["fileVersion"]):
             self.attention(item, "file_changed")
             return
         item.update(state="queued", phase="queued", message="单条重新核对完成，已确认缺失。", errorCode="")
@@ -641,16 +765,22 @@ class UploadManager:
     async def upload_one(self, identity, operation):
         item = self.store.get("items", identity)
         try:
+            if operation != 'cleanup' and getattr(self, 'workspace', None) and self.workspace.collection_source_binding(item)[1]:
+                self.attention(item, 'source_superseded')
+                return
             with self.leases.read(item["path"]):
                 if operation != "cleanup":
                     try:
-                        await asyncio.wait_for(asyncio.to_thread(self.file_check, item["path"], item["fileVersion"]), 25)
-                    except OSError:
-                        raise ValueError("disk") from None
+                        await self.validate_upload_source(item)
                     except TimeoutError:
+                        raise ValueError('media_check_busy') from None
+                    except OSError:
                         raise ValueError("disk") from None
                 credentials = await self.authorization(item)
                 item = self.store.get("items", identity)
+                if operation != 'cleanup' and getattr(self, 'workspace', None) and self.workspace.collection_source_binding(item)[1]:
+                    self.attention(item, 'source_superseded')
+                    return
                 prefix = credentials.get("prefix")
                 unwritten = not item.get("createAttempted") and not item.get("uploadId") and not item.get("parts")
                 replace_unwritten = (item.get("object") and unwritten and isinstance(prefix, str)
@@ -674,7 +804,9 @@ class UploadManager:
         except asyncio.CancelledError:
             item = self.store.get("items", identity)
             code = self.runtime.get(identity, {}).get("stopCode")
-            if code == "stalled":
+            if code == 'source_superseded':
+                self.attention(item, code)
+            elif code == "stalled":
                 # An unavailable volume is a pause, not a consumed upload retry.
                 try:
                     await asyncio.wait_for(asyncio.to_thread(source_fingerprint, Path(item["path"])), 3)
@@ -713,9 +845,11 @@ class UploadManager:
             if not isinstance(count, int) or count < 0 or count > item["size"]:
                 raise ValueError("parts_invalid")
             if count > runtime.get("bytes", 0):
-                elapsed = max(now - runtime.get("sampleAt", now), 0.001)
-                runtime.update(lastProgress=now, bytes=count,
-                    speed=max(0, count - runtime.get("sampleBytes", 0)) / elapsed, sampleAt=now, sampleBytes=count)
+                elapsed = now - runtime.get('sampleAt', now)
+                runtime.update(lastProgress=now, bytes=count)
+                if elapsed >= .5:
+                    runtime.update(speed=max(0, count - runtime.get('sampleBytes', 0)) / elapsed,
+                                   sampleAt=now, sampleBytes=count)
             return
         old_phase = item["phase"]
         if kind == "creating":
@@ -734,6 +868,10 @@ class UploadManager:
             previous = item["parts"].get(str(number))
             item["parts"][str(number)] = {"number": number, "size": size, "etag": etag}
             item.update(bytes=sum(p["size"] for p in item["parts"].values()), phase="uploading")
+            if item['bytes'] > runtime.get('bytes', 0):
+                # Reconciled parts are old progress, not bytes transferred in
+                # this speed sample. Do not report a multi-GB/s resume spike.
+                runtime.update(bytes=item['bytes'], sampleBytes=item['bytes'], sampleAt=now, speed=0)
             if not previous:
                 runtime["lastProgress"] = now
         elif kind == "completing":
@@ -780,7 +918,7 @@ class UploadManager:
         self.store.save("items", item)
 
     def pause_item(self, item, code):
-        state = "waiting_disk" if code == "disk" else "waiting_auth" if code in ("auth", "authorization") else "waiting_connection"
+        state = 'waiting_local' if code == 'media_check_busy' else "waiting_disk" if code == "disk" else "waiting_auth" if code in ("auth", "authorization") else "waiting_connection"
         item.update(state=state, phase="paused", message=safe_message(code), errorCode=code, speed=0,
                     nextAttempt=self.clock() + CHECK_SECONDS)
         self.detach(item)
@@ -836,26 +974,45 @@ class UploadManager:
         inventory = await self.remote.videos(batch["dataset"])
         if not self.store.settings["enabled"] or self.stopping:
             return
-        retained = []
-        for item in items:
+        batch = self.store.get('batches', batch['id']) or batch
+        if batch.get('state') != 'preparing':
+            return
+        retained, ready_ids = [], set()
+        for snapshot in items:
+            item = self.store.get('items', snapshot['id'])
+            if not item or item.get('state') != 'uploaded' or item.get('batchId') != batch['id']:
+                continue
+            ready_ids.add(item['id'])
             # An external import of the same named file also suppresses our pending submission.
             if not await self.existing_video(item, inventory):
                 retained.append(item)
-        if not retained:
-            batch.update(state="complete", message="视频已由其他导入确认存在，未重复启动。")
-            self.store.save("batches", batch)
-            return
         keys = [i["object"]["key"] for i in retained]
         if sum(i["size"] for i in retained) >= MAX_BATCH_BYTES:
             self.block_batch(batch, "import_identity")
             return
-        batch.update(state="submitting", items=[i["id"] for i in retained], keys=keys,
+        remaining = [self.store.get('items', identity) for identity in batch.get('items', []) if identity not in ready_ids]
+        remaining = [i for i in remaining if i and i.get('batchId') == batch['id']
+                     and i.get('state') not in {'complete', 'attention', 'dismissed'}]
+        changes = []
+        if remaining:
+            successor = {'id': uuid4().hex, 'dataset': batch['dataset'], 'state': 'preparing',
+                         'items': [i['id'] for i in remaining], 'bytes': sum(i['size'] for i in remaining),
+                         'createdAt': now_iso(), 'message': '继续上传剩余视频，已传完的文件先导入。'}
+            changes.append(('batches', successor))
+            for item in remaining:
+                item['batchId'] = successor['id']
+                changes.append(('items', item))
+        batch.update(state="submitting" if retained else 'complete', items=[i["id"] for i in retained], keys=keys,
             beforeJobs=[str(j["id"]) for j in jobs], beforeVideos=[str(v["id"]) for v in inventory],
-            submitAt=now_iso(), message="已保存提交前快照，正在提交增量导入。", blocksImport=True)
-        self.store.save("batches", batch)
+            submitAt=now_iso(), message="已保存提交前快照，正在提交增量导入。" if retained else '已有结果已核对，未重复导入。',
+            blocksImport=bool(retained))
+        changes.append(('batches', batch))
         for item in retained:
             item.update(state="importing", phase="submitting", message="正在提交本批导入。")
-            self.store.save("items", item)
+            changes.append(('items', item))
+        self.store.save_membership(changes)
+        if not retained:
+            return
         try:
             identity = await self.remote.submit(batch["dataset"], keys)
         except AuditError as error:
@@ -948,6 +1105,7 @@ class UploadManager:
 
     async def shutdown(self):
         self.stopping = True
+        await self.stop_probe_recovery()
         if self.scan_task and not self.scan_task.done():
             self.scan_task.cancel()
             await asyncio.gather(self.scan_task, return_exceptions=True)

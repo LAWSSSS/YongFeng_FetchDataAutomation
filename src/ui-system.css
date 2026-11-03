@@ -1,0 +1,219 @@
+/* Shared geometry for the local operations console. Business styles keep
+   their state colours; these tokens own dimensions and visual hierarchy. */
+.app-shell {
+  --content-width: 1280px;
+  --page-gutter: 24px;
+  --control-height: 44px;
+  --surface: #fff;
+  --canvas: #f5f5f7;
+  --ink: #1d1d1f;
+  --muted-ink: #626267;
+  --line: #dcdce0;
+  --soft-surface: #f7f7f9;
+  --brand: #315c45;
+  --panel-radius: 12px;
+  color: var(--ink);
+  background: var(--canvas);
+  line-height: 1.6;
+  font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Helvetica Neue', sans-serif;
+}
+.app-shell > main {
+  width: min(100%, calc(var(--content-width) + 2 * var(--page-gutter)));
+  max-width: none;
+  padding: 28px var(--page-gutter) 64px;
+}
+.app-shell .site-header {
+  min-height: 80px;
+  padding: 16px max(var(--page-gutter), calc((100% - var(--content-width)) / 2));
+  border-color: var(--line);
+  gap: 20px;
+}
+.app-shell .site-header nav { gap: 6px; flex-wrap: wrap; }
+.app-shell .site-header nav button { font-size: 14px; padding-inline: 16px; }
+.app-shell .brand strong { font-size: 16px; }
+.app-shell .brand small { font-size: 12px; color: var(--muted-ink); }
+.app-shell .hero.compact {
+  min-height: 76px;
+  padding: 0 0 20px;
+  margin: 0 0 24px;
+  border-bottom: 1px solid var(--line);
+}
+.app-shell .hero.compact h1 { font-size: 26px; line-height: 1.35; margin: 0 0 6px; letter-spacing: -.02em; }
+.app-shell .hero.compact p { font-size: 14px; line-height: 1.6; color: var(--muted-ink); }
+.app-shell :is(.panel, .video-card, .login-card) {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--panel-radius);
+  background: var(--surface);
+  box-shadow: none;
+}
+.app-shell .panel { width: 100%; padding: 24px; margin-bottom: 20px; }
+.app-shell .section-title,
+.app-shell .pipeline-heading {
+  min-height: 44px;
+  align-items: center;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+.app-shell :is(.section-title h2, .pipeline-heading h2, .panel > h2) {
+  font-size: 18px; line-height: 1.45; font-weight: 650; margin-top: 0;
+}
+.app-shell .section-title :is(p, small),
+.app-shell .section-title > span { color: var(--muted-ink); font-size: 13px; margin: 4px 0 0; }
+.app-shell button,
+.app-shell input:not([type=checkbox]):not([type=radio]),
+.app-shell select {
+  min-height: var(--control-height);
+  border-radius: 8px;
+  font-size: 14px;
+  line-height: 1.4;
+}
+.app-shell button { padding: 10px 14px; transition: background-color .15s ease; }
+.app-shell button:focus-visible,
+.app-shell summary:focus-visible,
+.app-shell a:focus-visible { outline: 3px solid #729a80; outline-offset: 3px; }
+.app-shell input:not([type=checkbox]):not([type=radio]), .app-shell select { padding: 10px 12px; border-color: #c7d3c9; }
+.app-shell :is(.record-checkbox, .record-pick) { min-height: 44px; align-items: center; gap: 8px; }
+.app-shell input[type=checkbox] { width: 18px; height: 18px; flex: none; }
+.app-shell :is(.filters, .record-filters, .record-filter-details, .slice-filter-bar) { gap: 16px; }
+.app-shell :is(.filters, .record-filters, .correction-fields, .slice-filter-bar) label { font-size: 13px; gap: 8px; }
+.app-shell .date-collection .filters { grid-template-columns: minmax(180px, 1fr) minmax(180px, 1fr) auto; max-width: 800px; }
+.app-shell :is(.record-filters, .date-collection .filters) .actions { margin-top: 0; }
+.app-shell :is(.video-status-filters, .pipeline-filters) { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 18px; }
+.app-shell :is(.video-status-filters, .pipeline-filters) button { border: 1px solid var(--line); padding-inline: 12px; }
+.app-shell :is(.video-status-filters, .pipeline-filters) button[aria-pressed=true] { border-color: var(--brand); background: #e7f0e8; color: #244a32; }
+.app-shell :is(.date-list, .batch-list) { gap: 16px; }
+.app-shell :is(.date-section, .batch-group) { border: 1px solid var(--line); border-radius: var(--panel-radius); overflow: clip; }
+.app-shell :is(.date-section, .batch-group) > summary {
+  min-height: 76px; padding: 16px 20px; gap: 12px; border-radius: var(--panel-radius);
+}
+.app-shell .date-section[open] > summary { border-radius: var(--panel-radius) var(--panel-radius) 0 0; background: var(--soft-surface); }
+.app-shell :is(.date-heading, .batch-title) { gap: 4px; }
+.app-shell :is(.date-heading strong, .batch-title strong) { font-size: 16px; font-weight: 650; line-height: 1.5; }
+.app-shell :is(.date-heading > span, .batch-title small) { font-size: 13px; line-height: 1.5; }
+.app-shell .date-content, .app-shell .submission-records .date-content { padding: 0 20px 20px; }
+.app-shell .date-tools { min-height: 52px; padding: 8px 0; gap: 12px; }
+.app-shell .dated-batch { padding-top: 16px; }
+.app-shell .dated-batch + .dated-batch { margin-top: 20px; }
+.app-shell .dated-batch-heading { min-height: 44px; margin-bottom: 12px; }
+.app-shell :is(.batch-video-grid, .video-grid, .batch-record-list) {
+  display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; align-items: stretch;
+}
+.app-shell :is(.video-card, .batch-record > .video-card) { padding: 16px; min-width: 0; min-height: 0; height: 100%; }
+.app-shell .batch-record { min-width: 0; }
+.app-shell .video-head { gap: 8px; }
+.app-shell .video-head .record-pick { min-width:0; align-items: start; }
+.app-shell .video-head h3 { font-size:16px; }
+.app-shell .video-card .record-time { font-size:13px; margin:12px 0 4px; font-variant-numeric:tabular-nums; }
+.app-shell .video-card > .subtle { font-size:12px; margin:0 0 12px; }
+.app-shell .video-open-detail { width:100%; }
+.app-shell .settings-process-row { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:16px; align-items:stretch; }
+.app-shell .settings-process-row > .panel { margin:0; display:flex; flex-direction:column; min-width:0; }
+.app-shell .settings-process-row { margin-bottom:20px; }
+.app-shell .settings-process-row .slice-process-control { flex-direction:column; align-items:stretch; margin-top:auto; }
+.app-shell .settings-process-row .slice-process-control :is(label,input,button) { width:100%; min-width:0; }
+.app-shell .photo-management > button { margin-top:auto; width:100%; }
+.app-shell .photo-management .slice-independent-queues { margin-bottom:16px; }
+.app-shell .slice-management-card { padding:0; border:0; background:transparent; }
+.app-shell .slice-management-card + .slice-management-card { padding-left:16px; border-left:1px solid var(--line); }
+.app-shell .slice-independent-queues { gap:6px; font-size:12px; }
+.app-shell .slicing-settings .slice-settings-grid { grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:16px; margin-top:12px; }
+.app-shell .parameter-toggle {display:flex; align-items:center; gap:8px; min-height:44px; margin-top:12px; font-size:13px;}
+.app-shell .slicing-settings .check-label { grid-column:auto; }
+.app-shell .dataset-target-summary { display:flex; flex-wrap:wrap; gap:8px 24px; font-size:13px; color:var(--muted-ink); }
+.app-shell .batch-video-grid:has(.is-expanded) { align-items:start; }
+.app-shell .video-card.is-expanded { height:auto; }
+.app-shell .inline-video-details { border-top:1px solid var(--line); margin-top:16px; padding-top:16px; }
+.app-shell .inline-video-details :is(.correction-fields,.version) { grid-template-columns:minmax(0,1fr); }
+.app-shell .inline-video-details :is(input,select,video,.version-history,.processing-group) { max-width:100%; min-width:0; }
+.app-shell .inline-video-details :is(.actions,.primary-video-actions) { flex-wrap:wrap; }
+.app-shell .inline-video-details .version strong { overflow-wrap:anywhere; }
+.app-shell .video-details-body > .subtle { font-size:13px; }
+.app-shell .video-details-body video { width:100%; max-height:420px; background:#111; border-radius:10px; }
+.app-shell .initial-plan-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px; }
+.app-shell .initial-plan-card { min-width:0; padding:16px; border:1px solid var(--line); border-radius:10px; }
+.app-shell .initial-plan-card p { font-size:13px; line-height:1.7; margin:10px 0; }
+.app-shell .capture-choice { display:flex; align-items:center; gap:8px; min-height:44px; }
+.app-shell .capture-choice input { display:block; }
+.app-shell .plan-selection { display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:12px; margin:16px 0; font-size:13px; }
+.app-shell .plan-selection .actions { margin:0; }
+.app-shell .initial-capture-editor { display:grid; gap:12px; margin-top:16px; padding-top:16px; border-top:1px solid var(--line); }
+.app-shell .initial-capture-editor label { display:grid; gap:6px; font-size:13px; }
+.app-shell .initial-capture-editor input { width:100%; min-width:0; }
+.app-shell .collection-plan.panel { margin-top:20px; padding:20px 0 0; border:0; border-top:1px solid var(--line); border-radius:0; }
+.app-shell .collection-plan .section-title p { margin:4px 0; font-size:13px; }
+.app-shell .collection-plan .section-title > label { display:grid; gap:4px; font-size:12px; }
+.app-shell :is(.video-head h3, .slice-video-head h3, .local-processing-name) { margin: 0 0 6px; font-size: 18px; line-height: 1.45; overflow-wrap: anywhere; }
+.app-shell :is(.badge, .slice-state, .submission-state) { font-size: 12px; line-height: 1.5; padding: 4px 8px; border-radius: 6px; }
+.app-shell :is(.subtle, .slice-detail, .submission-message) { color: var(--muted-ink); line-height: 1.65; }
+.app-shell :is(.batch-toolbar, .date-tools, .submission-pagination, .slice-pagination, .pipeline-panel .pagination) { font-size: 13px; }
+.app-shell .submission-items { grid-template-columns: repeat(auto-fit, minmax(min(100%, 340px), 1fr)); gap: 0 20px; }
+.app-shell .submission-item { padding-block: 16px; }
+.app-shell .submission-record > summary { min-height: 76px; }
+.app-shell .record-batch-management {
+  display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap;
+  gap: 12px 20px; margin: 16px 0 20px; padding: 14px 16px;
+  min-height: 76px; border: 1px solid var(--line); border-radius: 10px; background: var(--soft-surface);
+}
+.app-shell .record-batch-summary { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 12px; font-size: 13px; }
+.app-shell .record-batch-summary strong { font-size: 14px; color: var(--ink); }
+.app-shell .record-batch-summary small { color: var(--muted-ink); font-size: 12px; }
+.app-shell .record-batch-actions { display: flex; align-items: center; justify-content: flex-end; flex: 1; flex-wrap: wrap; gap: 8px; min-width: 0; }
+.app-shell .record-batch-actions .actions, .app-shell .record-batch-actions .record-delete { margin: 0; }
+.app-shell .record-batch-actions .selection-scope { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+.app-shell .record-batch-actions .record-delete:has(.record-delete-confirm) { flex-basis: 100%; }
+.app-shell .record-delete-confirm { padding: 16px; border-radius: 10px; }
+.app-shell .record-deleted-notice { padding: 12px 16px; margin-block: 12px; border: 1px solid #ccdfd0; border-radius: 10px; background: #f0f7f1; }
+.app-shell .record-deleted-notice p { margin: 0; }
+.app-shell .record-deleted-notice.panel { padding: 12px 16px; }
+.app-shell .collection-history { border-top: 1px solid var(--line); margin-top: 20px; }
+.app-shell .collection-history > summary { min-height: 52px; padding-block: 14px; cursor: pointer; font-size: 14px; color: var(--brand); font-weight: 600; }
+.app-shell .collection-run-record { padding-block: 16px; border-top: 1px solid var(--line); font-size: 14px; }
+.app-shell .collection-run-record p { margin: 6px 0; overflow-wrap: anywhere; }
+.app-shell .collection-run-record .record-delete { margin-top: 0; }
+.app-shell .collection-active { margin-top: 16px; padding: 12px 16px; background: var(--soft-surface); border-radius: 8px; color: var(--brand); font-size: 14px; }
+.app-shell .collection-active p { margin: 4px 0; }
+.app-shell :is(.connections, .slicing-management-grid) { gap: 16px; }
+.app-shell .connections { grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); margin-bottom: 0; }
+.app-shell .login-card { padding: 20px; }
+.app-shell .site-footer { padding: 24px; font-size: 12px; color: var(--muted-ink); }
+@media (max-width: 760px) {
+  .app-shell { --page-gutter: 16px; }
+  .app-shell > main { padding-top: 24px; }
+  .app-shell .site-header { align-items: stretch; flex-direction: column; gap: 14px; }
+  .app-shell .site-header nav { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+  .app-shell .site-header nav button { width: 100%; padding-inline: 8px; white-space: normal; }
+  .app-shell .hero.compact h1 { font-size: 24px; }
+  .app-shell .panel { padding: 18px 16px; }
+  .app-shell :is(.date-section, .batch-group) > summary { min-height: 76px; padding: 14px 16px; }
+  .app-shell .date-content, .app-shell .submission-records .date-content { padding: 0 14px 16px; }
+  .app-shell :is(.video-card, .batch-record > .video-card) { padding: 18px 16px; }
+  .app-shell .date-collection .filters { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  .app-shell .date-collection .filters button { grid-column: 1 / -1; }
+  .app-shell :is(.batch-video-grid, .video-grid, .batch-record-list) { grid-template-columns: minmax(0, 1fr); }
+  .app-shell .record-batch-management { align-items: stretch; flex-direction: column; padding: 14px 12px; }
+  .app-shell .record-batch-actions { justify-content: flex-start; width: 100%; }
+  .app-shell .record-batch-actions > :is(button, .record-delete) { flex: 1 1 auto; }
+  .app-shell .record-batch-actions > .record-delete > button { width: 100%; }
+  .app-shell .record-batch-actions .selection-scope { flex-basis: 100%; }
+  .app-shell .selection-scope select { flex: 1; width: 0; }
+  .app-shell input:not([type=checkbox]):not([type=radio]), .app-shell select { font-size: 16px; }
+  .app-shell .date-tools { align-items: stretch; }
+  .app-shell .date-tools > :is(.actions, .record-delete) { width: 100%; margin-left: 0; }
+}
+@media (min-width:768px) and (max-width:1199px) {
+  .app-shell :is(.batch-video-grid,.video-grid,.batch-record-list,.initial-plan-grid) {grid-template-columns:repeat(2,minmax(0,1fr));}
+}
+@media (max-width:1023px) {
+  .app-shell .settings-process-row {grid-template-columns:minmax(0,1fr);}
+}
+@media (max-width:767px) {
+  .app-shell :is(.batch-video-grid,.video-grid,.batch-record-list,.initial-plan-grid) {grid-template-columns:minmax(0,1fr);}
+  .app-shell .slicing-settings .slice-settings-grid {grid-template-columns:minmax(0,1fr);}
+  .app-shell .plan-selection .actions {width:100%;}
+  .app-shell .initial-plan-card {padding:14px;}
+  .app-shell .slice-management-card + .slice-management-card {padding:12px 0 0; border-left:0; border-top:1px solid var(--line);}
+}
+@media (prefers-reduced-motion: reduce) {
+  .app-shell button { transition: none; }
+}

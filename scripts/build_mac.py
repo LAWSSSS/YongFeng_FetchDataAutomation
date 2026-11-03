@@ -22,6 +22,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from app.runtime import BUNDLE_ID, VERSION
 from scripts.fetch_models import verify as verify_models
+from scripts.package_safety import source_inventory, inventory_digest, inventory_tree, relative_name, verify_requirement_wheels
+from scripts.scan_secrets import issues
 
 MACH_HEADERS = {b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf", b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca"}
 
@@ -55,6 +57,7 @@ def make_runtime(source, destination, version, wheels, requirements):
         raise ValueError("Unexpected standalone Python patch version.")
     wheel_lock = json.loads((ROOT / "assets/wheels.lock.json").read_text())["files"]
     entries = [entry for entry in wheel_lock if entry["environment"] == wheels.name]
+    verify_requirement_wheels(requirements, entries)
     if {entry["wheel"] for entry in entries} != {path.name for path in wheels.glob("*.whl")}:
         raise ValueError("Wheel directory does not match the locked allowlist.")
     for entry in entries:
@@ -159,13 +162,25 @@ def audit_binaries(app):
         if path != app / "Contents/MacOS/Launcher":
             run("/usr/bin/codesign", "--force", "--sign", "-", "--timestamp=none", path,
                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    run("/usr/bin/codesign", "--force", "--sign", "-", "--timestamp=none", app,
-        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    try:
+        run("/usr/bin/codesign", "--force", "--sign", "-", "--timestamp=none", app,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    except subprocess.CalledProcessError as error:
+        if b"resource fork" in (error.stderr or b"") or b"Finder information" in (error.stderr or b""):
+            raise ValueError("The output directory adds Finder/sync metadata. Build in the default local Library/Caches directory, then distribute the ZIP.") from None
+        raise
     run("/usr/bin/codesign", "--verify", "--deep", "--strict", app)
     return len(binaries)
 
 
 def assemble(args):
+    sources = source_inventory(ROOT)
+    for entry in sources:
+        if issues((ROOT / entry["path"]).read_bytes()):
+            raise ValueError(f'Credential scan failed: {entry["path"]}')
+    if not (args.web / "index.html").is_file():
+        raise ValueError("A fresh frontend build is required.")
+    inventory_tree(args.web)  # Reject links escaping the fresh web build.
     output = args.output.resolve()
     if output.exists():
         raise ValueError("Output already exists. Choose a fresh staging directory.")
@@ -177,12 +192,18 @@ def assemble(args):
     application.mkdir(parents=True)
     (contents / "MacOS").mkdir()
     # Only source modules, fresh web build and explicit resource lists enter the app.
-    shutil.copytree(ROOT / "app", application / "app", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    for entry in sources:
+        if not entry["path"].startswith("app/"):
+            continue
+        target = application / entry["path"]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(ROOT / entry["path"], target)
     shutil.copytree(args.web, application / "dist")
     shutil.copy2(ROOT / "scripts/portable_launcher.py", application / "launcher.py")
     verify_models(args.models)
     manifest = json.loads((ROOT / "assets/models/manifest.json").read_text())
     for entry in manifest["files"]:
+        relative_name(entry["path"])
         target = resources / "models" / entry["path"]
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(args.models / entry["path"], target)
@@ -216,8 +237,11 @@ def assemble(args):
     package = {"bundleId": BUNDLE_ID, "version": VERSION, "packageId": uuid4().hex,
                "platform": "macos-arm64", "minimumMacOS": "14.0", "runtimes": runtimes,
                "sourceCommit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
+               "sourceDirty": bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=ROOT)),
+               "sourceTreeSha256": inventory_digest(sources),
                "algorithmChanged": False}
     (resources / "release.json").write_text(json.dumps(package, indent=2) + "\n")
+    (resources / "source-manifest.json").write_text(json.dumps({"files": sources}, ensure_ascii=False, indent=2) + "\n")
     stop = output / "停止采集助手.command"
     stop.write_text('#!/bin/sh\nset -eu\nfolder=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)\n'
                     'exec "$folder/采集助手.app/Contents/Resources/runtime/backend/bin/python3.13" -I -B '
@@ -225,8 +249,21 @@ def assemble(args):
     stop.chmod(0o755)
     shutil.copy2(ROOT / "docs/mac-quickstart.md", output / "使用说明.md")
     binaries = audit_binaries(app)
-    entries = [{"path": str(path.relative_to(output)), "bytes": path.stat().st_size, "sha256": digest(path)}
-               for path in sorted(output.rglob("*")) if path.is_file() and not path.is_symlink()]
+    # Export the actual working tree, including reviewed new modules. HEAD alone
+    # cannot reproduce an uncommitted pre-release; never label it as that commit.
+    if sources != source_inventory(ROOT):
+        raise ValueError("Source changed during packaging; rebuild from a stable working tree.")
+    with zipfile.ZipFile(output / "源码与模型.zip", "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        names = set()
+        for entry in sources:
+            archive.write(ROOT / entry["path"], "采集助手-源码/" + entry["path"])
+            names.add(entry["path"])
+        for entry in manifest["files"]:
+            name = "assets/models/" + entry["path"]
+            if name not in names:
+                archive.write(resources / "models" / entry["path"], "采集助手-源码/" + name)
+        archive.writestr("采集助手-源码/源码版本.json", json.dumps(package, ensure_ascii=False, indent=2) + "\n")
+    entries = inventory_tree(output)
     (output / "文件校验.json").write_text(json.dumps({"version": VERSION, "binaryCount": binaries, "files": entries},
                                                  ensure_ascii=False, indent=2) + "\n")
     print(json.dumps({"output": str(output), "files": len(entries), "binaries": binaries}, ensure_ascii=False))

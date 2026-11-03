@@ -11,11 +11,17 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def digest(path):
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
 def verify(directory):
     manifest = json.loads((ROOT / "assets/models/manifest.json").read_text())
     for entry in manifest["files"]:
         path = directory / entry["path"]
-        if not path.is_file() or hashlib.file_digest(path.open("rb"), "sha256").hexdigest() != entry["sha256"]:
+        if (not path.is_file() or path.is_symlink() or not path.resolve().is_relative_to(directory.resolve())
+                or path.stat().st_size != entry["bytes"] or digest(path) != entry["sha256"]):
             raise ValueError(f'Model resource checksum mismatch: {entry["path"]}')
 
 
@@ -35,7 +41,7 @@ def main():
             archive = work / manifest["releaseAsset"]
         allowed = {item["path"] for item in manifest["files"]}
         with zipfile.ZipFile(archive) as bundle:
-            if set(bundle.namelist()) != allowed:
+            if len(bundle.namelist()) != len(allowed) or set(bundle.namelist()) != allowed:
                 raise ValueError("Unexpected model resource archive contents.")
             for info in bundle.infolist():
                 entry = next(item for item in manifest["files"] if item["path"] == info.filename)
@@ -45,7 +51,9 @@ def main():
         verify(work / "models")
         for name in allowed:
             target = args.destination / name
-            if target.exists() and hashlib.file_digest(target.open("rb"), "sha256").hexdigest() != next(
+            if (target.is_symlink() or not target.resolve().is_relative_to(args.destination.resolve())):
+                raise ValueError(f"Refusing a model resource symlink: {name}")
+            if target.exists() and digest(target) != next(
                     entry["sha256"] for entry in manifest["files"] if entry["path"] == name):
                 raise ValueError(f"Refusing to overwrite a different model resource: {name}")
         shutil.copytree(work / "models", args.destination, dirs_exist_ok=True)

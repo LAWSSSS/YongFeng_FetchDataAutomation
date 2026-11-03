@@ -105,6 +105,23 @@ async def test_process_limit_can_be_changed_without_invalidating_an_active_run(t
     await close_app(app)
 
 
+@pytest.mark.asyncio
+async def test_model_settings_cannot_overwrite_a_new_process_limit_from_a_stale_draft(tmp_path):
+    from app.videos import Conflict
+    app = create_app(data_dir=tmp_path / 'data')
+    manager = app.state.slicing
+    draft = {**manager.state()['settings'], 'expectedRevision': 0, 'requestId': 'old-model-draft'}
+    manager.update_process_limit({'expectedRevision': 0, 'requestId': 'new-process-limit',
+                                  'maxLocalSlicingProcesses': 5})
+    with pytest.raises(Conflict, match='进程数量已单独调整'):
+        manager.update_settings(draft)
+    assert manager.store.settings['maxLocalSlicingProcesses'] == 5
+    assert manager.store.settings['processLimitRevision'] == 1
+    assert manager.store.settings['revision'] == 0
+    assert not manager.store.settings.get('settingsRequestIds', {}).get('old-model-draft')
+    await close_app(app)
+
+
 
 
 @pytest.mark.asyncio
@@ -152,10 +169,13 @@ async def test_platform_checks_continue_during_analysis_and_only_one_local_worke
     app = create_app(data_dir=tmp_path); manager = app.state.slicing
     manager.auth.access = "test-token"
     manager.run = {"id": "concurrent", "state": "running"}
+    manager.store.settings['enabled'] = True
     manager.store.save("runs", manager.run)
     for identity in ("first", "second"):
         manager.store.save("items", {"id": identity, "state": "pending", "path": "/fixture.mp4",
             "sourceDatasetId": "27912", "categories": {"bed": {"state": "pending"}}})
+    manager.store.save('items', {'id': 'remote-wait', 'state': 'platform_processing', 'sourceDatasetId': '27912',
+        'categories': {'bed': {'state': 'waiting', 'taskId': 'bound'}}})
     release = asyncio.Event(); calls = []; polls = []
 
     async def analyze(item):
@@ -169,7 +189,7 @@ async def test_platform_checks_continue_during_analysis_and_only_one_local_worke
     await asyncio.wait_for(manager._tick(), 1)
     await asyncio.sleep(0)
     await asyncio.wait_for(manager._tick(), 1)
-    assert calls == ["first"] and len(polls) == 2
+    assert calls == ["first"] and len(polls) == 1
     release.set(); await manager.analysis_task
     await close_app(app)
 
@@ -326,8 +346,9 @@ def test_partial_sampling_reads_edges_at_boundaries_not_for_each_frame(tmp_path,
         return original(path, version, check_edges=check_edges)
 
     monkeypatch.setattr(worker, "verify_file_version", track)
-    monkeypatch.setattr(worker.subprocess, "run", lambda *_a, **_kw:
-                        SimpleNamespace(returncode=0, stdout=b"\xff\xd8\xff\xd9", stderr=b""))
+    monkeypatch.setattr(worker.subprocess, "run", lambda command, **_kw:
+                        SimpleNamespace(returncode=0, stdout=b"\xff\xd8\xff\xd9", stderr=(
+                            f"[Parsed_showinfo_0] n: 0 pts: 0 pts_time:{command[command.index('-ss') + 1]}".encode())))
     rows = list(worker.extract_requested_frames(str(path), str(ffmpeg),
         {"duration": 61, "frameRate": 25, "_expectedFileVersion": expected},
         {"bed": [0, 30, 60], "magnet": [0, 30, 60]}, skip_undecodable=True))

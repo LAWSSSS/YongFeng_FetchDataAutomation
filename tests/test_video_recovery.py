@@ -34,6 +34,9 @@ async def test_restart_only_discards_selected_checkpoint_and_replay_keeps_new_pr
             payload = {'version': 0, 'expectedRevision': 0, 'requestId': 'restart-one'}
             result = await client.post(f'/api/videos/{row["id"]}/restart-download', json=payload)
             assert result.status_code == 202, result.text
+            operation = manager.operation_tasks.get(result.json()['operationId'])
+            if operation:
+                await operation
             saved = manager.store.get(row['id'])
             assert saved['activeRevision'] == 0 and saved['revision'] == 0
             assert saved['versions'][0]['taskId'] == version['taskId']
@@ -71,7 +74,11 @@ async def test_restart_never_removes_a_symlink_or_its_target(app_factory, tmp_pa
             part.parent.mkdir(parents=True, exist_ok=True); part.symlink_to(target)
             result = await client.post(f'/api/videos/{row["id"]}/restart-download', json={
                 'version':0,'expectedRevision':0,'requestId':'unsafe-path'})
-            assert result.status_code == 400
+            assert result.status_code == 202
+            operation = manager.operation_tasks.get(result.json()['operationId'])
+            if operation:
+                await operation
+            assert manager.store.get_operation(result.json()['operationId'])['state'] == 'attention'
             assert target.read_bytes() == b'preserve-user-file' and part.is_symlink()
 
 

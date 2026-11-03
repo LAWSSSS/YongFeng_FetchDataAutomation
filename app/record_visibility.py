@@ -7,7 +7,7 @@ from .videos import Conflict
 
 class RecordVisibility:
     def __init__(self, db, namespace='slicing'):
-        assert namespace in {'slicing', 'collection', 'receipts', 'receipt_items'}
+        assert namespace in {'slicing', 'collection', 'receipts', 'receipt_items', 'collection_runs'}
         self.db = db
         self.namespace = namespace
         self.hidden_table = f'simple_{namespace}_hidden_records'
@@ -28,7 +28,7 @@ class RecordVisibility:
             return saved
         return None
 
-    def prepare_hide(self, store, request_id, selections):
+    def prepare_hide(self, store, request_id, selections, *, rows=None):
         choices = sorted(selections, key=lambda s: s['id'])
         if len({s['id'] for s in choices}) != len(choices):
             raise ValueError('不能重复选择同一条记录。')
@@ -37,12 +37,18 @@ class RecordVisibility:
         if saved:
             return saved['result'], None
         hidden = self.hidden()
+        # Receipt children are a projection of their parent submission. Reuse
+        # one projection per parent rather than rebuilding it for every child.
+        batch = rows if rows is not None else (store.get_many([choice['id'] for choice in choices])
+                 if self.namespace == 'receipt_items' and hasattr(store, 'get_many') else None)
         for choice in choices:
-            row = store.get('items', choice['id']) if self.namespace == 'slicing' else store.get(choice['id'])
+            row = (batch.get(choice['id']) if batch is not None else
+                   store.get('items', choice['id']) if self.namespace == 'slicing' else store.get(choice['id']))
             if not row:
                 raise ValueError('记录不存在，请刷新列表。')
             if int(row.get('revision', 0)) != choice['expectedRevision']:
-                raise Conflict('记录已有新进度，未删除；请刷新后重新选择。')
+                label = row.get('name') or row.get('videoName') or row.get('title') or choice['id']
+                raise Conflict(f'“{label}”已有新进度，本次均未删除；请刷新后重新选择。')
             if choice['id'] in hidden:
                 raise Conflict('记录已从列表删除，请刷新。')
         result = {'removalId': request_id, 'ids': [s['id'] for s in choices]}

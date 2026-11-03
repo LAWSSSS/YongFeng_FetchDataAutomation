@@ -1,3 +1,4 @@
+import {processingFinished,terminalGroupState} from './processing-status.ts';
 type SliceItem = {name: string; sourceDatasetId: string; sourceVideoId: string; state: string;
   categories: Record<string, {state: string; packageId?: string; taskId?: string}>};
 
@@ -44,7 +45,7 @@ export function slicePage<T extends SliceItem>(items: T[], options: {
     const selectedCategory = options.source === 'all' ? undefined : options.source === '27912' ? 'bed' : 'magnet';
     const values = selectedCategory ? [item.categories[selectedCategory]].filter(Boolean) : Object.values(item.categories);
     const statuses = values.map(category => category.state).filter(state => state !== 'not_applicable');
-    const finished = item.state === 'complete' || item.state === 'no_target';
+    const finished = processingFinished(item.state);
     const matching = options.status === 'all' || (selectedCategory ? statuses.includes(options.status) : item.state === options.status) ||
       (options.status === 'unsliced' && !finished) ||
       (options.status === 'analyzing' && item.state === 'analyzing' && statuses.includes('pending')) ||
@@ -56,6 +57,22 @@ export function slicePage<T extends SliceItem>(items: T[], options: {
   const pages = Math.max(1, Math.ceil(filtered.length / pageSize));
   const page = Math.max(1, Math.min(pages, Math.floor(options.page) || 1));
   return {rows:filtered.slice((page-1)*pageSize,page*pageSize),total:filtered.length,pages,page};
+}
+
+/** A package or whole-file issue can require attention even after model analysis completed. */
+export function sliceGroupMatches<T extends SliceItem & {id:string}>(records:T[],options:{status:string;source:string;search:string;overall:string;
+  attention?:{kind:string;category?:string}|null;packageIssues?:{itemId?:string;category:string;state:string}[]}) {
+  const {status,source,overall,attention}=options;
+  if (status === 'unsliced' && processingFinished(overall)) return false;
+  if (source === 'all' && status !== 'all' && status !== 'unsliced' && overall !== status) return false;
+  const selected=source === '27912' ? 'bed' : 'magnet';
+  const ids=new Set(records.map(record=>record.id));
+  const packageIssue=options.packageIssues?.some(pack=>ids.has(pack.itemId||'')&&pack.category===selected&&
+    ['attention','review'].includes(pack.state));
+  const groupIssue=status==='attention' && source!=='all' && (packageIssue || !!attention &&
+    (attention.kind==='video'||attention.kind==='archive'||(attention.kind==='package'&&attention.category===selected)));
+  const recordStatus=status==='unsliced'?'unsliced':source==='all'||groupIssue?'all':status;
+  return slicePage(records,{status:recordStatus,source,search:options.search,page:1,pageSize:records.length}).total>0;
 }
 
 export function physicalFiles<T extends SliceItem & {id: string; path?: string;mediaId?:string;mediaGeneration?:number;collectionRevision?:number}>(items: T[]) {
@@ -71,5 +88,5 @@ export function physicalFiles<T extends SliceItem & {id: string; path?: string;m
 export function physicalState(records: {state:string}[]) {
   return ['attention','review','analyzing','waiting_connection','pending','platform_processing'].find(
     status=>records.some(record=>record.state === status)) ||
-    (records.every(record=>record.state === 'no_target') ? 'no_target' : 'complete');
+    terminalGroupState(records.map(record=>record.state));
 }

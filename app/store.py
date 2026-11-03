@@ -6,9 +6,14 @@ from .domain import now_iso
 
 
 class JobStore:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, managed_root: Path | None = None):
         path.parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(path)
+        if managed_root is not None:
+            from .managed_storage import ManagedConnection
+            self.db = sqlite3.connect(path, factory=ManagedConnection)
+            self.db.initialize(managed_root)
+        else:
+            self.db = sqlite3.connect(path)
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, created_at TEXT, payload TEXT NOT NULL)")
         self.db.commit()
@@ -41,7 +46,9 @@ class JobStore:
         return [json.loads(row[0]) for row in self.db.execute("SELECT payload FROM jobs ORDER BY created_at DESC")]
 
     def known_keys(self, exclude_job: str = "") -> set[str]:
-        return {item["key"] for job in self.list() if job["id"] != exclude_job for item in job["items"]
+        retired = ({row[0] for row in self.db.execute('SELECT key FROM retired_task_keys')}
+                   if self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='retired_task_keys'").fetchone() else set())
+        return retired | {item["key"] for job in self.list() if job["id"] != exclude_job for item in job["items"]
                 if item["status"] in ("submitted", "duplicate", "uncertain", "submitting")}
 
     def remove_history(self, job_id: str):

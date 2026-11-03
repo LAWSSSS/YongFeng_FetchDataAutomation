@@ -161,6 +161,8 @@ def scan_directory(directory, recursive=False):
 class AthenaClient:
     """Only authentication and allowlisted GET requests; no upload/write API."""
     def __init__(self, transport=None, persist_connection=None):
+        from .availability import ConnectionAvailability
+        self.availability = ConnectionAvailability()
         self.client = httpx.AsyncClient(base_url=f"{ATHENA_ORIGIN}/api/", trust_env=False,
             follow_redirects=False, timeout=httpx.Timeout(60, connect=12), transport=transport,
             headers={"Accept": "application/json", "aics-fronted": "true"})
@@ -168,7 +170,10 @@ class AthenaClient:
         self.persist_connection = transport is None if persist_connection is None else persist_connection
         self.saved_connection = False
         self.connection_warning = ""
+        self.restore_pending = False
         self.auth_lock = asyncio.Lock()
+        self.restore_lock = asyncio.Lock()
+        self.session_generation = 0
         self.log_slots = asyncio.Semaphore(4)
 
     @property
@@ -176,6 +181,8 @@ class AthenaClient:
         return bool(self.access)
 
     def clear(self):
+        self.session_generation += 1
+        self.restore_pending = False
         self.access = self.refresh = self.user = ""
         self.client.cookies.clear()
 
@@ -185,6 +192,8 @@ class AthenaClient:
             raise AuditError("视觉AI平台登录已失效，请重新连接后核对。", "auth", 401)
         if response.status_code == 403:
             raise AuditError("账号无权读取这个数据集或日志。", "permission", 403)
+        if response.status_code == 429 or 500 <= response.status_code < 600:
+            raise AuditError(f"视觉AI平台暂不可用（HTTP {response.status_code}），保留进度后自动重试。", 'network', response.status_code)
         if not response.is_success:
             raise AuditError(f"视觉AI平台返回 HTTP {response.status_code}，请稍后重试。", "remote")
         try:
@@ -199,7 +208,9 @@ class AthenaClient:
         try:
             response = await self.client.post(path, json=payload)
         except httpx.HTTPError:
+            self.availability.unavailable()
             raise AuditError("无法连接视觉AI平台，请检查网络。", "network") from None
+        self.availability.received()
         return self.unpack(response)
 
     async def login(self, account, password):
@@ -223,56 +234,102 @@ class AthenaClient:
             self.connection_warning = "平台没有提供可续期凭证；当前连接有效，但关闭程序后需要重新连接。"
             return
         try:
-            await asyncio.to_thread(secure_store.save_connection, self.refresh, self.user)
+            # Callers hold auth_lock. Cancellation must wait for the real
+            # keychain write before another account can save its credentials.
+            await self._keychain_write(secure_store.save_connection, self.refresh, self.user)
             self.saved_connection = True
             self.connection_warning = ""
         except Exception:
             self.saved_connection = False
             self.connection_warning = "连接有效，但系统钥匙串未能保存续期凭证；检查本机钥匙串访问后重新连接。"
 
+    @staticmethod
+    async def _keychain_write(function, *args):
+        """Even repeated cancellation cannot let a stale write outlive auth_lock."""
+        task = asyncio.create_task(asyncio.to_thread(function, *args))
+        cancelled = False
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                cancelled = True
+            except Exception:
+                break
+        try:
+            result = task.result()
+        except Exception:
+            if cancelled:
+                raise asyncio.CancelledError() from None
+            raise
+        if cancelled:
+            raise asyncio.CancelledError()
+        return result
+
     async def restore_saved_connection(self):
+        generation = self.session_generation
+        async with self.restore_lock:
+            if generation != self.session_generation or self.connected:
+                return self.connected
+            return await self._restore_saved_connection(generation)
+
+    async def _restore_saved_connection(self, generation):
+        self.restore_pending = False
         if not self.persist_connection:
             return False
         try:
             saved = await asyncio.to_thread(secure_store.load_connection)
         except Exception:
-            self.connection_warning = "无法读取本机钥匙串中的连接；请重新连接平台。"
+            if generation == self.session_generation:
+                self.connection_warning = "无法读取本机钥匙串中的连接；请重新连接平台。"
             return False
-        if not saved:
+        if generation != self.session_generation or not saved:
             return False
         old_refresh = saved["refresh"]
-        self.refresh, self.user = old_refresh, saved.get("user", "")
         self.saved_connection = True
         try:
             data = await self.auth_request("auth/token/refresh/", {"refresh": old_refresh})
             access = data.get("access") if isinstance(data, dict) else None
             if not isinstance(access, str) or not access:
                 raise AuditError("保存的视觉AI会话已失效，请重新连接。", "auth", 401)
-            self.access = access
-            self.refresh = data.get("refresh") or old_refresh
-            if self.refresh != old_refresh:
-                await self._save_connection()
-            else:
-                self.saved_connection = True
-                self.connection_warning = ""
-            return True
+            async with self.auth_lock:
+                if generation != self.session_generation:
+                    return False
+                self.access = access
+                self.refresh = data.get("refresh") or old_refresh
+                self.user = saved.get('user', '')
+                if self.refresh != old_refresh:
+                    await self._save_connection()
+                else:
+                    self.saved_connection = True
+                    self.connection_warning = ""
+                return True
         except AuditError as error:
-            self.clear()
-            if error.status == 401:
-                try:
-                    await asyncio.to_thread(secure_store.delete_connection)
-                except Exception:
-                    pass
-                self.saved_connection = False
-                self.connection_warning = "保存的视觉AI会话已过期，请重新连接一次。"
-            else:
-                self.connection_warning = "保存的视觉AI会话暂时无法恢复；检查网络后可重新连接。"
+            async with self.auth_lock:
+                if generation != self.session_generation:
+                    return False
+                self.restore_pending = error.code == 'network'
+                if error.status == 401:
+                    self.clear()
+                    try:
+                        await self._keychain_write(secure_store.delete_connection)
+                    except Exception:
+                        pass
+                    self.saved_connection = False
+                    self.connection_warning = "保存的视觉AI会话已过期，请重新连接一次。"
+                else:
+                    self.connection_warning = "保存的视觉AI会话暂时无法恢复；检查网络后可重新连接。"
             return False
 
     async def forget_saved_connection(self):
+        async with self.auth_lock:
+            self.session_generation += 1
+            self.restore_pending = False
+            await self._forget_saved_connection_locked()
+
+    async def _forget_saved_connection_locked(self):
         if self.persist_connection:
             try:
-                await asyncio.to_thread(secure_store.delete_connection)
+                await self._keychain_write(secure_store.delete_connection)
             except Exception:
                 self.connection_warning = "已断开本次会话，但系统钥匙串中的保存项未能清除。"
                 raise AuditError(self.connection_warning, "secure_store") from None
@@ -299,21 +356,26 @@ class AthenaClient:
             raise AuditError("请先连接视觉AI平台。", "auth", 401)
         for attempt in range(3):
             token = self.access
+            generation = self.session_generation
             try:
                 response = await self.client.get(path, params=params, headers={"Authorization": f"Bearer {token}"})
             except httpx.HTTPError:
+                self.availability.unavailable()
                 if attempt < 2:
                     await asyncio.sleep(attempt + 1)
                     continue
                 raise AuditError("读取视觉AI平台超时或网络中断，已有核对结果已保留。", "network") from None
+            self.availability.received()
             if response.status_code == 401 and attempt < 2:
                 async with self.auth_lock:
-                    if token == self.access:
+                    if token == self.access and generation == self.session_generation:
                         if not self.refresh:
                             self.clear()
                             raise AuditError("视觉AI平台登录已失效，请重新连接。", "auth", 401)
                         try:
                             data = await self.auth_request("auth/token/refresh/", {"refresh": self.refresh})
+                            if generation != self.session_generation or token != self.access:
+                                raise AuditError('会话已变化，旧请求未覆盖新连接。', 'auth', 401)
                             if not isinstance(data, dict) or not data.get("access"):
                                 raise AuditError("视觉AI平台登录已失效，请重新连接。", "auth", 401)
                             self.access = data["access"]
@@ -322,10 +384,10 @@ class AthenaClient:
                                 self.refresh = next_refresh
                                 await self._save_connection()
                         except AuditError as error:
-                            self.clear()
-                            if error.status == 401:
+                            if error.status == 401 and generation == self.session_generation:
+                                self.clear()
                                 try:
-                                    await self.forget_saved_connection()
+                                    await self._forget_saved_connection_locked()
                                 except AuditError:
                                     pass
                             raise
@@ -333,7 +395,7 @@ class AthenaClient:
             if response.status_code in (429, 500, 502, 503, 504) and attempt < 2:
                 await asyncio.sleep(attempt + 1)
                 continue
-            if response.status_code == 401:
+            if response.status_code == 401 and generation == self.session_generation and token == self.access:
                 self.clear()
             data = self.unpack(response)
             return data, response.headers

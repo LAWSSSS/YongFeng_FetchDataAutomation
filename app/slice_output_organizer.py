@@ -64,6 +64,23 @@ class SliceOutputOrganizer:
         plans = self._all()
         return self._public(plans[-1]) if plans else None
 
+    def photo_ready(self, package):
+        from .photo_completion import photo_results_verified
+        item = self.slicing.store.get('items', package.get('itemId'))
+        if not item or item.get('superseded') or not item.get('fileVersion'):
+            return False
+        peers = []
+        for candidate in self.slicing.store.list('items'):
+            if candidate.get('superseded') or candidate.get('fileVersion') != item['fileVersion']:
+                continue
+            same_media = (item.get('mediaId') and candidate.get('mediaId') == item['mediaId']
+                          and candidate.get('mediaGeneration', 0) == item.get('mediaGeneration', 0))
+            if same_media or (not item.get('mediaId') and candidate.get('path') == item.get('path')):
+                peers.append(candidate)
+        ids = {peer['id'] for peer in peers}
+        packages = [row for row in self.packages.store.list('items') if row.get('itemId') in ids]
+        return photo_results_verified(peers, packages)
+
     def preview(self, payload):
         requests = [plan for plan in self._all() if plan.get("previewRequestId") == payload["requestId"]]
         if requests:
@@ -90,6 +107,10 @@ class SliceOutputOrganizer:
                 rows.append(row)
                 continue
 
+            if not self.photo_ready(package):
+                row.update(state="held", message="同一视频的照片尚未全部导入核验，暂不归档。")
+                rows.append(row)
+                continue
             item = videos.get(package.get("itemId")) or {}
             video_path = package.get("videoPath") or item.get("path")
             image_dir = package.get("imageDir")
@@ -218,8 +239,8 @@ class SliceOutputOrganizer:
                 if row.get("state") not in {"planned", "moving"}:
                     continue
                 package = self.packages.store.get("items", row["packageId"])
-                if not package or package.get("state") != "complete":
-                    raise Conflict("图片包状态已变化，请重新预览。")
+                if not package or package.get("state") != "complete" or not self.photo_ready(package):
+                    raise Conflict("同一视频的照片尚未全部导入核验，请重新预览。")
                 if not plan.get("confirmRequestId") and package.get("revision", 0) != row.get("packageRevision", 0):
                     raise Conflict("图片包记录已更新，请重新预览。")
 

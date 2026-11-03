@@ -2,12 +2,13 @@
 import asyncio
 import json
 import zipfile
+from collections import Counter
 from contextlib import ExitStack
 from pathlib import Path
 
 from .audit_moves import checked_path, source_fingerprint
 from .domain import now_iso
-from .file_leases import FileLeases, finish_io
+from .file_leases import FileEnvironmentError, FileLeases, ReadProbes, finish_io
 from .package_archive import legacy_layout, repair_archive
 from .upload_audit import AuditError, name_key, is_import_job
 from .upload_remote import source_keys
@@ -89,8 +90,13 @@ class SlicePackageManager:
         self.worker = worker or ProcessWorker()
         self.clock = clock or __import__("time").time
         self.running = {}
+        self.target_tasks = {}
+        self.target_next_check = {}
         self.runtime = {}
         self.wake = asyncio.Event()
+        self.file_checks = ReadProbes(self.wake.set)
+        self.waiting_paths = set()
+        self.event_loop = None
         self.stopping = False
         self.loop_task = None
         self.leases = leases or FileLeases()
@@ -98,6 +104,22 @@ class SlicePackageManager:
         self.paused = bool((self.store.get("batches", "control") or {}).get("paused"))
         self.on_change = lambda item: None
         self.leases.subscribe_moves(self.moved)
+        self.leases.subscribe_release(self._file_released)
+
+    def _file_released(self, path):
+        if self.stopping or path not in self.waiting_paths or not self.event_loop or self.event_loop.is_closed():
+            return
+        self.event_loop.call_soon_threadsafe(self._resume_released, path)
+
+    def _resume_released(self, path):
+        if self.stopping:
+            return
+        self.waiting_paths.discard(path)
+        for item in self.store.list('items'):
+            if item.get('path') == path and item.get('state') == 'queued' and item.get('reasonCode') == 'file_busy':
+                item.update(nextAttempt=0, reasonCode='', errorCode='', message='文件已释放，继续上传。')
+                self._save(item)
+        self.wake.set()
 
     def moved(self, source, destination, version):
         for item in self.store.list("items"):
@@ -119,40 +141,83 @@ class SlicePackageManager:
         self.store.save("items", item)
         self.on_change(item)
 
+    def queue_verification_retry(self, item):
+        """Recheck a bound import once; this never creates another upload or import."""
+        job = str(item.get('jobId') or '')
+        keys = item.get('keys') or [(item.get('object') or {}).get('key')]
+        if (not job or not all(keys) or item.get('verificationAutoRetryForJob') == job
+                or item.get('superseded') or (getattr(self, 'control', None) and not self.control.package_allowed(item, allow_paused=True))):
+            return False
+        item.update(state='importing', errorCode='verification_pending', verificationAutoRetryForJob=job,
+                    verificationNotBefore=self.clock()+30,
+                    message='图片结果尚未齐全，将自动重新核对已有导入任务。')
+        self._save(item)
+        return True
+
     def pause(self):
         self.paused = True
         self.store.save("batches", {"id": "control", "paused": True})
         for task in self.running.values():
             task.cancel()
+        for dataset, task in self.target_tasks.items():
+            if not any(item.get('dataset') == dataset and item.get('state') in {'submitting', 'importing'}
+                       for item in self.store.list('items')):
+                task.cancel()
+        self.wake.set()
 
     def resume(self):
         if self.paused:
             self.paused = False
             self.store.save("batches", {"id": "control", "paused": False})
         self.wake.set()
+        self.target_next_check.clear()
 
-    def state(self):
-        items = self.store.list("items")
+    def state(self, summary=False, item_ids=None):
+        # Summary polling never deserializes image inventories or submission
+        # snapshots. Detail callers can request only their visible source IDs.
+        if summary or item_ids is not None:
+            projection = [dict(zip(('id', 'itemId', 'category', 'state', 'dataset'), row))
+                          for row in self.store.db.execute("""SELECT id,
+                json_extract(payload,'$.itemId'),json_extract(payload,'$.category'),
+                json_extract(payload,'$.state'),json_extract(payload,'$.dataset')
+                FROM simple_slice_package_items ORDER BY rowid""")]
+            selected = None if item_ids is None else set(item_ids)
+            if summary:
+                items = [row for row in projection if selected is None or row.get('itemId') in selected]
+            elif not selected:
+                items = []
+            else:
+                placeholders = ','.join('?' for _ in selected)
+                items = [json.loads(row[0]) for row in self.store.db.execute(
+                    "SELECT payload FROM simple_slice_package_items WHERE json_extract(payload,'$.itemId') IN ("
+                    + placeholders + ') ORDER BY rowid', tuple(selected))]
+        else:
+            items = self.store.list("items")
+            projection = items
         targets = []
         for dataset in PACKAGE_TARGETS:
-            rows = [item for item in items if item.get("dataset") == dataset["id"]]
-            targets.append({**dataset, "items": rows,
+            rows = [item for item in projection if item.get("dataset") == dataset["id"]]
+            targets.append({**dataset,
                             "importing": sum(item.get("state") == "importing" for item in rows),
                             "uploading": sum(item.get("state") == "uploading" for item in rows),
                             "queued": sum(item.get("state") in {"queued", "uploaded", "review"} for item in rows)})
         # Object addresses and submit snapshots are internal recovery receipts.
         fields = {"id", "revision", "dataset", "category", "sourceDatasetId", "sourceVideoId", "itemId",
-                  "videoPath", "path", "imageDir", "name", "state", "message", "errorCode", "images",
+                  "videoPath", "path", "imageDir", "name", "state", "message", "errorCode",
                   "imageCount", "actualImages", "bytes", "size", "retries", "jobId", "cleanupState",
                   "cleanupMessage", "createdAt", "updatedAt", "superseded", "localCleanupState"}
+        fields.add('reasonCode')
+        if summary:
+            fields = {'id', 'itemId', 'category', 'state'}
         public = [{key: value for key, value in item.items() if key in fields} for item in items]
-        for target in targets:
-            target["items"] = [item for item in public if item.get("dataset") == target["id"]]
+        if not summary:
+            for target in targets:
+                target["items"] = [item for item in public if item.get("dataset") == target["id"]]
         return {"targets": targets, "items": public, "paused": self.paused,
-                "busy": bool(self.running) or self.tick_lock.locked()}
+                "busy": bool(self.running) or any(not task.done() for task in self.target_tasks.values()) or self.tick_lock.locked()}
 
     def remember(self, record):
-        if getattr(self, "control", None) and not self.control.package_allowed(record):
+        if getattr(self, "control", None) and not self.control.package_allowed(record, allow_paused=True):
             record.update(superseded=True, state="superseded", message="旧版照片已保留，不再上传。")
         if record.get("sourceIdentity"):
             existing = next((item for item in self.store.list("items")
@@ -179,6 +244,15 @@ class SlicePackageManager:
 
     async def start(self):
         if not self.loop_task or self.loop_task.done():
+            # A process restart loses only the in-memory worker, not its bound
+            # object or multipart journal. Let the ordinary worker reconcile
+            # HEAD/parts before uploading; submitted imports never go backwards.
+            for item in self.store.list('items'):
+                active = self.running.get(item['id'])
+                if item.get('state') == 'uploading' and (not active or active.done()):
+                    item.update(state='queued', phase='reconciling',
+                                message='已恢复上传断点，先核对原对象及分片。')
+                    self._save(item)
             self.stopping = False
             self.loop_task = asyncio.create_task(self.loop(), name="slice-packages")
 
@@ -192,6 +266,10 @@ class SlicePackageManager:
             task.cancel()
         if self.running:
             await asyncio.gather(*self.running.values(), return_exceptions=True)
+        for task in self.target_tasks.values():
+            task.cancel()
+        if self.target_tasks:
+            await asyncio.gather(*self.target_tasks.values(), return_exceptions=True)
 
     async def loop(self):
         while not self.stopping:
@@ -208,41 +286,76 @@ class SlicePackageManager:
                 pass
 
     async def tick(self):
-        if self.paused or self.tick_lock.locked():
+        if self.tick_lock.locked():
             return
         async with self.tick_lock:
             await self._tick()
 
     async def _tick(self):
-        if getattr(self, 'workspace', None) and self.workspace.blocked:
-            return
         now = self.clock()
         for identity, task in list(self.running.items()):
             runtime = self.runtime.get(identity, {})
             if not task.done() and now - runtime.get("lastProgress", now) >= STALL_SECONDS:
-                runtime["stopCode"] = "stalled"
+                runtime["stopCode"] = ("disk" if getattr(self, 'workspace', None)
+                                       and self.workspace.blocked else "stalled")
                 task.cancel()
+        if getattr(self, 'workspace', None) and self.workspace.blocked:
+            reason = getattr(self.workspace, 'availability', {}).get('reasonCode') or 'disk_offline'
+            for item in self.store.list('items'):
+                if item.get('state') == 'queued' and item['id'] not in self.running and item.get('reasonCode') != reason:
+                    item.update(errorCode='disk', reasonCode=reason,
+                                message='等待原工作区磁盘恢复；照片和上传断点保留。')
+                    self._save(item)
         if not any(item.get("state") in {"queued", "uploaded", "uploading", "importing", "submitting"}
                    for item in self.store.list("items")):
             return
-        # One target's outage must not interrupt or leak the other target's work.
-        results = await asyncio.gather(*(self.tick_target(dataset["id"]) for dataset in PACKAGE_TARGETS),
-                                       return_exceptions=True)
-        for target, result in zip(PACKAGE_TARGETS, results):
-            if isinstance(result, Exception):
-                code = result.code if isinstance(result, AuditError) else "network"
-                for item in self.store.list("items"):
-                    if item.get("dataset") == target["id"] and item.get("state") in {"queued", "uploaded", "submitting", "importing"}:
-                        item.update(errorCode=code, message=safe_message(code))
-                        self._save(item)
+        # Each target owns one import/poll task. A slow target cannot hold the
+        # other target's next admission or the local upload watchdog lock.
+        items = self.store.list('items')
+        for target in PACKAGE_TARGETS:
+            dataset = target['id']
+            if self.paused and not any(item.get('dataset') == dataset and item.get('state') in
+                                      {'submitting', 'importing'} for item in items):
+                continue
+            self._launch_next(dataset, items)
+            task = self.target_tasks.get(dataset)
+            if task and not task.done():
+                continue
+            if now < self.target_next_check.get(dataset, 0):
+                continue
+            if not any(item.get('dataset') == dataset and item.get('state') in
+                       {'queued', 'uploading', 'uploaded', 'submitting', 'importing'} for item in items):
+                continue
+            self.target_tasks[dataset] = asyncio.create_task(self._run_target(dataset), name='photo-import-' + dataset)
+        for _ in range(3):
+            if all(task.done() for task in self.target_tasks.values()):
+                break
+            await asyncio.sleep(0)
+
+    async def _run_target(self, dataset):
+        try:
+            await self.tick_target(dataset)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            code = error.code if isinstance(error, AuditError) else 'network'
+            for item in self.store.list('items'):
+                if item.get('dataset') == dataset and item.get('state') in {'queued', 'uploaded', 'submitting', 'importing'}:
+                    if item.get('state') == 'queued' and getattr(self, 'workspace', None) and self.workspace.blocked:
+                        continue
+                    item.update(errorCode=code, message=safe_message(code))
+                    self._save(item)
+        finally:
+            self.target_next_check[dataset] = self.clock() + CHECK_SECONDS
 
     async def tick_target(self, dataset):
         items = [item for item in self.store.list("items") if item.get("dataset") == dataset]
         if not items:
             return
+        # Uploading local photos does not depend on a remote import list.
+        # Start its independent worker before a possibly slow platform poll.
+        self._launch_next(dataset, items)
         jobs = await self.remote.jobs(dataset)
-        if self.paused:
-            return
         active = [job for job in jobs if str(job.get("status")) in {"1", "2"}]
         for item in items:
             if item["state"] in {"submitting", "importing"} and not item.get("jobId"):
@@ -250,9 +363,13 @@ class SlicePackageManager:
                 continue
             if item["state"] != "importing" or not item.get("jobId"):
                 continue
+            if item.get('verificationNotBefore', 0) > self.clock():
+                continue
             job = next((row for row in jobs if str(row.get("id")) == str(item["jobId"])), None)
             if job and str(job.get("status")) in {"3", "4", "5"}:
                 await self.verify(item, job)
+        if self.paused:
+            return
         busy = bool(active) or any(item.get("state") in {"submitting", "importing"}
                                     or item.get("errorCode") in {"import_uncertain", "import_identity"}
                                     for item in self.store.list("items") if item.get("dataset") == dataset)
@@ -262,8 +379,23 @@ class SlicePackageManager:
                           and (not getattr(self, "control", None) or self.control.package_allowed(item))), None)
             if ready:
                 await self.submit_one(ready, jobs)
+        self._launch_next(dataset, self.store.list('items'))
+
+    def _launch_next(self, dataset, items):
+        # Task completion callbacks run on a later loop turn. A caller can
+        # already observe a finished task before that callback releases it.
+        for identity, task in list(self.running.items()):
+            if task.done():
+                row = self.store.get('items', identity) or {}
+                self._release_upload_task(identity, task, row.get('dataset'))
+        # Local media requires the disk. Already-submitted imports and watchdogs
+        # continue independently, using their persisted remote receipts.
+        if getattr(self, 'workspace', None) and self.workspace.blocked:
+            return
+        if self.paused or any(item.get('dataset') == dataset and item['id'] in self.running for item in items):
+            return
         now = self.clock()
-        for item in self.store.list("items"):
+        for item in items:
             if self.paused:
                 return
             if item.get("dataset") != dataset or item.get("state") != "queued" or item["id"] in self.running:
@@ -272,8 +404,6 @@ class SlicePackageManager:
                 continue
             if item.get("nextAttempt", 0) > now:
                 continue
-            if any(other.get("dataset") == dataset and other["id"] in self.running for other in self.store.list("items")):
-                break
             self.launch(item)
             break
 
@@ -282,9 +412,22 @@ class SlicePackageManager:
         self.runtime[identity] = {"lastProgress": self.clock(), "bytes": item.get("bytes", 0)}
         task = asyncio.create_task(self.upload_one(identity), name="slice-package-" + identity)
         self.running[identity] = task
-        task.add_done_callback(lambda _done: (self.running.pop(identity, None), self.runtime.pop(identity, None), self.wake.set()))
+        def finished(_done):
+            self._release_upload_task(identity, _done, item['dataset'])
+        task.add_done_callback(finished)
+
+    def _release_upload_task(self, identity, task, dataset):
+        # A delayed callback from an old attempt cannot release a newer one.
+        if self.running.get(identity) is not task:
+            return
+        self.running.pop(identity, None)
+        self.runtime.pop(identity, None)
+        if dataset is not None:
+            self.target_next_check[dataset] = 0
+        self.wake.set()
 
     async def upload_one(self, identity):
+        self.event_loop = asyncio.get_running_loop()
         item = self.store.get("items", identity)
         if getattr(self, "control", None) and not self.control.package_allowed(item):
             return
@@ -293,12 +436,20 @@ class SlicePackageManager:
             with self.leases.read(item["path"]):
                 if operation == "upload":
                     try:
-                        current = source_fingerprint(Path(item["path"]))
+                        def inspect():
+                            # A timed-out stat may still be running. Its own
+                            # lease prevents cleanup until that read finishes.
+                            with self.leases.read(item['path']):
+                                return source_fingerprint(Path(item['path']))
+                        current = await self.file_checks.run(item['path'], inspect)
                     except OSError:
                         raise AuditError("外置盘或压缩包暂不可用。", "disk") from None
                     if current != item["fileVersion"]:
                         raise ValueError("file_changed")
                 credentials = await self.remote.signature(item["dataset"], item.get("object"))
+                if (not self._verification_current(item) or item.get('superseded')
+                        or (getattr(self, 'control', None) and not self.control.package_allowed(item))):
+                    return
                 if not item.get("object"):
                     prefix = credentials.get("prefix")
                     key = prefix + "simple-" + identity + "/" + item["name"] if prefix is not None else credentials["key"]
@@ -306,20 +457,26 @@ class SlicePackageManager:
                 elif any(item["object"][key] != credentials[key] for key in ("bucket", "endpoint")):
                     raise ValueError("object_changed")
                 item.update(state="uploading", message="正在核对本条分片。" if operation == "cleanup" else "正在上传切片压缩包。")
+                item['reasonCode'] = ''
                 self._save(item)
                 payload = {**item, "fileVersion": item.get("uploadFileVersion", item["fileVersion"]),
                            "sourceFileVersion": item["fileVersion"]}
                 await self.worker.run(payload, credentials, lambda event: self.worker_event(identity, event), operation)
         except asyncio.CancelledError:
             item = self.store.get("items", identity)
-            if self.runtime.get(identity, {}).get("stopCode") == "stalled":
-                self.fail(item, "stalled")
-            elif item and item["state"] not in {"uploaded", "complete"}:
+            stop_code = self.runtime.get(identity, {}).get("stopCode")
+            if stop_code in {"stalled", "disk"}:
+                self.fail(item, stop_code)
+            elif item and item["state"] in {"queued", "uploading"}:
                 item.update(state="queued", message="上传已暂停，压缩包保留。")
                 self._save(item)
             raise
         except AuditError as error:
             self.fail(self.store.get("items", identity), error.code if error.code in {"auth", "network", "disk"} else "upload_failed")
+        except FileEnvironmentError as error:
+            if error.code == 'file_busy':
+                self.waiting_paths.add(item['path'])
+            self.fail(self.store.get("items", identity), "disk", reason_code=error.code)
         except ValueError as error:
             self.fail(self.store.get("items", identity), str(error) if str(error) in {
                 "file_changed", "object_changed", "parts_invalid", "stalled"} else "upload_failed")
@@ -328,6 +485,14 @@ class SlicePackageManager:
 
     async def worker_event(self, identity, event):
         item = self.store.get("items", identity)
+        if not item:
+            return
+        # Completion acknowledgement and process exit are separate awaits. An
+        # import may already have started, or correction may own this history.
+        # No late upload callback can revert those facts or revive an old file.
+        if (item.get('superseded') or item.get('state') in {'uploaded', 'submitting', 'importing', 'complete', 'superseded', 'dismissed'}
+                or (getattr(self, 'control', None) and not self.control.package_allowed(item, allow_paused=True))):
+            return
         runtime = self.runtime.setdefault(identity, {"lastProgress": self.clock(), "bytes": 0})
         kind, now = event.get("event"), self.clock()
         before = (item.get("phase"), item.get("uploadId"), len(item.get("parts") or {}))
@@ -365,7 +530,7 @@ class SlicePackageManager:
                 raise ValueError("object_changed")
             item.update(state="uploaded", phase="uploaded", bytes=item["size"], etag=event["etag"],
                         objectVersion=event.get("versionId", ""), uploadId="", cleanupNeeded=False,
-                        errorCode="", nextAttempt=0, message="压缩包已上传，等待导入。")
+                        errorCode="", reasonCode="", nextAttempt=0, message="压缩包已上传，等待导入。")
         elif kind == "cleaned":
             item.update(uploadId="", parts={}, bytes=0, createAttempted=False, completionAttempted=False,
                         cleanupNeeded=False, phase="queued")
@@ -382,11 +547,17 @@ class SlicePackageManager:
             runtime["lastProgress"] = now
         self._save(item)
 
-    def fail(self, item, code):
+    def fail(self, item, code, *, reason_code=None):
         if not item:
+            return
+        if (item.get('superseded') or item.get('state') in {'uploaded', 'submitting', 'importing', 'complete', 'superseded', 'dismissed'}
+                or (getattr(self, 'control', None) and not self.control.package_allowed(item, allow_paused=True))):
             return
         if code in PAUSE_CODES:
             item.update(state="queued", errorCode=code, message=safe_message(code), nextAttempt=self.clock() + CHECK_SECONDS)
+            item['reasonCode'] = reason_code or ('disk_io' if code == 'disk' else code)
+            if reason_code == 'file_busy':
+                item['message'] = '文件正在使用，释放后自动继续；上传断点保留。'
         elif code in {"file_changed", "object_changed", "multipart_unknown", "parts_invalid", "authorization_binding"}:
             item.update(state="attention", errorCode=code, message=safe_message(code))
         else:
@@ -429,27 +600,49 @@ class SlicePackageManager:
                 item["state"] = "uploaded"
             else:
                 item["state"] = "queued"
-            item.update(retries=0, nextAttempt=0, errorCode="", message="先核对已有任务和断点，再继续。")
+            item.update(retries=0, nextAttempt=0, verificationNotBefore=0, errorCode="", message="先核对已有任务和断点，再继续。")
             self._save(item)
         self.store.save("batches", {"id": marker, "itemId": identity})
         self.wake.set()
         return item
 
     async def submit_one(self, item, jobs):
+        if self.paused or (getattr(self, 'workspace', None) and getattr(self.workspace, 'maintenance', False)):
+            return
         item = self.store.get("items", item["id"])
         if item["state"] != "uploaded" or not item.get("object"):
             return
         keys = [item["object"]["key"]]
         # Old images with the same names are not proof of this import. Keep a
         # pre-submit inventory when possible; network failures happen pre-write.
-        images = await self.remote.images(item["dataset"], prefix=image_prefix(item))
+        try:
+            images = await self.remote.images(item["dataset"], prefix=image_prefix(item))
+        except AuditError as error:
+            if error.code in {'auth', 'network', 'disk'}:
+                raise
+            if self._verification_current(item):
+                item.update(state='attention', errorCode='image_identity',
+                            verificationFailureType=error.code,
+                            message='平台图片清单暂不能确认身份，未提交导入；请核对后继续。')
+                self._save(item)
+            return
         current = self.store.get("items", item["id"])
+        if (not self._verification_current(item) or current.get('state') != 'uploaded'
+                or current.get('superseded')):
+            return
         if getattr(self, "control", None) and not self.control.package_allowed(current):
             return
         if self.paused:
             return
+        from .package_import_reuse import image_identity
+        before_ids = [image_identity(image.get('id')) for image in images]
+        if any(identity is None for identity in before_ids) or len(set(before_ids)) != len(before_ids):
+            item.update(state='attention', errorCode='image_identity',
+                        message='平台图片ID缺失或重复，未提交导入；压缩包和原片保留，请核对后继续。')
+            self._save(item)
+            return
         item.update(state="submitting", beforeJobs=[str(job.get("id")) for job in jobs], keys=keys,
-                    beforeImageIds=[str(image["id"]) for image in images],
+                    beforeImageIds=before_ids,
                     message="已保存导入前任务清单，正在提交这一个压缩包。")
         self._save(item)
         try:
@@ -486,7 +679,7 @@ class SlicePackageManager:
     async def verify(self, item, job):
         if not self._verification_current(item):
             return
-        from .package_import_reuse import reuse_image_ids
+        from .package_import_reuse import image_identity, reuse_image_ids
         try:
             reused_ids = reuse_image_ids(item, lambda path, version: file_locations.resolve(self.store.db, path, version))
         except (TypeError, ValueError):
@@ -506,7 +699,14 @@ class SlicePackageManager:
             item.update(state="attention", errorCode="import_failed", message="平台导入失败，压缩包和原片保留。")
             self._save(item)
             return
-        images = await self.remote.images(item["dataset"], prefix=image_prefix(item))
+        try:
+            images = await self.remote.images(item["dataset"], prefix=image_prefix(item))
+        except AuditError as error:
+            if error.code in {'auth', 'network', 'disk'}:
+                raise
+            item['verificationFailureType'] = error.code
+            self._record_verification_failure(item, item.get('imageCount', 0), 0)
+            return
         if not self._verification_current(item):
             return
         expected = {name_key(name) for name in item.get("images") or []}
@@ -516,32 +716,47 @@ class SlicePackageManager:
             key = name_key(name)
             if key not in expected:
                 continue
+            identity = image_identity(image.get('id'))
+            if identity is None:
+                continue
             job_id = image.get("taskId", image.get("task_id", image.get("jobId", image.get("job_id"))))
             # Exact job association or an exact new-image delta is required.
             if job_id is not None:
                 owned = str(job_id) == str(item["jobId"])
             else:
-                owned = isinstance(item.get("beforeImageIds"), list) and str(image["id"]) not in item["beforeImageIds"]
+                owned = isinstance(item.get("beforeImageIds"), list) and identity not in item["beforeImageIds"]
             if owned:
-                if reused_ids is not None and str(image['id']) != reused_ids.get(key):
+                if reused_ids is not None and identity != reused_ids.get(key):
                     continue
-                found.setdefault(key, []).append(str(image["id"]))
-        if expected and len(expected) == item.get("imageCount") and all(len(found.get(name, [])) == 1 for name in expected):
+                found.setdefault(key, []).append(identity)
+        identity_counts = Counter(identity for identities in found.values() for identity in identities)
+        verified = {name: identities[0] for name, identities in found.items()
+                    if len(identities) == 1 and identity_counts[identities[0]] == 1}
+        if expected and len(expected) == item.get("imageCount") and set(verified) == expected:
             item.update(state="complete", message="图片已逐张核验。", errorCode="", actualImages=len(expected),
-                        outputImageIds=[found[name][0] for name in sorted(expected)], verifiedJobId=str(item["jobId"]))
+                        outputImageIds=[verified[name] for name in sorted(expected)], verifiedJobId=str(item["jobId"]))
             self._save(item)
             self.delete_if_both_complete(item)
             return
         if await self.reuse_identical_import(item):
             return
+        self._record_verification_failure(item, len(expected), len(verified), legacy_layout(item))
+
+    def _record_verification_failure(self, item, expected_count, actual_count, wrong_layout=False):
         current = self.store.get('items', item['id'])
         if (not self._verification_current(item) or current.get('superseded')
-                or (getattr(self, 'control', None) and not self.control.package_allowed(current))):
+                or (getattr(self, 'control', None) and not self.control.package_allowed(current, allow_paused=True))):
             return
-        wrong_layout = legacy_layout(item)
-        item.update(state="attention", errorCode="archive_layout" if wrong_layout else "verification", actualImages=sum(len(v) == 1 for v in found.values()),
+        item['actualImages'] = actual_count
+        job = str(item.get('jobId') or '')
+        item['verificationFailures'] = (int(item.get('verificationFailures') or 0)
+            if item.get('verificationFailureJob') == job else 0) + 1
+        item['verificationFailureJob'] = job
+        if not wrong_layout and self.queue_verification_retry(item):
+            return
+        item.update(state="attention", errorCode="archive_layout" if wrong_layout else "verification", actualImages=actual_count,
                     message="压缩包目录格式有误，原片保留；可修复格式后重传。" if wrong_layout else
-                    f"导入已结束，明确关联 {sum(len(v) == 1 for v in found.values())}/{len(expected)} 张；原片保留，可重新核对。")
+                    f"导入已结束，唯一关联 {actual_count}/{expected_count} 张；图片ID、数量或任务归属不符，原片保留，可重新核对。")
         self._save(item)
 
     async def reuse_identical_import(self, item):
@@ -559,7 +774,7 @@ class SlicePackageManager:
             source = self.store.get('items', peer['id'])
             if (not equality or not current or not source or current['revision'] != item['revision']
                     or source['revision'] != peer['revision'] or current.get('superseded')
-                    or (getattr(self, 'control', None) and not self.control.package_allowed(current))):
+                    or (getattr(self, 'control', None) and not self.control.package_allowed(current, allow_paused=True))):
                 return False
             self._save(prepare_import_reuse(current, source, equality))
             self.wake.set()
@@ -568,68 +783,16 @@ class SlicePackageManager:
             return False
 
     def delete_if_both_complete(self, item):
-        if item.get("superseded"):
+        """Import completion never authorizes local deletion.
+
+        Retain the legacy callback name for callers; only the explicit workspace
+        cleanup operation may remove originals, photographs or their archives.
+        """
+        if item.get('state') != 'complete' or item.get('superseded') or item.get('localCleanupState') == 'complete':
             return
-        if getattr(self, 'workspace', None) and self.workspace.enabled:
-            self.workspace.wake.set()
-            return
-        video_path = item.get("videoPath") or ""
-        related = [row for row in self.store.list("items") if (row.get("videoPath") or "") == video_path
-                   and row.get("videoFileVersion") == item.get("videoFileVersion")]
-        states = {row.get("category"): row.get("state") for row in related}
-        if states.get("bed") != "complete" or states.get("magnet") != "complete":
-            return
-        if len(related) != 2:
-            return
-        if any(not row.get("verifiedJobId") or not row.get("videoFileVersion")
-               or row.get("actualImages") != row.get("imageCount") or not row.get("imageVersions")
-               for row in related):
-            for row in related:
-                row.update(cleanupState="attention", cleanupMessage="缺少原片或图片版本凭证，文件保留。")
-                self._save(row)
-            return
-        removed = []
-        try:
-            # Validate the source video and the entire temporary-output deletion
-            # set before removing anything. Source videos are user data and must
-            # remain available after their images have been imported.
-            expected = {}
-            for row in related:
-                expected[row["path"]] = row["fileVersion"]
-                directory = checked_path(row["imageDir"])
-                for name in row["images"]:
-                    if Path(name).name != name:
-                        raise ValueError("unsafe_image_name")
-                    expected[str(directory / name)] = row["imageVersions"][name]
-                if row.get("videoPath") != video_path:
-                    raise ValueError("file_changed")
-                if row.get("videoFileVersion") != related[0].get("videoFileVersion"):
-                    raise ValueError("file_changed")
-            source_video = checked_path(video_path)
-            if not source_video.is_file() or source_fingerprint(source_video) != related[0]["videoFileVersion"]:
-                raise ValueError("file_changed")
-            for raw, version in expected.items():
-                path = checked_path(raw)
-                if self.leases.busy(path):
-                    raise ValueError("file_busy")
-                if path.exists() and source_fingerprint(path) != version:
-                    raise ValueError("file_changed")
-            # Only exact recorded files; no globbing user-added JPEGs.
-            for raw, version in expected.items():
-                path = checked_path(raw)
-                with self.leases.write(path):
-                    if path.exists():
-                        if source_fingerprint(path) != version:
-                            raise ValueError("file_changed")
-                        path.unlink()
-                    removed.append(raw)
-        except (OSError, ValueError) as error:
-            for row in related:
-                row.update(cleanupState="attention", cleanupMessage="临时照片尚未清理，原片保留；请核对后重试。",
-                           cleanupError=type(error).__name__)
-                self._save(row)
-            return
-        for row in related:
-            row.update(cleanupState="complete", cleanupMessage="车斗和磁盘吊都已导入，临时照片已清理，原片保留。",
-                       deletedPaths=removed)
-            self._save(row)
+        if item.get('cleanupState') != 'complete':
+            item.update(cleanupState='pending_manual', cleanupMessage='照片已导入，等待手动清理。')
+            self._save(item)
+        workspace = getattr(self, 'workspace', None)
+        if workspace and workspace.enabled:
+            workspace.wake.set()

@@ -16,6 +16,7 @@ from .media import file_digest, publish_with_reservation, transfer_reservation_i
 from .upload_audit import AUDIT_POLICY_VERSION
 from .videos import Conflict
 from . import file_locations
+from .file_leases import FileEnvironmentError
 
 MOVE_RULE_VERSION = 4
 
@@ -37,7 +38,7 @@ def checked_path(value):
         raise ValueError("桌面的“视频抽帧”源目录受保护，不能用于分类移动。")
     if path.is_relative_to(Path("/Volumes")) and len(path.parts) > 2:
         if not os.path.ismount(str(Path(*path.parts[:3]))):
-            raise ValueError("外置盘尚未挂载，请连接原磁盘后重试。")
+            raise FileEnvironmentError("外置盘尚未挂载，请连接原磁盘后继续。", 'disk_offline')
     return path
 
 

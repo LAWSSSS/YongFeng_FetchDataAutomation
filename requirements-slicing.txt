@@ -1,4 +1,4 @@
-# Separate Python 3.11 CPU inference environment. The deployed model files are not copied.
+# Separate Python 3.11 CPU inference environment; models resolve from application resources.
 numpy==1.26.4
 Pillow==13.0.0
 onnxruntime==1.19.2

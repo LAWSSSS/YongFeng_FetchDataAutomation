@@ -1,6 +1,6 @@
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from . import runtime
 
 
@@ -46,6 +46,36 @@ class SearchInput(BaseModel):
     filters: SearchFilters
 
 
+class CollectionRunInput(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    filters: SearchFilters
+    requestId: str = Field(min_length=1, max_length=100)
+
+
+class FinalConfirmationInput(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    version: int = Field(ge=0, strict=True)
+    expectedRevision: int = Field(ge=0, strict=True)
+    requestId: str = Field(min_length=1, max_length=100)
+
+
+class CollectionDraftInput(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    recordId: str = Field(min_length=1, max_length=100)
+    startTime: str = Field(min_length=19, max_length=35)
+    durationSeconds: int = Field(ge=60, le=7200, strict=True)
+    expectedPlanRevision: int = Field(ge=0, strict=True)
+    requestId: str = Field(pattern=r'^[A-Za-z0-9_-]{1,100}$')
+    page: int = Field(default=1, ge=1)
+
+
+class CollectionSubmitInput(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    recordIds: list[str] = Field(min_length=1, max_length=10000)
+    expectedPlanRevision: int = Field(ge=0, strict=True)
+    requestId: str = Field(pattern=r'^[A-Za-z0-9_-]{1,100}$')
+
+
 class PreviewInput(BaseModel):
     searchId: str
     recordIds: list[str] = Field(min_length=1, max_length=10000)
@@ -54,6 +84,7 @@ class PreviewInput(BaseModel):
 class SubmitInput(BaseModel):
     planId: str
     downloadAfterCollection: bool = False
+    confirmed: bool = False
 
 
 class VideoDownloadLimitInput(BaseModel):
@@ -236,6 +267,46 @@ class RecordRestoreInput(BaseModel):
     removalId: str = Field(min_length=1, max_length=100)
 
 
+class ProcessingContinueInput(BaseModel):
+    model_config = ConfigDict(extra='forbid', strict=True)
+    requestId: str = Field(pattern=r'^[A-Za-z0-9_-]{1,100}$')
+    generation: int = Field(ge=0)
+    selections: list[RecordSelection] = Field(default_factory=list, max_length=20)
+    packages: list[RecordSelection] = Field(default_factory=list, max_length=20)
+
+
+class PipelineControlInput(BaseModel):
+    model_config = ConfigDict(extra='forbid', strict=True)
+    expectedRevision: int = Field(ge=0)
+    requestId: str = Field(pattern=r'^[A-Za-z0-9_-]{1,100}$')
+
+
+class PipelineSelection(BaseModel):
+    model_config = ConfigDict(extra='forbid', strict=True)
+    mediaId: str = Field(min_length=1, max_length=200)
+    generation: int = Field(ge=0)
+    action: Literal['continue', 'archive', 'pause', 'resume'] = 'continue'
+    selections: list[RecordSelection] = Field(default_factory=list, max_length=20)
+    packages: list[RecordSelection] = Field(default_factory=list, max_length=20)
+    fileId: str | None = Field(default=None, min_length=1, max_length=200)
+    itemId: str | None = Field(default=None, min_length=1, max_length=200)
+    expectedRevision: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode='after')
+    def check_action(self):
+        if self.action == 'archive' and (not self.fileId or not self.itemId or self.expectedRevision is None):
+            raise ValueError('归档操作缺少文件或视频修订信息。')
+        if self.action == 'continue' and not self.selections and not self.packages:
+            raise ValueError('没有可继续的记录。')
+        return self
+
+
+class PipelineBatchInput(BaseModel):
+    model_config = ConfigDict(extra='forbid', strict=True)
+    requestId: str = Field(pattern=r'^[A-Za-z0-9_-]{1,100}$')
+    selections: list[PipelineSelection] = Field(min_length=1, max_length=20)
+
+
 class SlicingBindInput(SlicingItemActionInput):
     path: str = Field(min_length=1, max_length=4000)
 
@@ -257,3 +328,14 @@ class GroupRecordRemoveInput(BaseModel):
     requestId: str = Field(pattern=r'^[A-Za-z0-9_-]{1,100}$')
     selections: list[RecordSelection] = Field(default_factory=list, max_length=5000)
     receipts: list[RecordSelection] = Field(default_factory=list, max_length=5000)
+
+
+class RecordDeletionChoice(BaseModel):
+    kind: Literal['collection', 'slicing', 'receipts', 'receipt_items', 'collection_runs']
+    id: str = Field(min_length=1, max_length=300)
+    expectedRevision: int = Field(ge=0)
+
+
+class RecordDeletionInput(BaseModel):
+    requestId: str = Field(min_length=1, max_length=100, pattern=r'^[A-Za-z0-9_-]+$')
+    selections: list[RecordDeletionChoice] = Field(min_length=1, max_length=10000)

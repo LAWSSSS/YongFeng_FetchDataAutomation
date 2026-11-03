@@ -1,7 +1,6 @@
 """Small macOS Keychain store for renewable local platform sessions.
 
-Only refresh tokens are stored here. Account passwords and access tokens are
-never persisted by this module.
+Platform secrets use separate Keychain entries; they never enter data files.
 """
 from __future__ import annotations
 
@@ -37,7 +36,7 @@ def _check(status: int) -> None:
         raise SecureStoreError("本机系统钥匙串操作失败。")
 
 
-def _find(security):
+def _find(security, account=_ACCOUNT):
     length = ctypes.c_uint32()
     data = ctypes.c_void_p()
     item = ctypes.c_void_p()
@@ -48,7 +47,7 @@ def _find(security):
     ]
     security.SecKeychainFindGenericPassword.restype = ctypes.c_int32
     status = security.SecKeychainFindGenericPassword(
-        None, len(_SERVICE), _SERVICE, len(_ACCOUNT), _ACCOUNT,
+        None, len(_SERVICE), _SERVICE, len(account), account,
         ctypes.byref(length), ctypes.byref(data), ctypes.byref(item),
     )
     if status == _ERR_ITEM_NOT_FOUND:
@@ -68,29 +67,24 @@ def _free(security, core_foundation, data, item) -> None:
         core_foundation.CFRelease(item)
 
 
-def load_connection() -> dict[str, str] | None:
+def load_payload(account: bytes) -> dict | None:
     security, core_foundation = _frameworks()
-    length, data, item = _find(security)
+    length, data, item = _find(security, account)
     if length is None:
         return None
     try:
         raw = ctypes.string_at(data, length)
         value = json.loads(raw.decode("utf-8"))
-        if not isinstance(value, dict) or not isinstance(value.get("refresh"), str) or not value["refresh"]:
-            return None
-        user = value.get("user")
-        return {"refresh": value["refresh"], "user": user if isinstance(user, str) else ""}
+        return value if isinstance(value, dict) else None
     except (UnicodeDecodeError, json.JSONDecodeError):
         raise SecureStoreError("本机保存的连接信息无法读取。") from None
     finally:
         _free(security, core_foundation, data, item)
 
 
-def save_connection(refresh: str, user: str) -> None:
-    if not isinstance(refresh, str) or not refresh:
-        raise SecureStoreError("平台没有提供可续期的会话凭证。")
+def save_payload(account: bytes, value: dict) -> None:
     security, core_foundation = _frameworks()
-    payload = json.dumps({"refresh": refresh, "user": user or ""}, separators=(",", ":")).encode("utf-8")
+    payload = json.dumps(value, separators=(",", ":")).encode("utf-8")
     buffer = ctypes.create_string_buffer(payload)
     item = ctypes.c_void_p()
     security.SecKeychainAddGenericPassword.argtypes = [
@@ -100,11 +94,11 @@ def save_connection(refresh: str, user: str) -> None:
     ]
     security.SecKeychainAddGenericPassword.restype = ctypes.c_int32
     status = security.SecKeychainAddGenericPassword(
-        None, len(_SERVICE), _SERVICE, len(_ACCOUNT), _ACCOUNT,
+        None, len(_SERVICE), _SERVICE, len(account), account,
         len(payload), ctypes.cast(buffer, ctypes.c_void_p), ctypes.byref(item),
     )
     if status == _ERR_DUPLICATE_ITEM:
-        length, data, existing = _find(security)
+        length, data, existing = _find(security, account)
         if length is None:
             raise SecureStoreError("无法更新本机保存的连接。")
         try:
@@ -128,9 +122,9 @@ def save_connection(refresh: str, user: str) -> None:
             core_foundation.CFRelease(item)
 
 
-def delete_connection() -> None:
+def delete_payload(account: bytes) -> None:
     security, core_foundation = _frameworks()
-    _, data, item = _find(security)
+    _, data, item = _find(security, account)
     if item is None:
         return
     try:
@@ -139,3 +133,20 @@ def delete_connection() -> None:
         _check(security.SecKeychainItemDelete(item))
     finally:
         _free(security, core_foundation, data, item)
+
+
+def load_connection() -> dict[str, str] | None:
+    value = load_payload(_ACCOUNT)
+    if not value or not isinstance(value.get('refresh'), str) or not value['refresh']:
+        return None
+    return {'refresh': value['refresh'], 'user': value.get('user') if isinstance(value.get('user'), str) else ''}
+
+
+def save_connection(refresh: str, user: str) -> None:
+    if not isinstance(refresh, str) or not refresh:
+        raise SecureStoreError('平台没有提供可续期的会话凭证。')
+    save_payload(_ACCOUNT, {'refresh': refresh, 'user': user or ''})
+
+
+def delete_connection() -> None:
+    delete_payload(_ACCOUNT)

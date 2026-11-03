@@ -10,7 +10,7 @@ import pytest_asyncio
 from app.main import create_app
 from app import file_locations
 from app.slicing import source_version
-from tests.test_workspace import pair, enable, proofs
+from tests.test_workspace import pair, enable, proofs, downloaded_original
 from tests.test_media_control import collection
 from tests.test_archive_completion import seed
 from tests.test_slicing_performance import close_app
@@ -190,13 +190,17 @@ async def test_correction_during_cleanup_verification_retains_original(app,tmp_p
     w=app.state.workspace
     path=pair(w,tmp_path/'old',('complete','complete'))
     proofs(w,path,tmp_path)
+    downloaded_original(w, path)
     await enable(w,tmp_path)
     asset=w.rows('assets')[0]
+    await w.request_cleanup_completed(w.config['revision'], 'manual-correction-race')
     entered,release=asyncio.Event(),asyncio.Event()
-    async def remote(dataset):
-        entered.set();await release.wait()
-        return [{'id':dataset+'-result','size':asset['fileVersion']['size']}]
-    w.uploads.remote.videos=remote
+    io=w.videos.file_operation
+    async def slow_hash(function,*args):
+        if function.__name__=='file_version':
+            entered.set();await release.wait()
+        return await io(function,*args)
+    w.videos.file_operation=slow_hash
     task=asyncio.create_task(w.cleanup(asset));await entered.wait()
     for item in w.slicing.store.list('items'):
         item['superseded']=True;w.slicing.store.save('items',item)
@@ -276,6 +280,8 @@ async def test_waiting_remote_cleanup_does_not_block_new_file_arrangement(app,tm
     w=await prepared(app,tmp_path,1)
     entered,release=asyncio.Event(),asyncio.Event()
     monkeypatch.setattr(w,'cleanup_eligibility',lambda asset:(True,''))
+    monkeypatch.setattr('app.workspace_cleanup.eligibility',lambda manager,asset:(True,''))
+    await w.request_cleanup_completed(w.config['revision'], 'manual-slow-cleanup')
     async def slow_cleanup(asset):
         entered.set()
         await release.wait()

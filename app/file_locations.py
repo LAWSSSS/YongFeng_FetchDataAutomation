@@ -63,8 +63,27 @@ def field(db, row, path_key, version_key):
     target, version = resolve(db, path, row[version_key])
     if target == path and version == row[version_key]:
         return False
+    if path_key == 'path' and version_key == 'fileVersion':
+        relocate_conclusions(db, row, path, target, version)
     row[path_key], row[version_key] = target, version
     return True
+
+
+def relocate_conclusions(db, row, source, destination, version):
+    """Carry a zero-result proof only across the exact verified move receipt."""
+    for category in (row.get('categories') or {}).values():
+        proof = category.get('processingConclusion') or {}
+        expected = proof.get('fileVersion') or {}
+        if not identity(source, expected):
+            continue
+        target, actual = resolve(db, source, expected)
+        if (target != destination or identity(target, actual) != identity(destination, version)
+                or (expected.get('edgeHash') and version.get('edgeHash')
+                    and expected['edgeHash'] != version['edgeHash'])):
+            continue
+        if expected != actual:
+            proof.setdefault('originalFileVersion', dict(expected))
+            proof['fileVersion'] = actual
 
 
 def keep_cleanup(previous, row):

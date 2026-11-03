@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {createPoller} from '../src/usePolling.ts';
-import {physicalCategories,slicePage,sliceTitle,slicingControls} from '../src/slicing-view.ts';
+import {physicalCategories,sliceGroupMatches,slicePage,sliceTitle,slicingControls} from '../src/slicing-view.ts';
 
 test('slicing controls allow another video after a failed single run without a dead resume button',()=>{
   const state={enabled:false,busy:false,run:{state:'attention',singleMode:true,singleItemId:'failed'},
@@ -104,4 +104,18 @@ test('physical category selection prefers existing receipts over a pending dupli
   const pending={...base,id:'a',categories:{bed:{state:'pending'},magnet:{state:'not_applicable'}}};
   const complete={...base,id:'b',categories:{bed:{state:'complete',packageId:'existing'},magnet:{state:'not_applicable'}}};
   assert.deepEqual(physicalCategories([pending,complete]).map(row=>row.item.id),['b']);
+});
+
+test('category attention includes failed photo imports and whole-file archive issues',()=>{
+  const rows=[{id:'one',name:'video',sourceDatasetId:'27912',sourceVideoId:'42',state:'complete',
+    categories:{bed:{state:'complete',packageId:'b'},magnet:{state:'complete',packageId:'m'}}}];
+  const base={status:'attention',source:'27912',search:'',overall:'attention'};
+  assert.equal(sliceGroupMatches(rows,{...base,attention:{kind:'package',category:'bed'}}),true);
+  assert.equal(sliceGroupMatches(rows,{...base,source:'27944',attention:{kind:'package',category:'bed'}}),false);
+  assert.equal(sliceGroupMatches(rows,{...base,source:'27944',attention:{kind:'package',category:'bed'},
+    packageIssues:[{itemId:'one',category:'magnet',state:'attention'}]}),true);
+  assert.equal(sliceGroupMatches(rows,{...base,source:'27944',attention:{kind:'package',category:'bed'},
+    packageIssues:[{itemId:'other',category:'magnet',state:'attention'}]}),false);
+  assert.equal(sliceGroupMatches(rows,{...base,attention:{kind:'archive'}}),true);
+  assert.equal(sliceGroupMatches(rows,{...base,search:'other',attention:{kind:'archive'}}),false);
 });
