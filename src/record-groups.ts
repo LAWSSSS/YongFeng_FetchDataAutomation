@@ -29,7 +29,7 @@ const captureStates:Record<string,string> = {
   pending: '尚未提交采集', awaiting_confirmation: '等待确认采集', submitting: '正在提交采集',
   submitted: '已提交采集', waiting: '等待平台结果', ready: '待确认', saved: '已保存',
   downloading: '下载中', publishing: '正在保存', failed: '需处理', attention: '待核对',
-  uncertain: '待核对', withdrawn: '已撤回', replaced: '已替换', cloud_deleted: '旧版已清理',
+  uncertain: '待核对', withdrawing: '撤回处理中', withdrawn: '已撤回', replaced: '已替换', cloud_deleted: '旧版已清理',
 };
 
 export function captureStatusLabel(version:{state:string;taskId?:string;platformStatus?:string}) {
@@ -78,6 +78,7 @@ export function splitInspections(records: InspectionRecord[]) {
 export function videoCategory(video: BatchVideo): VideoCategory {
   if (['pending', 'error'].includes(video.deletion?.state || '')) return 'deleting';
   const active = video.versions.find(version => version.revision === video.activeRevision);
+  if (active?.state === 'withdrawing') return ['attention','conflict'].includes(video.operation?.state || '') ? 'review' : 'deleting';
   if(active&&partialComplete(active))return 'saved';
   if(recoveryInProgress(video))return 'processing';
   if (!active || ['attention', 'failed', 'uncertain'].includes(active.state)) return 'review';

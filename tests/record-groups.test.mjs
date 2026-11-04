@@ -5,6 +5,15 @@ import { batchDate, canDownload, captureStatusLabel, completedPartialVideo, grou
 const video = (id, jobId, state, extra = {}) => ({id, jobId, activeRevision: 0, revision: 0,
   versions: [{revision: 0, state}], capabilities:{version:0,expectedRevision:0,canConfirmFinal:state==='ready'}, ...extra});
 
+test('withdrawal never appears as a waiting platform download', () => {
+  const row = video('withdrawing', 'j', 'withdrawing', {operation:{kind:'withdraw',state:'reconciling'}});
+  assert.equal(captureStatusLabel(row.versions[0]), '撤回处理中');
+  assert.equal(videoCategory(row), 'deleting');
+  assert.equal(canDownload(row), false);
+  row.operation.state = 'attention';
+  assert.equal(videoCategory(row), 'review');
+});
+
 test('independent same-day submissions share one grid; cross-midnight items keep their real day',()=>{
   const records=[video('a','one','ready',{submittedAt:'2026-11-03T02:00:00Z'}),
     video('b','two','ready'),video('c','three','ready'),

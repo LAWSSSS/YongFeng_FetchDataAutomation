@@ -162,12 +162,13 @@ class VideoStore:
                     version["state"] = "ready" if version.get("resultId") else "waiting"
             self.save(row)
 
-    def save(self, row):
+    def save(self, row, *, commit=True):
         file_locations.video(self.db, row, self.get(row['id']))
         row["updatedAt"] = now_iso()
         self.db.execute("INSERT INTO simple_videos VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload",
                         (row["id"], json.dumps(row, ensure_ascii=False)))
-        self.db.commit()
+        if commit:
+            self.db.commit()
 
     def get(self, identity):
         value = self.db.execute("SELECT payload FROM simple_videos WHERE id=?", (identity,)).fetchone()
@@ -859,6 +860,8 @@ class VideoManager:
     @staticmethod
     def _merge_check_result(current, checked):
         # Keep concurrent download/correction progress; only merge remote facts.
+        if current.get('state') in TERMINAL | {'withdrawing'}:
+            return
         if current.get("taskId") and checked.get("taskId") and current["taskId"] != checked["taskId"]:
             return
         if current.get("resultId") and checked.get("resultId") and current["resultId"] != checked["resultId"]:
@@ -882,7 +885,7 @@ class VideoManager:
     async def _check_row(self, row, parents, *, active_only=False):
         versions = ([self.version(row, row.get("activeRevision"))] if active_only else row["versions"])
         for version in (item for item in versions if item):
-            if version["state"] in TERMINAL:
+            if version["state"] in TERMINAL | {'withdrawing'}:
                 continue
             if not version.get("taskId") and version.get("beforeIds") and version.get("writeAttempted"):
                 candidates = [parent for key, parent in parents.items()
@@ -1021,6 +1024,8 @@ class VideoManager:
                 return {'operationId':pending['id'], 'state':pending['state'], 'videoId':identity}
         if kind in {'correction', 'recapture'}:
             current = self.version(row, version)
+            if current.get('state') == 'withdrawing':
+                raise Conflict('本版正在撤回，请等待撤回完成后再更正。')
             if kind == 'recapture' and operation_payload.get('mode') == 'force':
                 if not self.can_force_recapture(row, current):
                     raise Conflict('本版没有可核对的原任务，或仍在处理，请先核对或等待完成。')
@@ -1073,10 +1078,16 @@ class VideoManager:
             operation['source'] = {key: current.get(key) for key in ('taskId', 'resultId')}
             control = self.control.get('collection:' + identity) if getattr(self, 'control', None) else {}
             operation['sourceGeneration'] = int((control or {}).get('generation') or 0)
-        if kind in {'withdraw', 'correction', 'recapture'} and getattr(self, 'control', None):
-            self.control.refresh()
+        if kind in {'withdraw', 'correction', 'recapture'}:
+            control = getattr(self, 'control', None)
+            if control:
+                control.refresh()
             with self.store.db:
-                operation['mediaGeneration'] = self.control.reserve(identity, operation_id, commit=False, refresh=False)
+                if control:
+                    operation['mediaGeneration'] = control.reserve(identity, operation_id, commit=False, refresh=False)
+                if kind == 'withdraw':
+                    self.version(row, version)['state'] = 'withdrawing'
+                    self.store.save(row, commit=False)
                 self.store.save_operation(operation, commit=False)
         else:
             self.store.save_operation(operation)
@@ -1118,10 +1129,18 @@ class VideoManager:
             latest = self.store.get_operation(operation_id)
             if latest:
                 code = getattr(error, "code", "network")
-                latest.update(state="waiting_connection" if not self.target.connected or str(code).upper() in {"401", "403", "NETWORK", "408", "429", "500", "502", "503", "504"} else "attention",
-                              stage="waiting_connection" if not self.target.connected or str(code).upper() in {"401", "403", "NETWORK", "408", "429", "500", "502", "503", "504"} else "attention",
-                              errorCode=code, message="平台暂时不可达，操作和媒体均保留；连接恢复后继续。")
-                if latest.get('kind') == 'restart-download' and latest['state'] == 'waiting_connection':
+                waiting = not self.target.connected or str(code).upper() in {
+                    '401', '403', 'NETWORK', '408', '429', '500', '502', '503', '504',
+                }
+                state = 'waiting_connection' if waiting else 'attention'
+                if waiting:
+                    message = '平台暂时不可达，操作和媒体均保留；连接恢复后继续。'
+                elif latest.get('kind') == 'withdraw':
+                    message = '平台未接受撤回清理，请核对后重试；上一版保留。'
+                else:
+                    message = '平台未接受本次操作，请核对后重试；原视频和进度保留。'
+                latest.update(state=state, stage=state, errorCode=code, message=message)
+                if waiting and latest.get('kind') == 'restart-download':
                     latest['nextAttemptAt'] = time.time() + 30
                 self.store.save_operation(latest)
         except (OSError, ValueError, Conflict) as error:
@@ -2790,9 +2809,11 @@ class VideoManager:
                 return
             if not self.matches(parent, version, self.target_config["cameraId"]):
                 raise ValueError("旧任务身份已变化，已阻止删除。")
-            results = await self.results(parent_id)
-            if version.get("resultId") and str(parent.get("taskStatus", "")).upper() != "FIXED":
+            if allow_incomplete or cleanup['started']:
+                await self._stop_cleanup_task(parent, version, cleanup, checkpoint)
+            elif version.get("resultId") and str(parent.get("taskStatus", "")).upper() != "FIXED":
                 raise ValueError("旧任务完成状态已变化，暂不删除。")
+            results = await self.results(parent_id)
             if not results and not version.get("resultId") and (version["revision"] > 0 or allow_incomplete):
                 # A withdrawn correction can still be collecting. Recheck the result after removing its exact task.
                 cleanup.update(started=True, pendingTaskOnly=True)
@@ -2828,14 +2849,37 @@ class VideoManager:
                                           body={"id": str(result["id"]), "type": "acInfo"}, write=True)
             await self._delete_objects(cleanup, parent_id, lambda: checkpoint())
             await self._verify_objects(cleanup)
+            # Deleting a result may restart its parent. Match and stop it again
+            # before the task DELETE, as required by the platform's own UI.
+            parent = (await self.jobs.remote_parents(self.target_config)).get(parent_id)
+            if parent:
+                await self._stop_cleanup_task(parent, version, cleanup, checkpoint)
             if await self.results(parent_id):
                 raise ValueError("旧结果记录仍存在，稍后继续核对。")
-            await self.target.request("/data-acquisition/delete", method="POST",
-                                      body={"id": parent_id, "type": "task"}, write=True)
+            if parent:
+                await self.target.request("/data-acquisition/delete", method="POST",
+                                          body={"id": parent_id, "type": "task"}, write=True)
             if parent_id in await self.jobs.remote_parents(self.target_config):
                 raise ValueError("旧任务仍存在，稍后继续核对。")
             cleanup["complete"] = True
             checkpoint()
+
+    async def _stop_cleanup_task(self, parent, version, cleanup, checkpoint):
+        if not self.matches(parent, version, self.target_config['cameraId']):
+            raise ValueError('旧任务身份已变化，已阻止删除。')
+        if str(parent.get('taskStatus', '')).upper() in {'FIXED', 'ENDED'}:
+            return
+        cleanup['stopRequested'] = True
+        checkpoint()
+        await self.target.request('/data-acquisition/end-task', method='POST',
+                                  body={'taskId': version['taskId']}, write=True)
+        current = (await self.jobs.remote_parents(self.target_config)).get(version['taskId'])
+        if not current or not self.matches(current, version, self.target_config['cameraId']):
+            raise ValueError('任务停止后身份无法核对，已保留清理凭证。')
+        if str(current.get('taskStatus', '')).upper() not in {'FIXED', 'ENDED'}:
+            raise ValueError('更正任务仍在停止，稍后继续核对。')
+        cleanup['stopConfirmed'] = True
+        checkpoint()
 
     async def _delete_objects(self, cleanup, parent_id, persist=None):
         for result_id, reference in cleanup["objects"].items():

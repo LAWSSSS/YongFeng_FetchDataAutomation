@@ -3,22 +3,47 @@ import copy
 import time
 
 from .domain import now_iso
+from .file_leases import FileEnvironmentError
 from .videos import Conflict, TERMINAL
+
+RETRYABLE_CLEANUP_MESSAGES = {
+    '存储端未确认删除旧文件，稍后继续核对。',
+    '旧视频对象仍可访问，云端清理尚未完成。',
+    '旧任务仍存在，稍后继续核对。',
+    '旧结果记录仍存在，稍后继续核对。',
+    '更正任务仍存在，暂不能确认撤回完成。',
+    '更正任务仍在停止，稍后继续核对。',
+}
+
+
+def _previous_version(manager, row, version):
+    def available(candidate):
+        return (candidate and candidate.get('state') not in TERMINAL
+                and candidate.get('submissionOutcome') != 'rejected')
+
+    previous = manager.version(row, version.get('previousActiveRevision'))
+    if available(previous):
+        return previous
+    revision = version.get('revision', 0)
+    return next((candidate for candidate in reversed(row['versions'])
+                 if candidate['revision'] < revision and available(candidate)), None)
 
 
 def capability(manager, row):
     version = manager.version(row, row.get('activeRevision')) or {}
-    previous = manager.version(row, version.get('previousActiveRevision'))
-    if not previous or previous.get('state') in TERMINAL or previous.get('submissionOutcome') == 'rejected':
-        previous = next((v for v in reversed(row['versions']) if v['revision'] < version.get('revision', 0)
-                         and v['state'] not in TERMINAL and v.get('submissionOutcome') != 'rejected'), None)
-    reason = ('初次采集无需撤回。' if not version.get('revision') else
-              '此版已最终确认，请通过再次更正调整。' if version.get('finalConfirmation') or
-              row.get('acceptedRevision') == version.get('revision') or version.get('state') in {'saved','downloading','publishing'} else
-              '没有可恢复的上一版本。' if not previous else
-              '此版本已经撤回。' if version.get('state') in TERMINAL else '')
-    if row.get('deletion', {}).get('state') in {'pending','error'}:
+    if row.get('deletion', {}).get('state') in {'pending', 'error'}:
         reason = '记录正在清理。'
+    elif not version.get('revision'):
+        reason = '初次采集无需撤回。'
+    elif (version.get('finalConfirmation') or row.get('acceptedRevision') == version['revision']
+          or version.get('state') in {'saved', 'downloading', 'publishing'}):
+        reason = '此版已最终确认，请通过再次更正调整。'
+    elif not _previous_version(manager, row, version):
+        reason = '没有可恢复的上一版本。'
+    elif version.get('state') in TERMINAL:
+        reason = '此版本已经撤回。'
+    else:
+        reason = ''
     return {'canWithdraw': not bool(reason), 'withdrawReason': reason}
 
 
@@ -39,6 +64,10 @@ def current(manager, operation):
 
 async def execute(manager, operation):
     row, version = current(manager, operation)
+    # Fence older queued withdrawals too, before yielding to the platform.
+    if version['state'] != 'withdrawing':
+        version['state'] = 'withdrawing'
+        manager.store.save(row)
     if getattr(manager, 'control', None):
         await manager.control.take_over(row['id'], operation['id'], operation.get('mediaGeneration'))
     if version.get('writeAttempted') and not version.get('taskId') and version.get('submissionOutcome') != 'rejected':
@@ -63,14 +92,13 @@ async def execute(manager, operation):
         snapshot = copy.deepcopy(row)
         snapshot['_withdrawCheckpoint'] = operation['version']
         target = manager.version(snapshot, operation['version'])
+        protected = {v.get('taskId') for v in row['versions'] if v['revision'] != operation['version']}
         try:
-            await manager.cleanup_cloud(snapshot, target, protected={v.get('taskId') for v in row['versions'] if v['revision'] != operation['version']}, allow_incomplete=True)
+            await manager.cleanup_cloud(snapshot, target, protected=protected, allow_incomplete=True)
         except ValueError as error:
-            from .file_leases import FileEnvironmentError
-            pending = str(error) in {'存储端未确认删除旧文件，稍后继续核对。', '旧视频对象仍可访问，云端清理尚未完成。',
-                '旧任务仍存在，稍后继续核对。', '旧结果记录仍存在，稍后继续核对。', '更正任务仍存在，暂不能确认撤回完成。'}
-            if isinstance(error, FileEnvironmentError) or pending:
-                operation['cleanupChecks'] = operation.get('cleanupChecks', 0) + (0 if isinstance(error, FileEnvironmentError) else 1)
+            occupied = isinstance(error, FileEnvironmentError)
+            if occupied or str(error) in RETRYABLE_CLEANUP_MESSAGES:
+                operation['cleanupChecks'] = operation.get('cleanupChecks', 0) + (0 if occupied else 1)
                 if operation['cleanupChecks'] <= 2:
                     operation.update(state='reconciling', stage='waiting_cleanup', nextAttemptAt=time.time()+5,
                                      message='撤回已登记，等待占用释放或核对删除结果；上一版保留。')
@@ -79,18 +107,18 @@ async def execute(manager, operation):
             raise
     async with manager.row_lock(row['id']):
         row, version = current(manager, operation)
-        previous = manager.version(row, version.get('previousActiveRevision'))
-        if not previous or previous['state'] in TERMINAL or previous.get('submissionOutcome') == 'rejected':
-            previous = next(v for v in reversed(row['versions']) if v['revision'] < version['revision'] and v['state'] not in TERMINAL and v.get('submissionOutcome') != 'rejected')
+        previous = _previous_version(manager, row, version)
         version.update(state='withdrawn', withdrawnAt=now_iso())
         row['activeRevision'] = previous['revision']
         row['revision'] += 1
         row['requests'][operation['requestId']] = {'kind':'withdraw', 'version':version['revision']}
-        manager.store.save(row)
         operation.update(state='complete', stage='complete', resultRevision=row['revision'],
                          message='更正已撤回，已恢复上一有效版本。')
-        operation.pop('nextAttemptAt', None)
-        manager.store.save_operation(operation)
+        for field in ('nextAttemptAt', 'errorCode', 'failedStage', 'failureType', 'failureErrno'):
+            operation.pop(field, None)
+        with manager.store.db:
+            manager.store.save(row, commit=False)
+            manager.store.save_operation(operation, commit=False)
 
 
 def cleanup_checkpoint(manager, row, version):

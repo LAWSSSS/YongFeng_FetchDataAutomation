@@ -28,6 +28,10 @@ class FakePlatform:
         self.change_on_resume = False
         self.new_tasks_waiting = False
         self.lose_delete_response = ""
+        self.require_stopped_delete = False
+        self.restart_parent_after_result_delete = False
+        self.stop_calls = []
+        self.lose_stop_response = False
 
     @staticmethod
     def answer(data):
@@ -102,11 +106,28 @@ class FakePlatform:
                 self.fail_after_write = False
                 return httpx.Response(503)
             return self.answer(True)
+        if path.endswith('/data-acquisition/end-task'):
+            identity = json.loads(request.content)['taskId']
+            self.stop_calls.append(identity)
+            self.parents[identity]['taskStatus'] = 'ENDED'
+            if self.lose_stop_response:
+                self.lose_stop_response = False
+                return httpx.Response(503)
+            return self.answer(True)
         if path.endswith("/data-acquisition/delete"):
             payload = json.loads(request.content)
+            task_id = payload['id']
+            if payload['type'] == 'acInfo':
+                task_id = next((task for task, results in self.results.items()
+                                if any(result['id'] == payload['id'] for result in results)), '')
+            if (self.require_stopped_delete and task_id in self.parents
+                    and self.parents[task_id]['taskStatus'] not in {'FIXED', 'ENDED'}):
+                return httpx.Response(200, json={'code': 'DWB55-1002', 'message': 'Stop the task before deletion'})
             if payload["type"] == "acInfo":
                 for values in self.results.values():
                     values[:] = [row for row in values if row["id"] != payload["id"]]
+                if self.restart_parent_after_result_delete and task_id in self.parents:
+                    self.parents[task_id]['taskStatus'] = 'RUNNING'
             else:
                 self.parents.pop(payload["id"], None)
             if self.lose_delete_response == payload["type"]:

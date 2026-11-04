@@ -66,6 +66,7 @@ class FinalProcessing:
         blocked = bool(row.get('deletedAt') or row.get('deletion', {}).get('state') in {'pending', 'error'})
         current = self.current_operation(row, version) if version else None
         reason = ('记录正在清理。' if blocked else
+                  '本版正在撤回，上一有效版本保留。' if version.get('state') == 'withdrawing' else
                   '本版已清理，保留历史。' if version.get('localCleanupState') == 'complete' else
                   '请先启用视频工作区。' if not self.workspace.enabled else
                   '本版已确认；后台继续处理，暂停后请使用继续入口。' if current else
@@ -120,6 +121,8 @@ class FinalProcessing:
             raise Conflict('采集区间已有变化，请查看当前版本后确认。')
         self.videos.require_editable(row)
         version = self.videos.version(row, data['version'])
+        if version and version.get('state') == 'withdrawing':
+            raise Conflict('本版正在撤回，不能确认或下载。')
         allowed = {'ready'} if not legacy else {'ready', 'saved', 'failed', 'downloading', 'publishing'}
         if (not version or version.get('state') not in allowed
                 or (not legacy and (not version.get('taskId') or not version.get('resultId')))):

@@ -118,6 +118,21 @@ function VideoCard({video,onSelect,selected,onOpen,children}:{
   </article>;
 }
 
+function VideoPreview({ src, onPlay }: { src: string; onPlay: () => void }) {
+  const ref = useRef<HTMLVideoElement>(null);
+  useEffect(() => {
+    const player = ref.current;
+    if (!player) return;
+    if (player.getAttribute('src') !== src) player.setAttribute('src', src);
+    return () => {
+      player.pause();
+      player.removeAttribute('src');
+      player.load();
+    };
+  }, [src]);
+  return <video ref={ref} controls playsInline preload="metadata" src={src} onPlay={onPlay} />;
+}
+
 function VideoDetails({video,onRefresh,onRemoved,processing}:{
   video:Video;onRefresh:()=>Promise<void>;onRemoved:(id:string)=>void;processing:ProcessingGroup[];
 }){
@@ -155,6 +170,10 @@ function VideoDetails({video,onRefresh,onRemoved,processing}:{
   }, [video.activeRevision, video.revision]);
   // Polling revisions reflect progress too; only a different capture closes the player.
   useEffect(() => {setReviewed(false);setPlaying(null);}, [video.activeRevision]);
+  // A withdrawn version must release its stream so it cannot block its own cleanup.
+  useEffect(() => {
+    if (active.state === 'withdrawing') setPlaying(current => current === active.revision ? null : current);
+  }, [active.state, active.revision]);
   useEffect(() => {
     try {
       if (dirty) sessionStorage.setItem(draftKey, JSON.stringify({date,clock,minutes,revision:draftRevision,dirty:true}));
@@ -194,6 +213,7 @@ function VideoDetails({video,onRefresh,onRemoved,processing}:{
       if(!mounted.current)return true;
       setOperationNotice(result.operationId?'操作已登记，后台继续处理。':'操作已完成，正在更新状态。');
       if (path === 'corrections' || path === 'recapture') {setDirty(false);setPrepared(null);setDraftRevision(video.revision);}
+      if (path === 'withdraw') setPlaying(current => current === active.revision ? null : current);
       if (path === 'hide-record' && result.recordRemoval) {
         onRemoved(video.id);
         return true; // The parent clears the focus and refreshes the remaining records.
@@ -297,12 +317,12 @@ function VideoDetails({video,onRefresh,onRemoved,processing}:{
     {!clearing && hasMoreActions && <details className="more-video-actions"><summary>重试与版本操作</summary><div className="actions">
       {['attention','uncertain','waiting','failed'].includes(active.state) && <button className="secondary" disabled={busy || recoveryRunning} onClick={() => {void act('check', {expectedRevision:video.revision,requestId:uid()});}}>重新核对这一条</button>}
       {canRecapture && !recoveryRunning && <button disabled={busy||recapturing||withdrawing} onClick={()=>void recaptureCurrent()}>按当前区间重新采集</button>}
-      {canWithdraw && !recoveryRunning && <button className="secondary" disabled={busy} onClick={() => {void act('withdraw', {version: active.revision, expectedRevision: video.revision, requestId: uid()});}}>撤回本次更正</button>}
+      {canWithdraw && !recoveryRunning && <button className="secondary" disabled={busy} onClick={() => {void act('withdraw', {version: active.revision, expectedRevision: video.revision, requestId: uid()});}}>{active.state === 'withdrawing' ? '重试撤回' : '撤回本次更正'}</button>}
       {active.state === 'failed' && active.downloadRequested && !recoveryRunning && !recoveryPaused && !partialComplete(active) && <button disabled={busy} onClick={() => {void act('retry-download', {});}}>重试下载</button>}
       {recoveryOptions.canRestartDownload && (recoveryProofReady||partialComplete(active)||recoveryOptions.checkpointProblem) && <button className="secondary" disabled={busy || !video.capabilities?.canRestartDownload || recoveryRunning} title={video.capabilities?.restartDownloadReason} onClick={restartFullDownload}>重新下载完整文件</button>}
       {active.downloadRequested && !recoveryRunning && !recoveryPaused && <button className="secondary" disabled={busy || recoveryRunning} onClick={() => void act('cancel-download', {version:active.revision,expectedRevision:video.revision,requestId:uid()})}>停止本条下载，保留断点</button>}
     </div></details>}
-    {playingVersion && !clearing && <div className="player"><video controls playsInline preload="metadata" src={`/api/videos/${video.id}/versions/${playingVersion.revision}/stream`} onPlay={() => setReviewed(true)} />
+    {playingVersion && !clearing && <div className="player"><VideoPreview key={playingVersion.revision} src={`/api/videos/${video.id}/versions/${playingVersion.revision}/stream`} onPlay={() => setReviewed(true)} />
       <p className="subtle">正在查看第{playingVersion.revision+1}版：{playingVersion.startTime} → {playingVersion.endTime}</p>
       {playingVersion.state === 'attention' && <p className="notice">此视频仅供核对，异常解除后才能确认下载。</p>}
       {playing !== active.revision && versionDownloadable(playingVersion) && <p><button className="secondary" disabled={busy} onClick={()=>void act('history-download',{version:playingVersion.revision,expectedRevision:video.revision,requestId:uid()})}>保存第 {playingVersion.revision + 1} 版</button></p>}

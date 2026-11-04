@@ -10,6 +10,8 @@ def record_status(row):
     if partial_complete(active):
         return 'saved'
     operation = row.get('operation') or {}
+    if active['state'] == 'withdrawing':
+        return 'review' if operation.get('state') in {'attention', 'conflict'} else 'deleting'
     if (operation.get('kind') == 'recover-decodable'
             and operation.get('version') == row['activeRevision']
             and operation.get('expectedRevision') == row['revision']

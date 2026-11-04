@@ -9,11 +9,15 @@ import uvicorn
 
 from app.main import create_app
 from app.remote import RemoteClient
-from tests.test_simple_flow import FakePlatform, new_video, source_handler
+from tests.test_simple_flow import FakePlatform, new_video, source_handler, wait_video_operation
 
 
 def run():
     platform = FakePlatform()
+    exercise_withdrawal = os.environ.get('RECORD_UI_WITHDRAW') == '1'
+    platform.require_stopped_delete = exercise_withdrawal
+    platform.restart_parent_after_result_delete = exercise_withdrawal
+
     with tempfile.TemporaryDirectory(prefix='capture-history-ui-') as directory:
         root = Path(directory)
         source = RemoteClient('source', transport=httpx.MockTransport(source_handler))
@@ -28,7 +32,14 @@ def run():
             async with lifecycle(application):
                 async with httpx.AsyncClient(transport=httpx.ASGITransport(app=application),
                                              base_url='http://127.0.0.1') as client:
-                    await new_video(client, application)
+                    row = await new_video(client, application)
+                    if exercise_withdrawal:
+                        response = await client.post(f'/api/videos/{row["id"]}/corrections', json={
+                            'startTime': '2026-09-30 02:30:00', 'durationSeconds': 120,
+                            'expectedRevision': 0, 'requestId': 'withdrawal-ui-setup'})
+                        assert (await wait_video_operation(application, response))['state'] == 'complete'
+                        await application.state.videos.check_once()
+                        platform.lose_delete_response = 'acInfo'
                 runs = application.state.collection_runs
                 runs.start({'dateFrom': '2026-09-30', 'dateTo': '2026-09-30', 'requestId': 'ui-query'})
                 await runs.tick()
