@@ -1,4 +1,5 @@
 import {partialComplete,recoveryInProgress} from './video-recovery.ts';
+import {groupSubmissionDays} from './submission-dates.ts';
 
 export type InspectionRecord = {
   id: string; plate: string; checkStartTime: string; checkCompleteTime: string;
@@ -23,6 +24,22 @@ export const categoryLabels = {
   processing:'恢复处理中',
 };
 export type VideoCategory = keyof typeof categoryLabels;
+
+const captureStates:Record<string,string> = {
+  pending: '尚未提交采集', awaiting_confirmation: '等待确认采集', submitting: '正在提交采集',
+  submitted: '已提交采集', waiting: '等待平台结果', ready: '待确认', saved: '已保存',
+  downloading: '下载中', publishing: '正在保存', failed: '需处理', attention: '待核对',
+  uncertain: '待核对', withdrawn: '已撤回', replaced: '已替换', cloud_deleted: '旧版已清理',
+};
+
+export function captureStatusLabel(version:{state:string;taskId?:string;platformStatus?:string}) {
+  if (['pending','submitted','waiting'].includes(version.state) && version.taskId) {
+    if (version.platformStatus?.toUpperCase() === 'PENDING') return '平台排队中';
+    if (version.state === 'pending') return '等待平台结果';
+  }
+  return captureStates[version.state] || '状态待核对';
+}
+
 export const videoStatusOptions: {value: 'all' | VideoCategory; label: string}[] = [
   {value:'all',label:'全部记录'}, {value:'saved',label:categoryLabels.saved},
   {value:'ready',label:categoryLabels.ready}, {value:'download',label:categoryLabels.download},
@@ -116,4 +133,13 @@ export function batchDate(value?: string) {
     timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit',
     hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
   }).format(date);
+}
+
+/** A date owns one grid. Separate submissions must not force separate rows. */
+export function groupVideoDays<T extends BatchVideo>(videos:T[],jobs:CollectionJob[]) {
+  const datesByJob=new Map(jobs.map(job=>[job.id,job.createdAt]));
+  return groupSubmissionDays(videos,video=>video.submittedAt||datesByJob.get(video.jobId)).map(date=>({
+    ...date,
+    submissionCount:new Set(date.records.map(video=>video.jobId)).size,
+  }));
 }

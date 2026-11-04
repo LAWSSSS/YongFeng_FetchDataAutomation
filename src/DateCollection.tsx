@@ -6,18 +6,13 @@ import {requestIntents} from './request-intent';
 import AdmissionSettings from './AdmissionSettings';
 import {dateRangeDraft,readDraft,writeDraft} from './draft-storage';
 import {readInterval} from './view-preferences';
-import DateSection from './DateSection';
 import CollectionPlan from './CollectionPlan';
-import RecordDelete from './RecordDelete';
-import RecordBatch,{toggleRecord,reconcileRecordChoices} from './RecordBatch';
-import type {RecordChoice} from './RecordBatch';
-import {groupSubmissionDays,submissionTime} from './submission-dates';
 
 const defaults={timeFrom:'00:00:00',timeTo:'23:59:59',plates:''};
 const advanced=()=>{try{return {...defaults,...JSON.parse(localStorage.getItem('collection-filters')||'{}')};}catch{return defaults;}};
 const today=()=>new Date(Date.now()+8*3600000).toISOString().slice(0,10);
-type Run={id:string;revision:number;status:string;stage:string;message:string;filters:{dateFrom:string;dateTo:string};
-  scanned:number;total:number|null;counts:Record<string,number>;createdAt:string};
+type Run={id:string;revision:number;status:string;message:string;filters:{dateFrom:string;dateTo:string};
+  counts:Record<string,number>;createdAt:string;jobId?:string;planRevision?:number};
 const terminal=(state:string)=>['complete','attention','cancelled','awaiting_review'].includes(state);
 export function CollectionSettings(){
   const [filters,setFilters]=useState(advanced),[message,setMessage]=useState('');
@@ -39,44 +34,38 @@ export default function DateCollection({onVideos,onSettings}:{onVideos:()=>void;
   const {dateFrom,dateTo}=dates;
   const setDate=(key:'dateFrom'|'dateTo',value:string)=>{const next={...dates,[key]:value};writeDraft('collection-dates',next);setDates(next);};
   const [runs,setRuns]=useState<Run[]>([]);
-  const [reviewId,setReviewId]=useState('');
-  const autoOpened=useRef(new Set<string>());
-  const [page,setPage]=useState(1),[paging,setPaging]=useState({page:1,pages:1,total:0});
-  const [selected,setSelected]=useState<Map<string,RecordChoice>>(new Map());
-  const [busy,setBusy]=useState(false),[error,setError]=useState(''),[notice,setNotice]=useState('');
+  const [selectedRun,setSelectedRun]=useState('');
+  const [busy,setBusy]=useState(false),[error,setError]=useState('');
   const reads=useRef(createReadCycle()),intents=useRef(requestIntents()),locked=useRef(false);
-  const refresh=useCallback(async()=>{await reads.current.run(`collection-runs:${page}`,async context=>{
-    try{const value=await localJson<{runs:Run[];page:number;pages:number;total:number}>(`/api/collection-runs?page=${page}`,undefined,{signal:context.signal});
-      if(context.current()){setRuns(Array.isArray(value.runs)?value.runs:[]);setPaging({page:value.page||1,pages:value.pages||1,total:value.total||0});setError('');}}
+  const seenJobs=useRef(new Set<string>());
+  const refresh=useCallback(async()=>{await reads.current.run('current-collection-runs',async context=>{
+    try{const value=await localJson<{runs:Run[]}>('/api/collection-runs?currentOnly=true',undefined,{signal:context.signal});
+      if(!context.current())return;
+      setRuns(value.runs);
+      setError('');
+      const jobs=value.runs.flatMap(run=>run.jobId?[run.jobId]:[]);
+      const newJob=jobs.some(id=>!seenJobs.current.has(id));
+      jobs.forEach(id=>seenJobs.current.add(id));
+      if(newJob)window.dispatchEvent(new Event('collection-submissions-updated'));
+    }
     catch(failure){if(context.current()&&!cancelledRead(failure))setError((failure as Error).message);}
-  });},[page]);
+  });},[]);
   useRecordChanges(refresh);
-  useEffect(()=>{const ready=runs.find(run=>run.status==='awaiting_review'&&!autoOpened.current.has(run.id));
-    if(ready){autoOpened.current.add(ready.id);setReviewId(ready.id);}},[runs]);
   useEffect(()=>{void refresh();return()=>reads.current.cancel();},[refresh]);
-  useEffect(()=>{setSelected(previous=>reconcileRecordChoices(previous,runs.map(run=>({key:run.id,id:run.id,revision:run.revision,kind:'item'}))));},[runs]);
   const activeRuns=runs.filter(run=>!terminal(run.status));
-  usePolling(refresh,readInterval(activeRuns.some(run=>!['waiting_connection','waiting'].includes(run.status)),
-    activeRuns.length>0&&activeRuns.every(run=>run.status==='waiting_connection')),{immediate:false});
+  const current=runs.find(run=>run.id===selectedRun)||runs[0];
+  usePolling(refresh,activeRuns.length?readInterval(activeRuns.some(run=>!['waiting_connection','waiting'].includes(run.status)),
+    activeRuns.every(run=>run.status==='waiting_connection')):null,{immediate:false});
   async function start(){
-    if(locked.current)return;locked.current=true;setBusy(true);setError('');setNotice('');reads.current.cancel();
+    if(locked.current)return;locked.current=true;setBusy(true);setError('');reads.current.cancel();
     try{const value=await localJson<Run>('/api/collection-runs',intents.current.payload('collect',{filters:{...advanced(),dateFrom,dateTo}}));
-      intents.current.complete('collect');if(page===1)setRuns(before=>[value,...before.filter(row=>row.id!==value.id)]);else setPage(1);
-      setNotice('查询已登记。结果就绪后，请核对并确认采集计划。');}
+      intents.current.complete('collect');
+      reads.current.cancel();
+      setSelectedRun(value.id);
+      setRuns(before=>[value,...before.filter(row=>row.id!==value.id)]);}
     catch(failure){setError((failure as Error).message);}
     finally{locked.current=false;setBusy(false);}
   }
-  async function hide(choices:RecordChoice[],requestId:string){
-    if(locked.current)throw new Error('正在处理，请稍候。');
-    locked.current=true;setBusy(true);reads.current.cancel();
-    try{
-      await localJson<{recordRemoval:{removalId:string}}>('/api/collection-runs/records/remove',{
-        requestId,selections:choices.map(row=>({id:row.id,expectedRevision:row.revision}))});
-      const ids=new Set(choices.map(row=>row.id));setRuns(before=>before.filter(row=>!ids.has(row.id)));setSelected(new Map());
-      void refresh();
-    }finally{locked.current=false;setBusy(false);}
-  }
-  const pick=(run:Run):RecordChoice=>({key:run.id,id:run.id,revision:run.revision,kind:'item'});
   return <section className="panel date-collection" aria-label="日期采集表单">
     <form className="filters" onSubmit={e=>{e.preventDefault();void start();}}>
       <label>开始日期<input type="date" required value={dateFrom} onChange={e=>setDate('dateFrom',e.target.value)}/></label>
@@ -84,28 +73,12 @@ export default function DateCollection({onVideos,onSettings}:{onVideos:()=>void;
       <button disabled={busy}>{busy?'正在登记…':'查询待采集视频'}</button>
       <button type="button" className="link" onClick={onSettings}>采集设置</button>
     </form>
-    {error&&<p className="error" role="alert">{error}</p>}{notice&&<p className="success" role="status">{notice}</p>}
-    {!!activeRuns.length&&<div className="collection-active" role="status">{activeRuns.map(run=><p key={run.id}><strong>{run.filters.dateFrom} 至 {run.filters.dateTo}</strong>　{run.message}</p>)}</div>}
-    {reviewId&&<CollectionPlan key={reviewId} runId={reviewId} revision={runs.find(run=>run.id===reviewId)?.revision||0} onChanged={()=>void refresh()}/>}
-    {(runs.length>0||paging.total>0)&&<details className="collection-history"><summary>日期任务记录 · {paging.total||runs.length} 条</summary>
-    <RecordBatch selected={selected} disabled={busy} total={runs.length} scope="本页日期任务"
-      onSelectAll={()=>setSelected(new Map(runs.map(run=>[run.id,pick(run)])))} onClear={()=>setSelected(new Map())} onDelete={hide}/>
-    <div className="date-list collection-runs">{groupSubmissionDays(runs,run=>run.createdAt).map(day=><DateSection key={day.day} day={day.day}
-      rememberKey={`collection-runs:${day.day}`} summary={`${day.records.length} 个日期任务`}>
-      <div className="date-tools"><span>按提交日期管理</span><button className="secondary" disabled={busy} onClick={()=>setSelected(before=>{const next=new Map(before);day.records.forEach(run=>next.set(run.id,pick(run)));return next;})}>选择当天任务</button></div>
-      {day.records.map(run=><article key={run.id} className="collection-run-record">
-      <div className="dated-batch-heading"><div><label className="record-checkbox"><input type="checkbox" disabled={busy} aria-label={`选择日期任务 ${run.filters.dateFrom} 至 ${run.filters.dateTo}`}
-        checked={selected.has(run.id)} onChange={()=>setSelected(before=>toggleRecord(before,pick(run)))}/><strong>{run.filters.dateFrom} 至 {run.filters.dateTo}</strong></label><p>{submissionTime(run.createdAt)}</p></div>
-      <RecordDelete name={`${run.filters.dateFrom} 至 ${run.filters.dateTo} · 日期任务`} disabled={busy} version={run.revision} onDelete={id=>hide([pick(run)],id)}/></div>
-      <p>{run.message}</p>
-      <p>查询 {run.scanned}{run.total!==null?` / ${run.total}`:''} 条 · 已提交 {run.counts.submitted||0} 条 · 可查看 {run.counts.ready||0} 条 · 重复 {run.counts.duplicate||0} 条</p>
-      {run.status==='awaiting_review'&&<button className="secondary" onClick={()=>setReviewId(run.id)}>核对采集计划</button>}
-      {!!run.counts.ready&&<button className="secondary" onClick={onVideos}>查看并确认视频</button>}
-      </article>)}
-    </DateSection>)}</div>
-    {paging.pages>1&&<nav className="submission-pagination" aria-label="日期任务分页"><span>第 {paging.page}/{paging.pages} 页</span><div>
-      <button className="secondary" disabled={busy||paging.page<=1} onClick={()=>{setSelected(new Map());setPage(paging.page-1);}}>上一页</button>
-      <button className="secondary" disabled={busy||paging.page>=paging.pages} onClick={()=>{setSelected(new Map());setPage(paging.page+1);}}>下一页</button>
-    </div></nav>}</details>}
+    {error&&<p className="error" role="alert">{error}</p>}
+    {current&&(!terminal(current.status)||current.status==='attention')&&
+      <p className="collection-status" role="status">{current.message||'正在查询质检记录…'}</p>}
+    {current?.status==='complete'&&!!current.counts.ready&&
+      <button className="link collection-result-link" onClick={onVideos}>查看已采集视频</button>}
+    {current?.planRevision!==undefined&&(!terminal(current.status)||current.status==='awaiting_review'||current.status==='attention'||current.counts.duplicate>0)&&
+      <CollectionPlan key={current.id} runId={current.id} revision={current.revision} queryDates={current.filters} onChanged={()=>{reads.current.cancel();void refresh();}}/>}
   </section>;
 }

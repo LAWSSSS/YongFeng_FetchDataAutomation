@@ -204,7 +204,7 @@ def build_tasks(records: list[dict], rule: CollectionRule, target: dict, existin
         status = "invalid" if reason else "duplicate" if key in seen else "ready"
         duplicate_source = "local" if key in existing_keys else "selection"
         if status == "duplicate":
-            reason = ("本地记录已登记相同相机和采集时段，请在执行记录核对原站状态"
+            reason = ("本条已有采集，可打开已有视频查看或按当前区间重新采集"
                       if duplicate_source == "local" else "本次选择包含相同相机和采集时段，仅创建一次")
         if status == "ready":
             seen.add(key)

@@ -1,4 +1,5 @@
 #import <Cocoa/Cocoa.h>
+#include <string.h>
 
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
@@ -6,7 +7,8 @@ int main(int argc, const char *argv[]) {
         NSString *resources = [bundle resourcePath];
         NSTask *task = [[NSTask alloc] init];
         task.executableURL = [NSURL fileURLWithPath:[resources stringByAppendingPathComponent:@"runtime/backend/bin/python3.13"]];
-        task.arguments = @[@"-I", @"-B", [resources stringByAppendingPathComponent:@"application/launcher.py"], @"launch"];
+        BOOL stopping = argc > 1 && strcmp(argv[1], "stop") == 0;
+        task.arguments = @[@"-I", @"-B", [resources stringByAppendingPathComponent:@"application/launcher.py"], stopping ? @"stop" : @"launch"];
         NSMutableDictionary *environment = [[[NSProcessInfo processInfo] environment] mutableCopy];
         for (NSString *key in [environment.allKeys copy]) {
             if ([key hasPrefix:@"PYTHON"] || [key hasPrefix:@"DYLD_"] || [key hasPrefix:@"LD_"]) [environment removeObjectForKey:key];
@@ -22,7 +24,7 @@ int main(int argc, const char *argv[]) {
             NSString *message = started ? [[NSString alloc] initWithData:[[errors fileHandleForReading] readDataToEndOfFile] encoding:NSUTF8StringEncoding] : @"无法打开内置运行环境，请重新解压完整文件夹。";
             [NSApplication sharedApplication];
             NSAlert *alert = [[NSAlert alloc] init];
-            alert.messageText = @"采集助手暂未启动";
+            alert.messageText = stopping ? @"采集助手暂未停止" : @"采集助手暂未启动";
             alert.informativeText = message.length ? message : @"请检查独立数据目录中的启动日志。";
             [alert addButtonWithTitle:@"知道了"];
             [alert runModal];

@@ -4,7 +4,8 @@ import hashlib
 import json
 from datetime import timedelta
 
-from .domain import format_time, now_iso, parse_time, task_key
+from .capture_history import matching_receipts, same_target, target_of
+from .domain import TARGET_URL, format_time, now_iso, parse_time, task_key
 from .videos import Conflict
 
 
@@ -32,16 +33,139 @@ class CollectionReview:
             raise Conflict('质检尚未查询完成。')
         new = 'reviewTasks' not in row
         tasks = self.ensure(row)
-        if new:
+        if self.refresh_historical_duplicates(row) or new:
             self.manager._save(row)
         selected = [task for task in tasks if category == 'all' or
                     (task['status'] == 'ready' if category == 'ready' else task['status'] != 'ready')]
         pages = max(1, (len(selected) + 19) // 20)
         page = min(max(1, page), pages)
+        visible = copy.deepcopy(selected[(page-1)*20:page*20])
+        job_results = {job['id']: {str(t.get('recordId')): t for t in job['items']}
+                       for job in self.manager.store.list() if job['id'] in row.get('jobIds', [])}
+        linked = {}
+        for video in self.manager.videos.store.list():
+            if video.get('duplicateOfVideoId'):
+                continue
+            if same_target(target_of(self.manager.store, video), row['target']):
+                linked.setdefault(str(video.get('recordId')), []).append(video['id'])
+        for task in visible:
+            actual = job_results.get(task.get('jobId') or row.get('jobId'), {}).get(str(task['recordId']))
+            if actual and actual['status'] in {'submitted', 'duplicate', 'failed', 'uncertain'} and task['status'] != 'ready':
+                task.update(status=actual['status'], reason=actual.get('message', ''))
+                if actual['status'] == 'duplicate':
+                    task.update(duplicateSource=actual.get('duplicateSource'), existingTaskId=actual.get('remoteId'))
+            matches = linked.get(str(task['recordId']), [])
+            if len(matches) == 1 and task['status'] != 'invalid':
+                task['existingVideoId'] = matches[0]
+                if task['status'] == 'duplicate' and task.get('duplicateSource') == 'local':
+                    task['reason'] = '本条已有采集，可打开已有视频查看或按当前区间重新采集。'
+            elif not matches and task['status'] in {'ready', 'duplicate'}:
+                receipts = self.old_receipts(row, task)
+                if len({receipt['videoId'] for receipt in receipts}) == 1:
+                    task['canRecaptureArchived'] = True
         return {'runId': identity, 'planRevision': row['planRevision'],
-                'tasks': copy.deepcopy(selected[(page-1)*20:page*20]), 'total': len(selected),
+                'tasks': visible, 'total': len(selected),
                 'page': page, 'pages': pages, 'readyIds': [t['recordId'] for t in tasks if t['status'] == 'ready'],
-                'pendingSubmission': row.get('pendingSubmissionId', '')}
+                'pendingSubmission': row.get('pendingSubmissionId', ''), 'platformUrl': TARGET_URL}
+
+    def refresh_historical_duplicates(self, row):
+        if not row.get('reviewTasks') or row.get('pendingSubmissionId'):
+            return False
+        candidates = [task for task in row['reviewTasks']
+                      if task['status'] == 'duplicate' and task.get('duplicateSource') == 'local']
+        if not candidates:
+            return False
+        keys = self.manager.store.known_keys(include_retired=False)
+        records = self.manager.store.known_records(row['target'])
+        changed = False
+        for task in candidates:
+            if task['key'] not in keys and str(task['recordId']) not in records:
+                task['status'] = 'ready'
+                task.pop('reason', None)
+                task.pop('duplicateSource', None)
+                changed = True
+        if changed:
+            row['planRevision'] += 1
+            row['counts']['duplicate'] = sum(task['status'] == 'duplicate' for task in row['reviewTasks'])
+            if row['status'] == 'complete':
+                row.update(status='awaiting_review', stage='review', message='旧采集记录已重新核对，请确认要采集的条目。')
+        return changed
+
+    def old_receipts(self, row, task):
+        return matching_receipts(self.db, task['recordId'], row['target'], task['startTime'], task['endTime'])
+
+    async def recapture(self, identity, data):
+        from .domain import approval_issue
+        videos = self.manager.videos
+        request_id = hashlib.sha256(('archived-recapture:' + identity + ':' + data['requestId']).encode()).hexdigest()
+        source = {'runId': identity, 'recordId': data['recordId'], 'planRevision': data['expectedPlanRevision']}
+        existing = next((entry for entry in videos.store.list_operations()
+                         if entry.get('requestId') == request_id and entry.get('kind') == 'recapture'), None)
+        if existing:
+            if existing['payload'].get('collectionSource') != source:
+                raise Conflict('请求编号已用于其他采集计划。')
+            return await videos.recapture_unavailable(existing['videoId'], {
+                'version': existing['version'], 'expectedRevision': existing['expectedRevision'],
+                'requestId': request_id, 'mode': 'force', 'collectionSource': source})
+        row = self.manager.get(identity)
+        if not row or identity in self.manager.visibility.hidden() or not row.get('queryComplete'):
+            raise ValueError('请先查询并核对采集计划。')
+        task = next((task for task in row.get('reviewTasks', []) if task['recordId'] == data['recordId']), None)
+        if not task or task['status'] not in {'ready', 'duplicate'}:
+            raise Conflict('该条采集计划不可重采，请刷新后核对。')
+        receipts = self.old_receipts(row, task)
+        if len({receipt['videoId'] for receipt in receipts}) != 1:
+            raise Conflict('找不到唯一归属于本条实绩的旧任务。')
+        newest = receipts[-1]
+        video_id = newest['videoId']
+        if (row['planRevision'] != data['expectedPlanRevision'] or row.get('pendingSubmissionId')
+                or row['admissionRevision'] != self.manager.admission_settings.state()['revision']):
+            raise Conflict('采集计划或准入条件已变化，请刷新后重新核对。')
+        if issue := approval_issue(task, row['admissionRule']):
+            raise ValueError('质检实绩未通过采集准入：' + issue)
+        existing_video = videos.store.get(video_id)
+        if existing_video:
+            if (str(existing_video.get('recordId')) != str(task['recordId'])
+                    or not same_target(target_of(self.manager.store, existing_video), row['target'])):
+                raise Conflict('现有视频与旧任务凭证不一致，请先核对。')
+            if existing_video.get('deletedAt'):
+                raise Conflict('旧记录已删除，请从日期查询发起新的采集。')
+            if existing_video.get('activeRevision') != newest['version']['revision']:
+                raise Conflict('已有更新的采集版本，请在“视频确认”打开该条记录。')
+        else:
+            # Verify the receipt before making the archived lineage visible.
+            # The queued operation repeats this check under the submission lock.
+            versions = [{**receipt['version'], 'state': 'submitted', 'restoredFromArchive': True} for receipt in receipts]
+            active = versions[-1]
+            existing_video = {'id': video_id, 'jobId': newest['jobId'], 'recordId': task['recordId'],
+                              'taskKey': task['key'], 'name': active['name'], 'plate': task['plate'],
+                              'qualityStart': task['checkStartTime'], 'qualityEnd': task['checkCompleteTime'],
+                              'photoCount': task['photoCount'], 'inspectionDurationSeconds': task['inspectionDurationSeconds'],
+                              'admissionRule': row['admissionRule'], 'submissionTarget': newest['target'],
+                              'createdAt': now_iso(), 'submittedAt': now_iso(), 'revision': active['revision'],
+                              'activeRevision': active['revision'], 'acceptedRevision': None, 'versions': versions,
+                              'requests': {}, 'error': ''}
+            if not same_target(newest['target'], videos.target_config):
+                raise Conflict('旧任务所属的采集节点与当前配置不同。')
+            validator = getattr(videos, 'validate_capture_interval', None)
+            if validator:
+                validator(active['startTime'], active['durationSeconds'])
+            parents = await videos.remote_parents_cached(fresh=True)
+            videos.verify_forced_interval(existing_video, active, parents)
+            await videos._check_row(existing_video, parents)
+            current_plan = self.manager.get(identity)
+            if (not current_plan or current_plan['planRevision'] != data['expectedPlanRevision']
+                    or current_plan.get('pendingSubmissionId')
+                    or row['admissionRevision'] != self.manager.admission_settings.state()['revision']):
+                raise Conflict('核对期间采集计划或准入条件已变化，请刷新。')
+            if videos.store.get(video_id):
+                raise Conflict('旧记录已由其他操作打开，请刷新。')
+            if not videos.can_force_recapture(existing_video, active):
+                raise Conflict('旧版本尚未通过平台核对。')
+            videos.store.save(existing_video)
+        return await videos.recapture_unavailable(video_id, {
+            'version': existing_video['activeRevision'], 'expectedRevision': existing_video['revision'],
+            'requestId': request_id, 'mode': 'force', 'collectionSource': source})
 
     def edit(self, identity, data):
         row = self.manager.get(identity)
@@ -153,6 +277,8 @@ class CollectionReview:
             if task['recordId'] in results:
                 actual = results[task['recordId']]
                 task.update(status=actual['status'], reason=actual.get('message', ''), jobId=job['id'])
+                if actual['status'] == 'duplicate':
+                    task.update(duplicateSource=actual.get('duplicateSource'), existingTaskId=actual.get('remoteId'))
         operation.update(state='attention' if row['status'] == 'attention' else 'complete',
                          message=row['message'], jobId=job['id'],
                          results=[{k:t.get(k) for k in ('recordId', 'status', 'message', 'remoteId')} for t in job['items']])
@@ -167,12 +293,10 @@ class CollectionReview:
     def aggregate_counts(self, row):
         ids = set(row.get('jobIds', []))
         jobs = [self.manager.store.get(identity) for identity in ids]
-        submitted = sum(t.get('status') == 'submitted' for job in jobs if job for t in job.get('items', []))
-        versions = [video['versions'][0] for video in self.manager.videos.store.list() if video.get('jobId') in ids]
-        ready = sum(bool(v.get('resultId')) for v in versions)
-        attention = sum(v.get('state') in {'attention','failed'} and not v.get('resultId') for v in versions)
-        row['counts'].update(submitted=submitted, ready=ready, attention=attention, waiting=max(0,submitted-ready-attention),
-                             duplicate=sum(t['status']=='duplicate' for t in row['reviewTasks']))
+        progress = [self.manager.videos.job_progress(job) for job in jobs if job]
+        row['counts'].update({key: sum(p[key] for p in progress)
+                              for key in ('submitted', 'reused', 'ready', 'attention', 'waiting')})
+        row['counts']['duplicate'] = sum(t['status']=='duplicate' for t in row['reviewTasks'])
 
     def finish_empty(self, row, tasks):
         operation = self.operation(row.get('pendingSubmissionId', ''))

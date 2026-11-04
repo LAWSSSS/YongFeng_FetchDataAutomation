@@ -17,22 +17,18 @@
 
 .batch-entry{display:flex;justify-content:flex-end;margin:0 0 16px}
 .batch-entry button{min-height:44px}
-.panel:not(:has([data-selecting="true"])) .record-checkbox input,
-.panel:not(:has([data-selecting="true"])) .date-tools>button{display:none}
-.panel:not(:has([data-selecting="true"])) .record-checkbox:has(input):not(:has(strong)){display:none}
+[data-selection-scope]:not(:has([data-selecting="true"])) .record-checkbox input,
+[data-selection-scope]:not(:has([data-selecting="true"])) .date-tools>button{display:none}
+[data-selection-scope]:not(:has([data-selecting="true"])) .record-checkbox:has(input):not(:has(strong)){display:none}
 .record-batch-management[data-selecting="true"]{background:var(--surface-muted,#f1f6f0);margin:0 0 16px}
 .storage-summary{display:flex;align-items:center;gap:8px;flex-wrap:wrap;color:#526858}
 .status-dot{width:7px;height:7px;border-radius:50%;background:#a98753;flex:none}.status-dot.online{background:#4c7a58}
 .pipeline-counts{margin:8px 0 0;color:#526858;font-variant-numeric:tabular-nums}
 .workspace-panel h2{display:flex;align-items:center;gap:8px}
 
-main:not(:has([data-selecting="true"])) .record-checkbox input{display:none}
-main:not(:has([data-selecting="true"])) .record-checkbox:not(:has(strong)){display:none}
 .video-card-details>summary{min-height:44px;display:flex;align-items:center;color:#315c45;font-weight:600;cursor:pointer;gap:8px}
 .video-card-details>summary::before{content:'›';font-size:20px;transition:transform .15s}
 .video-card-details[open]>summary::before{transform:rotate(90deg)}
 .video-card-details[open]>summary{border-bottom:1px solid #dce5dd;margin-bottom:12px}
 .record-time{color:#526858;font-variant-numeric:tabular-nums;margin:8px 0}
-main:not(:has([data-selecting="true"])) .record-pick>input{display:none}
-main:has([data-selecting="true"]) .record-pick>input{display:block}
 .slice-history:not(:has([data-selecting="true"])) .slice-history-day>.actions>button{display:none}

@@ -45,11 +45,21 @@ class JobStore:
     def list(self) -> list[dict]:
         return [json.loads(row[0]) for row in self.db.execute("SELECT payload FROM jobs ORDER BY created_at DESC")]
 
-    def known_keys(self, exclude_job: str = "") -> set[str]:
+    def known_keys(self, exclude_job: str = "", *, include_retired=True) -> set[str]:
         retired = ({row[0] for row in self.db.execute('SELECT key FROM retired_task_keys')}
-                   if self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='retired_task_keys'").fetchone() else set())
+                   if include_retired and self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='retired_task_keys'").fetchone() else set())
+        statuses = {"submitted", "uncertain", "submitting"}
+        if include_retired:
+            statuses.add("duplicate")
         return retired | {item["key"] for job in self.list() if job["id"] != exclude_job for item in job["items"]
-                if item["status"] in ("submitted", "duplicate", "uncertain", "submitting")}
+                          if item["status"] in statuses or (item["status"] == "duplicate" and item.get("bindingVerified"))}
+
+    def known_records(self, target):
+        from .capture_history import same_target
+        return {str(item["recordId"]) for job in self.list() if same_target(job.get("target"), target)
+                for item in job["items"] if item.get("recordId")
+                and (item["status"] in {"submitted", "pending", "uncertain", "submitting"}
+                     or (item["status"] == "duplicate" and item.get("bindingVerified")))}
 
     def remove_history(self, job_id: str):
         job = self.get(job_id)

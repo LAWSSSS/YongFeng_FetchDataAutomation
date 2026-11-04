@@ -52,8 +52,7 @@ def main():
         if sha(source) != entry["sha256"]:
             raise ValueError(f'Corresponding source checksum mismatch: {entry["archive"]}')
         shutil.copy2(source, args.output / source.name)
-    shutil.copy2(ROOT / "docs/releasing.md", args.output / "BUILD.md")
-    shutil.copy2(ROOT / "docs/third-party.md", args.output / "THIRD-PARTY.md")
+    shutil.copy2(ROOT / "README.md", args.output / "README.md")
     shutil.copy2(ROOT / "packaging.lock.json", args.output / "packaging.lock.json")
     paths = sorted(path for path in args.output.iterdir() if path.is_file())
     for path in paths:

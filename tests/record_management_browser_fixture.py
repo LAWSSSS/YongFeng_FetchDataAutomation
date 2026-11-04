@@ -67,6 +67,14 @@ def run():
                                   'state': 'complete', 'message': '示例批次已结束。'})
         slices.store.settings['latestRunId'] = 'fixture-run'
         slices.store.save_settings()
+        hidden_video = None
+        if os.environ.get('RECORD_UI_HIDDEN'):
+            hidden_video = next(row for row in app.state.videos.store.list() if row['name'] == fixture_names[0])
+            hidden_video['versions'][0]['state'] = 'waiting'
+            hidden_video['acceptedRevision'] = None
+            app.state.videos.store.save(hidden_video)
+            app.state.videos.record_visibility.hide(app.state.videos.store, 'fixture-hide',
+                [{'id':hidden_video['id'],'expectedRevision':hidden_video['revision']}])
         if os.environ.get('RECORD_UI_PARTIAL'):
             from tests.test_archive_completion import seed
             partial = root / 'partial'
@@ -109,7 +117,9 @@ def run():
         @app.get('/phone', response_class=HTMLResponse)
         async def phone():
             return '<!doctype html><html lang="zh"><title>390px 记录操作检查</title><body style="margin:0;background:#ddd"><iframe title="窄屏记录" src="/" style="display:block;border:0;width:390px;height:900px;margin:auto"></iframe></body></html>'
-        print(json.dumps({'fixtureDirectory': str(root)}, ensure_ascii=False), flush=True)
+        print(json.dumps({'fixtureDirectory': str(root),
+                          'hiddenVideoUrl': f"http://127.0.0.1:8795/?tab=videos&videoId={hidden_video['id']}" if hidden_video else None},
+                         ensure_ascii=False), flush=True)
         uvicorn.run(app, host='127.0.0.1', port=8795, access_log=False)
 
 

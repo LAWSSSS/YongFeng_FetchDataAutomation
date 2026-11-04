@@ -109,6 +109,18 @@ class VersionActionInput(BaseModel):
     waitForCompletion: bool = False
 
 
+class RecaptureInput(VersionActionInput):
+    mode: Literal["repair", "force"] = "repair"
+
+
+class CollectionRecaptureInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    recordId: str = Field(min_length=1, max_length=256)
+    expectedPlanRevision: int = Field(ge=0, strict=True)
+    requestId: str = Field(pattern=r"^[A-Za-z0-9_-]{1,100}$")
+
+
 class DirectoryInput(BaseModel):
     directory: str = Field(min_length=1, max_length=2000)
 

@@ -14,7 +14,7 @@ import DateCollection,{CollectionSettings} from './DateCollection';
 import { correctionInterval, correctionReviewCurrent, prepareCorrection } from './corrections';
 import type { PreparedCorrection } from './corrections';
 import { VideoBatches, VideoStatusFilters } from './RecordGroups';
-import { canDownload as canConfirmFinal, syncVideoSelection, visibleVideoSelections } from './record-groups';
+import { canDownload as canConfirmFinal, captureStatusLabel, syncVideoSelection, visibleVideoSelections } from './record-groups';
 import RecordSelection from './RecordSelection';
 import './compact-controls.css';
 import SubmissionRecords from './SubmissionRecords';
@@ -53,7 +53,7 @@ type Video = {id: string; jobId: string; submittedAt?:string; plate: string; nam
   finalProcessing?:{operationId:string;state:string;stage:string;message:string;manualPaused?:boolean;successfulSamples?:number;skippedSamples?:number;endReason?:string;
     stageLabel?:string;terminal?:boolean;progress?:{done:number;total:number;unit:string}|null;
     issue?:{code:string;stage?:string;message:string}|null;environmentBlocker?:{code:string;message:string}|null};
-  capabilities?:{version:number;expectedRevision:number;canConfirmFinal:boolean;confirmFinalReason?:string;canRestartDownload?:boolean;restartDownloadReason?:string;canContinueProcessing?:boolean;canWithdraw?:boolean;withdrawReason?:string};
+  capabilities?:{version:number;expectedRevision:number;canConfirmFinal:boolean;confirmFinalReason?:string;canRestartDownload?:boolean;restartDownloadReason?:string;canContinueProcessing?:boolean;canWithdraw?:boolean;withdrawReason?:string;canForceRecapture?:boolean};
   cleanupPending?: boolean; error?: string;
   deletion?: {state: string; message: string; requestId: string; expectedRevision: number; deleteCloud: boolean; deleteLocalFiles: boolean}};
 type VideoState = {videos: Video[]; directory: string; lastCheck: string; checkError: string;
@@ -99,29 +99,28 @@ function Login({service, connected, user, savedAccount = '', hasSavedCredentials
 }
 
 
-type VideoCardProps = {onOpen?:()=>void;children?:ReactNode;video: Video; onRefresh: () => Promise<void>; selected?: boolean; onSelect?: () => void; processing:ProcessingGroup[];recordHidden?:boolean;
-  onRemoved:(removalId:string)=>void};
-
-function VideoCard(props:VideoCardProps){
-  const {video,onSelect,selected,onOpen,children}=props;
+function VideoCard({video,onSelect,selected,onOpen,children}:{
+  video:Video;onSelect?:()=>void;selected?:boolean;onOpen:()=>void;children?:ReactNode;
+}){
   const trigger=useRef<HTMLButtonElement>(null);
   const expanded=!!children;
   const active=video.versions.find(v=>v.revision===video.activeRevision)!;
   const clearing=['pending','error'].includes(video.deletion?.state||'');
-  const label=video.finalProcessing?.stageLabel||(partialComplete(active)?'可用部分已保存':video.finalProcessing?.state==='complete'?'处理完成':
-    ({ready:'待确认',saved:'已保存',waiting:'等待平台结果',submitted:'已提交',uncertain:'待核对',downloading:'下载中',publishing:'正在保存',failed:'需处理',attention:'待核对',submitting:'提交中'} as Record<string,string>)[active.state]||active.state);
+  const label=video.finalProcessing?.stageLabel||(partialComplete(active)?'可用部分已保存':video.finalProcessing?.state==='complete'?'处理完成':captureStatusLabel(active));
   const progress=video.finalProcessing?.terminal?null:video.finalProcessing?.progress;
   return <article className={`video-card${expanded?' is-expanded':''}`} id={`video-${video.id}`}>
     <div className="video-head"><label className="record-pick">{onSelect&&<input type="checkbox" aria-label={`选择采集记录 ${video.name} ${video.qualityStart}`} checked={selected} disabled={clearing} onChange={onSelect}/>}<h3>{video.name}</h3></label><span className={`badge ${video.finalProcessing?.state||active.state}`}>{label}</span></div>
     <p className="record-time">{active.startTime}<br/>至 {active.endTime}</p><p className="subtle">{duration(active.durationSeconds)} · 第{active.revision+1}版</p>
     {progress&&<div className="pipeline-progress"><progress aria-label={`${video.name} ${label}`} value={progress.done} max={progress.total}/><small>{progress.unit==='bytes'?transferProgress(progress.done,progress.total):`${progress.done}/${progress.total} ${progress.unit}`}</small></div>}
     <button ref={trigger} className="secondary video-open-detail" aria-expanded={expanded}
-      aria-controls={`video-details-${video.id}`} onClick={()=>{onOpen?.();if(expanded)trigger.current?.focus({preventScroll:true});}}>{expanded?'收起详情':'查看与更正'}</button>
+      aria-controls={`video-details-${video.id}`} onClick={()=>{onOpen();if(expanded)trigger.current?.focus({preventScroll:true});}}>{expanded?'收起详情':'查看与更正'}</button>
     {children&&<div id={`video-details-${video.id}`} className="inline-video-details">{children}</div>}
   </article>;
 }
 
-function VideoDetails({video,onRefresh,onRemoved,processing,recordHidden=false}:VideoCardProps){
+function VideoDetails({video,onRefresh,onRemoved,processing}:{
+  video:Video;onRefresh:()=>Promise<void>;onRemoved:(id:string)=>void;processing:ProcessingGroup[];
+}){
   const active = video.versions.find(version => version.revision === video.activeRevision)!;
   const draftKey = `correction-draft:${video.id}`;
   const [initialDraft] = useState(() => {
@@ -140,6 +139,7 @@ function VideoDetails({video,onRefresh,onRemoved,processing,recordHidden=false}:
   const [dirty, setDirty] = useState(initialDraft.dirty);
   const [prepared, setPrepared] = useState<PreparedCorrection | null>(null);
   const restartRequest = useRef<{version:number;expectedRevision:number;requestId:string}|null>(null);
+  const recaptureIntent = useRef(requestIntents());
   const operationLocked = useRef(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
@@ -178,7 +178,9 @@ function VideoDetails({video,onRefresh,onRemoved,processing,recordHidden=false}:
     && (!active.downloadRequested || active.state === 'failed' || !!video.finalProcessing) && (!active.writeAttempted || !!active.taskId || active.submissionOutcome==='rejected') && !clearing && (!recoveryRunning || !!video.finalProcessing);
   const withdrawing=video.operation?.kind==='withdraw'&&['queued','running','reconciling','waiting_connection'].includes(video.operation.state);
   const canWithdraw=video.capabilities?.canWithdraw===true&&!withdrawing;
-  const hasMoreActions=['attention','uncertain','waiting','failed'].includes(active.state)||canWithdraw||recoveryOptions.canRestartDownload||active.downloadRequested;
+  const recapturing=video.operation?.kind==='recapture'&&['queued','running','reconciling','waiting_connection'].includes(video.operation.state);
+  const canRecapture=video.capabilities?.canForceRecapture||recoveryOptions.canRecapture;
+  const hasMoreActions=['attention','uncertain','waiting','failed'].includes(active.state)||canWithdraw||recoveryOptions.canRestartDownload||active.downloadRequested||canRecapture;
   const staleDraft = draftRevision !== video.revision;
   const playable = video.versions.filter(v => v.taskId && v.resultId && ['ready','saved','failed','publishing','attention'].includes(v.state)
     && !['result_missing','result_identity_changed','multiple_results'].includes(v.review?.code || ''));
@@ -192,7 +194,10 @@ function VideoDetails({video,onRefresh,onRemoved,processing,recordHidden=false}:
       if(!mounted.current)return true;
       setOperationNotice(result.operationId?'操作已登记，后台继续处理。':'操作已完成，正在更新状态。');
       if (path === 'corrections' || path === 'recapture') {setDirty(false);setPrepared(null);setDraftRevision(video.revision);}
-      if (path === 'hide-record' && result.recordRemoval) onRemoved(result.recordRemoval.removalId);
+      if (path === 'hide-record' && result.recordRemoval) {
+        onRemoved(video.id);
+        return true; // The parent clears the focus and refreshes the remaining records.
+      }
       void onRefresh().catch(()=>{if(mounted.current)setOperationNotice('操作已登记，等待状态更新。');});
       return true;
     }
@@ -229,23 +234,33 @@ function VideoDetails({video,onRefresh,onRemoved,processing,recordHidden=false}:
     }
     void act('restart-download', restartRequest.current);
   }
+  async function recaptureCurrent() {
+    if (!window.confirm(`按当前区间重新采集：${active.startTime} → ${active.endTime}。旧版本保留，是否提交？`)) return;
+    const payload = recaptureIntent.current.payload('recapture', {
+      version: active.revision, expectedRevision: video.revision,
+      ...(video.capabilities?.canForceRecapture ? {mode: 'force'} : {}),
+    });
+    if (await act('recapture', payload)) recaptureIntent.current.complete('recapture');
+  }
   const saved = video.versions.find(version => version.revision === video.acceptedRevision);
   const historical = video.versions.filter(version => version.revision !== active.revision && version.state !== 'withdrawn');
   const renderVersion = (version: Version) => <div key={version.revision} className="version-entry"><div className={version.revision === active.revision ? 'version current' : 'version'}>
     <span>第 {version.revision + 1} 版{version.revision === 0 ? ' · 初采' : ' · 手动更正'}</span>
     <strong>{version.startTime} → {version.endTime}</strong><span>{duration(version.durationSeconds)}</span>
-    <span>{partialComplete(version)?'原片不完整 · 可用部分已保存':version.state === 'cloud_deleted' ? '旧版已清理' : version.platformStatus || version.state}</span>
+    <span>{partialComplete(version)?'原片不完整 · 可用部分已保存':captureStatusLabel(version)}</span>
     </div>{version.revision !== active.revision && <div className="version-actions">
       {version.historyDownload?.state==='complete'?<span className="success">已保存历史版本</span>:version.historyDownload&&['queued','running','waiting'].includes(version.historyDownload.state)?<span role="status">{version.historyDownload.message||'正在保存历史版本…'}</span>:versionDownloadable(version) && !clearing ? <button className="secondary" disabled={busy} onClick={()=>void act('history-download',{version:version.revision,expectedRevision:video.revision,requestId:uid()})}>保存第 {version.revision + 1} 版</button>
         : <span className="subtle">{version.state === 'cloud_deleted' ? '此版已清理，无法下载' : '此版结果未确认，暂不能下载'}</span>}
     </div>}</div>;
   return <section className="video-details-body">
     <p className="subtle">原始质检：{video.qualityStart} 至 {video.qualityEnd}</p>
-    {video.operation?.kind==='withdraw'&&<p className={video.operation.state==='attention'?'notice':'subtle'} role="status">{video.operation.message}</p>}
+    {(video.operation?.kind==='withdraw'||video.operation?.kind==='recapture')&&<p className={['attention','conflict'].includes(video.operation.state)?'notice':'subtle'} role="status">{video.operation.message}</p>}
     <div className="video-versions">{renderVersion(active)}
       {!!historical.length && <details className="version-history"><summary>历史版本（{historical.length}）</summary>
         <p className="subtle">历史版本保存在数据文件夹，不改变当前版本。</p>{historical.map(renderVersion)}</details>}
     </div>
+    {active.state==='pending'&&!active.taskId&&!active.message&&
+      <p className="notice">这条任务尚未发送到采集平台。可在“日期采集”的采集提交记录中查看本批进度。</p>}
     {recoveryRunning && <div className="recovery-progress" role="status"><strong>{recovery?.stage==='photos_paused'?'等待继续照片上传':recovery?.stage==='photos_processing'?'照片上传与导入中':video.operation?.stage === 'waiting_connection' ? '等待平台连接' : '可用部分处理中'}</strong>
       <p>{recovery?.message || video.operation?.message || '正在识别可解码画面。'}</p>
       {recovery?.slicingItemId && <button className="link" onClick={() => window.dispatchEvent(new CustomEvent('simple-open-slicing'))}>查看切片进度</button>}
@@ -281,7 +296,7 @@ function VideoDetails({video,onRefresh,onRemoved,processing,recordHidden=false}:
     </div>}
     {!clearing && hasMoreActions && <details className="more-video-actions"><summary>重试与版本操作</summary><div className="actions">
       {['attention','uncertain','waiting','failed'].includes(active.state) && <button className="secondary" disabled={busy || recoveryRunning} onClick={() => {void act('check', {expectedRevision:video.revision,requestId:uid()});}}>重新核对这一条</button>}
-      {recoveryOptions.canRecapture && !recoveryRunning && <button disabled={busy} onClick={() => {if(window.confirm(`按已保存的区间重新采集：${active.startTime} → ${active.endTime}。现有更正和旧版将保留，是否提交？`)) void act('recapture', {version:active.revision,expectedRevision:video.revision,requestId:uid()});}}>按当前区间重新采集</button>}
+      {canRecapture && !recoveryRunning && <button disabled={busy||recapturing||withdrawing} onClick={()=>void recaptureCurrent()}>按当前区间重新采集</button>}
       {canWithdraw && !recoveryRunning && <button className="secondary" disabled={busy} onClick={() => {void act('withdraw', {version: active.revision, expectedRevision: video.revision, requestId: uid()});}}>撤回本次更正</button>}
       {active.state === 'failed' && active.downloadRequested && !recoveryRunning && !recoveryPaused && !partialComplete(active) && <button disabled={busy} onClick={() => {void act('retry-download', {});}}>重试下载</button>}
       {recoveryOptions.canRestartDownload && (recoveryProofReady||partialComplete(active)||recoveryOptions.checkpointProblem) && <button className="secondary" disabled={busy || !video.capabilities?.canRestartDownload || recoveryRunning} title={video.capabilities?.restartDownloadReason} onClick={restartFullDownload}>重新下载完整文件</button>}
@@ -310,8 +325,8 @@ function VideoDetails({video,onRefresh,onRemoved,processing,recordHidden=false}:
           }}>取消草稿</button>}</div>
       </form></details>}
 
-    {!recordHidden&&<RecordDelete name={video.name} version={video.revision} disabled={busy}
-      onDelete={requestId=>act('hide-record',{expectedRevision:video.revision,requestId})}/>}
+    <RecordDelete name={video.name} version={video.revision} disabled={busy}
+      onDelete={requestId=>act('hide-record',{expectedRevision:video.revision,requestId})}/>
     {operationNotice&&<p className="subtle" role="status">{operationNotice}</p>}
     {error && <p className="error" role="alert">{error}</p>}
   </section>;
@@ -324,7 +339,8 @@ export default function App() {
     return initialPage(location.search,saved);
   });
   useEffect(() => {try {sessionStorage.setItem('simple-active-tab',tab);} catch { /* Optional preference. */ }}, [tab]);
-  const [detailVideo,setDetailVideo]=useState<Video|null>(null);
+  const [openDetails,setOpenDetails]=useState<Map<string,Video>>(()=>new Map());
+  const detailReads=useRef(createReadCycle());
   const [session, setSession] = useState<Session>(emptySession);
   const [state, setState] = useState<VideoState>(emptyVideos);
   const [loaded,setLoaded]=useState(false),[sessionLoaded,setSessionLoaded]=useState(false);
@@ -341,6 +357,13 @@ export default function App() {
   const [focusedRecord,setFocusedRecord]=useState<{key:string;video:Video;recordHidden:boolean}|null>(null);
   const [focusLoading,setFocusLoading]=useState(false);
   const focusReads=useRef(createReadCycle());
+  const clearFocus=useCallback(()=>{
+    focusReads.current.cancel();setFocus(null);setFocusedRecord(null);setFocusError('');setFocusLoading(false);
+    focusDone.current='';focusElement.current=null;focusStarted.current=null;
+    try {
+      if(initialVideoTarget(location.search))history.replaceState(history.state,'',location.pathname+navigationSearch(location.search,'videos')+location.hash);
+    }catch{/* Closing a detail still works when history is unavailable. */}
+  },[]);
   const [jobs, setJobs] = useState<Job[]>([]);
   const [busy, setBusy] = useState('');
   const [error, setError] = useState('');
@@ -349,6 +372,7 @@ export default function App() {
   const [videoFilters, setVideoFilters] = useState(blankVideoFilters);
   const [appliedVideoFilters, setAppliedVideoFilters] = useState(blankVideoFilters);
   const [videoSelection, setVideoSelection] = useState<Map<string,VideoSelection>>(new Map());
+  const [selectingVideos,setSelectingVideos]=useState(false);
   const [bulkErrors, setBulkErrors] = useState<string[]>([]);
   const bulkIntents = useRef(requestIntents());
   const actionLocked = useRef(false);
@@ -360,15 +384,16 @@ export default function App() {
     // A detail jump belongs to that visit. Ordinary navigation back must not
     // replay an old scroll intent; a new detail action supplies a fresh key.
     if(tabRef.current==='videos'){
-      setDetailVideo(null);
-      setFocus(null);setFocusedRecord(null);setFocusError('');focusReads.current.cancel();setFocusLoading(false);focusDone.current='';focusElement.current=null;focusStarted.current=null;
+      detailReads.current.cancel();
+      setOpenDetails(new Map());
+      clearFocus();
     }
     reads.current.cancel();
     tabRef.current=next;++viewVisit.current;++refreshSequence.current;
     // Reloading a bookmark must retain the tab the user actually navigated to.
     try {history.replaceState(history.state,'',location.pathname+navigationSearch(location.search,next)+location.hash);}catch{/* Navigation still works if history is unavailable. */}
-    setError('');setReadError('');setMessage('');setBulkErrors([]);setVideoSelection(new Map());setLocalSelection(new Map());setTab(next);
-  },[]);
+    setError('');setReadError('');setMessage('');setBulkErrors([]);setVideoSelection(new Map());setSelectingVideos(false);setLocalSelection(new Map());setTab(next);
+  },[clearFocus]);
   const refresh = useCallback(async () => {
     if (tab !== tabRef.current) return;
     const page = tab;
@@ -460,7 +485,9 @@ export default function App() {
         if(target instanceof HTMLDetailsElement)target.open=true;
         const detail=target.querySelector<HTMLDetailsElement>(':scope > .video-card-details');
         if(detail)detail.open=true;
-        const chosen=state.videos.find(v=>v.id===focusedVideoId)||focusedRecord?.video;if(chosen)setDetailVideo(chosen);
+        const chosen=state.videos.find(v=>v.id===focusedVideoId)
+          ||(focusedRecord?.key===focus.key&&focusedRecord.video.id===focusedVideoId?focusedRecord.video:undefined);
+        if(chosen)setOpenDetails(before=>before.has(chosen.id)?before:new Map(before).set(chosen.id,chosen));
         focusDone.current=focus.key;focusElement.current=target;setFocusError('');target.scrollIntoView({behavior:'smooth',block:'center'});return;
       }
       if(!focusLoading&&Date.now()-(focusStarted.current?.at||Date.now())>=10000){setFocusError('没有找到对应的视频处理记录，请重新读取本条详情。');return;}
@@ -469,20 +496,62 @@ export default function App() {
     openTarget();
     return()=>{stopped=true;clearTimeout(timer);};
   },[focus,tab,state.videos,processing,focusedVideoId,focusedRecord,focusLoading,focusError]);
-  const detailId=detailVideo?.id;
-  useEffect(()=>{setDetailVideo(null);},[appliedVideoFilters]);
-  useEffect(()=>{if(!detailId)return;const latest=state.videos.find(v=>v.id===detailId);if(latest)setDetailVideo(latest);},[detailId,state.videos]);
-  const refreshDetail=useCallback(async()=>{
-    if(!detailId)return;
-    const value=await api<{video:Video}>(`/videos/${detailId}`);
-    setDetailVideo(before=>before?.id===detailId?value.video:before);
-  },[detailId]);
-  const readMissingDetail=useCallback(async()=>{if(detailId&&!state.videos.some(v=>v.id===detailId))await refreshDetail();},[detailId,state.videos,refreshDetail]);
-  usePolling(readMissingDetail,detailId?4000:null,{immediate:false});
-  async function refreshDetailAfterChange(){await refreshDetail();void refreshAfterChange();}
-  const displayVideos=detailVideo&&!state.videos.some(video=>video.id===detailVideo.id)&&!externalFocus
-    ? [...state.videos,detailVideo]:state.videos;
-  const toggleDetail=(video:Video)=>setDetailVideo(before=>before?.id===video.id?null:video);
+  const visibleIds=new Set(state.videos.map(video=>video.id));
+  const retainedDetails=[...openDetails.values()].filter(video=>!visibleIds.has(video.id)&&video.id!==externalFocus?.video.id);
+  useEffect(()=>{
+    setOpenDetails(before=>{
+      if(!before.size)return before;
+      const next=new Map(before);
+      let changed=false;
+      for(const video of state.videos){
+        if(!before.has(video.id)||before.get(video.id)===video)continue;
+        next.set(video.id,video);
+        changed=true;
+      }
+      return changed?next:before;
+    });
+  },[state.videos]);
+  useEffect(()=>()=>detailReads.current.cancel(),[]);
+  usePolling(async()=>{
+    await detailReads.current.run(JSON.stringify(retainedDetails.map(video=>video.id)),async context=>{
+      await Promise.allSettled(retainedDetails.map(async video=>{
+        let latest:Video|undefined;
+        try{
+          const result=await api<{video:Video;recordHidden:boolean}>(`/videos/${encodeURIComponent(video.id)}`,undefined,context.signal);
+          if(result.video.id!==video.id)return;
+          if(!result.recordHidden)latest=result.video;
+        }catch(failure){
+          if((failure as {status?:number}).status!==404)return;
+        }
+        if(!context.current())return;
+        setOpenDetails(before=>{
+          if(before.get(video.id)!==video)return before;
+          const next=new Map(before);
+          if(latest)next.set(video.id,latest);
+          else next.delete(video.id);
+          return next;
+        });
+      }));
+    });
+  },tab==='videos'&&retainedDetails.length?4000:null,{immediate:false});
+  const displayVideos=retainedDetails.length?[...state.videos,...retainedDetails]:state.videos;
+  function closeDetail(id:string){
+    setOpenDetails(before=>{const next=new Map(before);next.delete(id);return next;});
+  }
+  function removeVideoFromView(id:string){
+    closeDetail(id);
+    if(focusedVideoId===id)clearFocus();
+    setVideoSelection(before=>{const next=new Map(before);next.delete(id);return next;});
+    void refreshAfterChange();
+  }
+  function toggleDetail(video:Video){
+    setOpenDetails(before=>{
+      const next=new Map(before);
+      if(next.has(video.id))next.delete(video.id);
+      else next.set(video.id,video);
+      return next;
+    });
+  }
   const videoActive=!!(state.downloadWorkers?.active||state.counts.download||state.counts.processing);
   const offlineWait=!videoActive&&session.target.availability?.reachability==='offline'&&!!state.counts.waiting;
   usePolling(async()=>{if(!actionLocked.current)await refresh();},tab==='slicing'?null:readInterval(tab==='videos'&&videoActive,tab==='videos'&&offlineWait),{immediate:false});
@@ -502,6 +571,8 @@ export default function App() {
       else next.set(video.id, {id:video.id,version:video.activeRevision,expectedRevision:video.revision}); return next;});
   }
   function applyVideoFilters(value: typeof blankVideoFilters) {
+    detailReads.current.cancel();
+    setOpenDetails(new Map());
     setLoaded(false);setAppliedVideoFilters({...value});setVideoSelection(new Map());setBulkErrors([]);
   }
   function filterVideoStatus(status: string) {
@@ -556,8 +627,22 @@ export default function App() {
           setState(before=>({...before,downloadWorkers:workers}));
           return workers;
         }} />} onOpenSettings={()=>navigate('settings')}/><Workspace onChanged={refreshAfterChange} /><section className="panel"><div className="section-title"><h2>平台连接</h2></div>{sessionLoaded?<div className="connections"><Login service="source" connected={session.source.connected} user={session.source.user} savedAccount={session.source.savedAccount} hasSavedCredentials={session.source.hasSavedCredentials} credentialWarning={session.source.credentialWarning} availability={session.source.availability} onDone={refreshAfterChange}/><Login service="target" connected={session.target.connected} user={session.target.user} savedAccount={session.target.savedAccount} hasSavedCredentials={session.target.hasSavedCredentials} credentialWarning={session.target.credentialWarning} availability={session.target.availability} onDone={refreshAfterChange}/><VisualConnection/></div>:<p role="status">正在读取平台连接…</p>}</section></> : tab === 'slicing' ? <Slicing onOpenSettings={()=>navigate('settings')} /> : tab === 'collect' ? <><DateCollection onVideos={()=>navigate('videos')} onSettings={()=>navigate('settings')}/><SubmissionRecords kind="collection" onChanged={() => {void refreshAfterChange();}} /></>
-      : <><p className="subtle" role="status">{state.downloadWorkers?`正在下载 ${state.downloadWorkers.active} 条，排队 ${state.downloadWorkers.queued} 条。`:"正在读取视频…"} <button className="link" onClick={()=>navigate('settings')}>并行设置</button></p>
-        <section className="panel record-controls"><div className="section-title"><h2>采集记录</h2><span role="status">{loaded?`${state.filteredCount} / ${state.totalCount} 条`:'正在读取…'}</span></div>
+      : <>{(!loaded||!!state.downloadWorkers?.active||!!state.downloadWorkers?.queued)&&<p className="subtle" role="status">{state.downloadWorkers?`正在下载 ${state.downloadWorkers.active} 条，排队 ${state.downloadWorkers.queued} 条。`:"正在读取视频…"} <button className="link" onClick={()=>navigate('settings')}>并行设置</button></p>}
+        <section className="panel record-controls"><div className="section-title"><h2>采集记录</h2><span role="status">{loaded?`${state.filteredCount} / ${state.totalCount} 条`:'正在读取…'}</span>
+          <RecordSelection videos={state.videos} selectedIds={new Set(videoSelection.keys())} busy={!!busy||!loaded}
+            selecting={selectingVideos} onSelectingChange={setSelectingVideos}
+            onSelect={records=>{setVideoSelection(new Map(records.map(v=>[v.id,{id:v.id,version:v.activeRevision,expectedRevision:v.revision}])));}}
+            onClear={()=>{setVideoSelection(new Map());}} onDownload={()=>void bulk('confirm')}
+            onSave={()=>void bulk('classify-saved')} onRemove={async requestId=>{
+              const actionVisit=viewVisit.current;
+              const selectedRows=visibleVideoSelections(videoSelection.values(),state.videos).map(choice=>({id:choice.id,revision:choice.expectedRevision}));
+              if(!selectedRows.length){setVideoSelection(new Map());return;}
+              await api<{recordRemoval:{removalId:string}}>('/videos/records/remove',{requestId,selections:selectedRows.map(row=>({id:row.id,expectedRevision:row.revision}))});
+              if(viewVisit.current!==actionVisit)return;
+
+              setVideoSelection(new Map());void refresh().catch(()=>{});
+            }} />
+        </div>
           <VideoStatusFilters value={appliedVideoFilters.status} counts={state.counts} total={state.totalCount}
             disabled={!!busy||!loaded} onChange={filterVideoStatus} />
           <form className="record-filters condensed" onSubmit={e => {e.preventDefault();applyVideoFilters(videoFilters);}}>
@@ -570,37 +655,24 @@ export default function App() {
               <label>更正情况<select value={videoFilters.correction} onChange={e => setVideoFilters({...videoFilters,correction:e.target.value})}><option value="all">全部记录</option><option value="corrected">有更正历史</option><option value="withdrawn">最后操作为撤回</option><option value="uncorrected">从未更正</option></select></label>
             </div></details>
           </form>
-          <RecordSelection videos={state.videos} selectedIds={new Set(videoSelection.keys())} busy={!!busy||!loaded}
-            onSelect={records=>{setVideoSelection(new Map(records.map(v=>[v.id,{id:v.id,version:v.activeRevision,expectedRevision:v.revision}])));}}
-            onClear={()=>{setVideoSelection(new Map());}} onDownload={()=>void bulk('confirm')}
-            onSave={()=>void bulk('classify-saved')} onRemove={async requestId=>{
-              const actionVisit=viewVisit.current;
-              const selectedRows=visibleVideoSelections(videoSelection.values(),state.videos).map(choice=>({id:choice.id,revision:choice.expectedRevision}));
-              if(!selectedRows.length){setVideoSelection(new Map());return;}
-              await api<{recordRemoval:{removalId:string}}>('/videos/records/remove',{requestId,selections:selectedRows.map(row=>({id:row.id,expectedRevision:row.revision}))});
-              if(viewVisit.current!==actionVisit)return;
 
-              setVideoSelection(new Map());void refresh().catch(()=>{});
-            }} />
 
         </section>
     <div id="video-record-results">{focusLoading&&!externalFocus&&<p className="subtle" role="status">正在读取指定视频…</p>}
     {focusError&&<p className="notice" role="status">{focusError} <button className="link" onClick={()=>{setFocusError('');setFocus(before=>before?{...before,key:uid()}:null);void refresh();}}>重新查找</button></p>}
     {externalFocus&&<section className="panel focused-video-record" aria-label="指定视频处理入口">
       <div className="section-title"><div><h2>{externalFocus.recordHidden?'已隐藏的处理中记录':'本次打开的视频'}</h2><p className="subtle">仅临时打开指定记录，不改变隐藏状态或批量选择范围。</p></div>
-        <button className="secondary" onClick={()=>{focusReads.current.cancel();setFocus(null);setFocusedRecord(null);setFocusError('');setFocusLoading(false);}}>关闭详情</button></div>
-      <VideoCard video={externalFocus.video} onOpen={()=>toggleDetail(externalFocus.video)} recordHidden={externalFocus.recordHidden} processing={processing.filter(group=>group.videoId===externalFocus.video.id)}
-        onRefresh={async()=>{await Promise.all([refreshAfterChange(),refreshFocused()]);}} onRemoved={_removalId=>{
-
-        }}>
-        {detailVideo?.id===externalFocus.video.id&&<VideoDetails key={detailVideo.id} video={detailVideo} recordHidden={externalFocus.recordHidden}
-          processing={processing.filter(group=>group.videoId===detailVideo.id)}
-          onRefresh={async()=>{await Promise.all([refreshDetailAfterChange(),refreshFocused()]);}}
-          onRemoved={()=>{setDetailVideo(null);void refreshAfterChange();}}/>}
+        <button className="secondary" onClick={()=>{closeDetail(externalFocus.video.id);clearFocus();}}>关闭详情</button></div>
+      <VideoCard video={externalFocus.video} onOpen={()=>toggleDetail(externalFocus.video)}>
+        {openDetails.has(externalFocus.video.id)&&<VideoDetails video={externalFocus.video}
+          processing={processing.filter(group=>group.videoId===externalFocus.video.id)}
+          onRefresh={async()=>{await Promise.all([refreshAfterChange(),refreshFocused()]);}}
+          onRemoved={removeVideoFromView}/>}
       </VideoCard>
     </section>}
-    {!!localGroups.length&&<RecordBatch selected={localSelection} disabled={!!busy} total={localGroups.length} scope="本地记录"
-      onSelectAll={()=>selectLocal(localGroups,true)} onClear={()=>setLocalSelection(new Map())} onDelete={hideLocal}/>}
+    {!!localGroups.length&&<section data-selection-scope="local-videos" aria-label="本地视频记录">
+    <RecordBatch selected={localSelection} disabled={!!busy} total={localGroups.length} scope="本地记录"
+      onSelectAll={()=>selectLocal(localGroups,true)} onClear={()=>setLocalSelection(new Map())} onDelete={hideLocal}/>
     {groupSubmissionDays(localGroups,g=>g.createdAt).map(day=>{
       const choices=day.records.flatMap(group=>group.items.map(item=>({key:`item:${item.id}`,id:item.id,revision:item.revision,kind:'item' as const})));
       return <DateSection key={day.day} day={day.day} rememberKey={`local-videos:${day.day}`} expandedKey={day.records.some(g=>g.id===focus?.mediaId)?focus?.key:undefined} summary={`${day.records.length} 个本地视频待处理`}>
@@ -609,18 +681,14 @@ export default function App() {
         <label className="record-checkbox"><input type="checkbox" aria-label={`选择本地视频 ${group.name}`} checked={group.items.length>0&&group.items.every(item=>localSelection.has(`item:${item.id}`))} onChange={event=>selectLocal([group],event.target.checked)}/>选择</label>
         <h3 className="local-processing-name">{group.name}</h3><p className="subtle">{group.videoId?'关联采集记录已隐藏':'本地视频 · 无关联质检记录'}</p><VideoProcessing groups={[group]} onRefresh={refreshAfterChange} candidates={state.videos}/>
         <RecordDelete name={`${group.name} · 本地视频记录`} version={groupChoices.map(c=>`${c.id}:${c.revision}`).sort().join('|')} disabled={!!busy||!groupChoices.length} onDelete={requestId=>hideLocal(groupChoices,requestId)}/>
-      </article>;})}</div></DateSection>;})}
-    {!loaded?<section className="panel empty" role="status" aria-busy="true"><p>正在读取采集记录，已有进度保留。</p></section>:displayVideos.length ? <VideoBatches videos={displayVideos} jobs={jobs} totalByJob={state.byJob} selectedIds={new Set(videoSelection.keys())} focusedVideoId={focusedVideoId} focusKey={focus?.key}
-      disabled={!!busy} onSelectBatch={selectBatch}
-      onDownloadBatch={records => void bulk('confirm', records.map(video => ({id:video.id,version:video.activeRevision,expectedRevision:video.revision})))}>
-      {video => <VideoCard video={video} onOpen={()=>toggleDetail(video)} processing={processing.filter(g=>g.videoId===video.id)} onRefresh={refreshAfterChange} selected={videoSelection.has(video.id)} onSelect={state.videos.some(row=>row.id===video.id)?() => pickVideo(video):undefined} onRemoved={_removalId=>{
-
-        setVideoSelection(before=>{const next=new Map(before);next.delete(video.id);return next;});
-      }}>
-        {detailVideo?.id===video.id&&<>
-          {!state.videos.some(row=>row.id===video.id)&&<p className="subtle">本条状态已更新；关闭详情后按当前筛选隐藏。</p>}
-          <VideoDetails key={detailVideo.id} video={detailVideo} processing={processing.filter(g=>g.videoId===video.id)}
-            onRefresh={refreshDetailAfterChange} onRemoved={()=>{setDetailVideo(null);void refreshAfterChange();}}/>
+      </article>;})}</div></DateSection>;})}</section>}
+    {!loaded?<section className="panel empty" role="status" aria-busy="true"><p>正在读取采集记录，已有进度保留。</p></section>:displayVideos.length ? <VideoBatches videos={displayVideos} visibleIds={visibleIds} jobs={jobs} selecting={selectingVideos} focusedVideoId={focusedVideoId} focusKey={focus?.key}
+      disabled={!!busy} onSelectBatch={selectBatch}>
+      {video => <VideoCard video={video} onOpen={()=>toggleDetail(video)} selected={videoSelection.has(video.id)} onSelect={selectingVideos&&visibleIds.has(video.id)?() => pickVideo(video):undefined}>
+        {openDetails.has(video.id)&&<>
+          {!visibleIds.has(video.id)&&<p className="subtle">本条状态已更新；关闭详情后按当前筛选隐藏。</p>}
+          <VideoDetails video={video} processing={processing.filter(g=>g.videoId===video.id)}
+            onRefresh={refreshAfterChange} onRemoved={removeVideoFromView}/>
         </>}
       </VideoCard>}
     </VideoBatches> : <section className="panel empty"><h2>{state.totalCount ? '没有符合条件的记录' : state.hiddenRecordCount ? '当前没有可显示的记录' : '还没有采集记录'}</h2><p>{state.totalCount ? '可以调整日期、车牌和状态，或重置筛选。' : state.hiddenRecordCount ? '已删除记录的文件、更正和后台进度保留。' : '在“日期采集”中核对并提交后，这里会显示每辆车的采集进度。'}</p></section>}</div></>}

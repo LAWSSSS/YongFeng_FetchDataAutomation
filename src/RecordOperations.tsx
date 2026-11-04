@@ -28,10 +28,12 @@ export default function RecordOperations(){
   },[operations]);
   usePolling(refresh,operations.some(active)?2000:null,{immediate:false});
   if(!operations.length)return null;
-  return <aside className="panel record-operation-notice" aria-live="polite">{operations.map(op=><div key={op.operationId}>
+  const latestComplete=operations.findLast(op=>op.state==='complete')?.operationId;
+  const visible=operations.filter(op=>op.state!=='complete'||op.operationId===latestComplete);
+  return <aside className="panel record-operation-notice" aria-live="polite">{visible.map(op=><div key={op.operationId}>
     <div className="section-title"><p>{active(op)?`正在处理删除 · ${op.finished}/${op.total}`:op.state==='complete'?`已移除 ${op.total} 条记录`:'部分记录未删除'}
       {op.state==='waiting'&&' · 等待安全清理'}</p>
-      {!active(op)&&<button className="link" onClick={()=>setOperations(rows=>rows.filter(row=>row.operationId!==op.operationId))}>关闭提示</button>}</div>
+      {!active(op)&&<button className="link" onClick={()=>setOperations(rows=>rows.filter(row=>op.state==='complete'?row.state!=='complete':row.operationId!==op.operationId))}>关闭提示</button>}</div>
     {op.outcomes?.some(row=>row.state==='attention'||row.message?.includes('本地文件保留'))&&<details><summary>查看处理结果</summary><ul>
       {op.outcomes.filter(row=>row.state==='attention'||row.message?.includes('本地文件保留')).map(row=><li key={row.id}>{row.name}：{row.message}</li>)}</ul></details>}
   </div>)}</aside>;

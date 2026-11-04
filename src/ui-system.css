@@ -77,7 +77,7 @@
 .app-shell input[type=checkbox] { width: 18px; height: 18px; flex: none; }
 .app-shell :is(.filters, .record-filters, .record-filter-details, .slice-filter-bar) { gap: 16px; }
 .app-shell :is(.filters, .record-filters, .correction-fields, .slice-filter-bar) label { font-size: 13px; gap: 8px; }
-.app-shell .date-collection .filters { grid-template-columns: minmax(180px, 1fr) minmax(180px, 1fr) auto; max-width: 800px; }
+.app-shell .date-collection .filters { grid-template-columns: minmax(180px, 1fr) minmax(180px, 1fr) auto auto; }
 .app-shell :is(.record-filters, .date-collection .filters) .actions { margin-top: 0; }
 .app-shell :is(.video-status-filters, .pipeline-filters) { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 18px; }
 .app-shell :is(.video-status-filters, .pipeline-filters) button { border: 1px solid var(--line); padding-inline: 12px; }
@@ -100,7 +100,11 @@
   display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; align-items: stretch;
 }
 .app-shell :is(.video-card, .batch-record > .video-card) { padding: 16px; min-width: 0; min-height: 0; height: 100%; }
-.app-shell .batch-record { min-width: 0; }
+.app-shell .batch-record { min-width: 0; display:flex; flex-direction:column; }
+.app-shell .batch-record > .video-card { flex:1; height:auto; }
+.app-shell .date-video-grid { padding-top:16px; }
+.app-shell .date-tools + .date-video-grid { padding-top:0; }
+.app-shell .card-submission-time { margin:0 0 8px; font-size:12px; color:var(--muted-ink); font-variant-numeric:tabular-nums; }
 .app-shell .video-head { gap: 8px; }
 .app-shell .video-head .record-pick { min-width:0; align-items: start; }
 .app-shell .video-head h3 { font-size:16px; }
@@ -166,13 +170,16 @@
 .app-shell .record-deleted-notice { padding: 12px 16px; margin-block: 12px; border: 1px solid #ccdfd0; border-radius: 10px; background: #f0f7f1; }
 .app-shell .record-deleted-notice p { margin: 0; }
 .app-shell .record-deleted-notice.panel { padding: 12px 16px; }
-.app-shell .collection-history { border-top: 1px solid var(--line); margin-top: 20px; }
-.app-shell .collection-history > summary { min-height: 52px; padding-block: 14px; cursor: pointer; font-size: 14px; color: var(--brand); font-weight: 600; }
-.app-shell .collection-run-record { padding-block: 16px; border-top: 1px solid var(--line); font-size: 14px; }
-.app-shell .collection-run-record p { margin: 6px 0; overflow-wrap: anywhere; }
-.app-shell .collection-run-record .record-delete { margin-top: 0; }
-.app-shell .collection-active { margin-top: 16px; padding: 12px 16px; background: var(--soft-surface); border-radius: 8px; color: var(--brand); font-size: 14px; }
-.app-shell .collection-active p { margin: 4px 0; }
+.app-shell .collection-status { margin:16px 0 0; font-size:14px; color:var(--muted-ink); }
+.app-shell .collection-result-link { margin-top:8px; }
+.app-shell :is(.submission-records,.record-controls) > .section-title { flex-wrap:wrap; }
+.app-shell :is(.submission-records,.record-controls) > .section-title > .batch-entry { margin:0 0 0 auto; }
+.app-shell :is(.submission-records,.record-controls) > .section-title > .record-batch-management { flex-basis:100%; margin:0; }
+.app-shell .submission-records .dated-batch:first-child { border-top:0; }
+.app-shell .submission-records .submission-item { padding:16px 0; }
+.app-shell .submission-batch-status { font-size:13px; color:var(--muted-ink); }
+.app-shell .submission-proof { margin-top:8px; }
+.app-shell .submission-proof summary { cursor:pointer; min-height:44px; display:flex; align-items:center; font-size:13px; color:var(--brand); }
 .app-shell :is(.connections, .slicing-management-grid) { gap: 16px; }
 .app-shell .connections { grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); margin-bottom: 0; }
 .app-shell .login-card { padding: 20px; }

@@ -80,5 +80,10 @@ async def test_date_run_page_clamps_after_last_page_is_hidden(tmp_path):
                 'selections':[{'id':row['id'],'expectedRevision':row['revision']}]})
             clamped=(await client.get('/api/collection-runs?page=2')).json()
             assert clamped['page']==clamped['pages']==1 and len(clamped['runs'])==20
+            seed(manager,'old-review','awaiting_review')
+            seed(manager,'query','querying')
+            for index in range(21,42):seed(manager,str(index),'complete')
+            current=(await client.get('/api/collection-runs?currentOnly=true')).json()
+            assert [row['id'] for row in current['runs']]==['41','query','old-review']
     finally:
         await close_app(app)

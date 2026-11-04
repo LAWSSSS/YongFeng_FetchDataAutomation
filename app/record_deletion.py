@@ -75,13 +75,25 @@ class RecordDeletion:
             visibility, store = self.registries[kind]
             snapshot = (store.get_many([r['id'] for r in rows]) if kind == 'receipt_items'
                         else {r['id']: self.row(kind, r['id']) for r in rows})
-            visibility.prepare_hide(store, request_id, rows, rows=snapshot)
+            visibility.prepare_hide(store, request_id, rows, rows=snapshot, allow_hidden=kind == 'collection')
             snapshots[kind] = snapshot
         selections = []
         for choice in choices:
             row = snapshots[choice['kind']][choice['id']]
-            selections.append({**choice, 'name': row.get('name') or row.get('title') or row.get('videoName') or '记录',
-                               'logicalSignature': logical_record(row), 'state': 'queued'})
+            selection = {**choice, 'name': row.get('name') or row.get('title') or row.get('videoName') or '记录',
+                         'logicalSignature': logical_record(row), 'state': 'queued'}
+            if choice['kind'] == 'collection':
+                # Deleting a running card is a display action. Do not wait for
+                # stable byte counters or clean files that finish after this click.
+                assets = self.assets('collection', row)
+                permissions = [(asset, *self.workspace.cleanup_eligibility(asset)) for asset in assets
+                               if asset.get('cleanup', {}).get('state') != 'complete']
+                selection['cleanupAssetIds'] = [asset['id'] for asset, permitted, _ in permissions if permitted]
+                selection['initialRetainedReasons'] = list(dict.fromkeys(reason
+                    for _, permitted, reason in permissions if not permitted))
+                selection['presentationOnly'] = not selection['cleanupAssetIds']
+                selection['activeRevision'] = row.get('activeRevision')
+            selections.append(selection)
         operation = {'id': request_id, 'signature': signature, 'selections': selections,
                      'state': 'queued', 'createdAt': now_iso()}
         self.save(operation)
@@ -118,16 +130,27 @@ class RecordDeletion:
                 return True
         return False
 
+    @staticmethod
+    def selection_matches(row, selected):
+        if not row:
+            return False
+        if selected.get('presentationOnly'):
+            return (row.get('revision', 0) == selected['expectedRevision']
+                    and row.get('activeRevision') == selected.get('activeRevision'))
+        return logical_record(row) == selected['logicalSignature']
+
     async def advance(self, operation, selected):
         kind, identity = selected['kind'], selected['id']
         row = self.row(kind, identity)
-        if not row or logical_record(row) != selected['logicalSignature']:
+        if not self.selection_matches(row, selected):
             selected.update(state='attention', message='记录已有新进度，本条未删除，请刷新后重新选择。')
             return
         assets = self.assets(kind, row)
+        if 'cleanupAssetIds' in selected:
+            assets = [asset for asset in assets if asset['id'] in selected['cleanupAssetIds']]
         if 'cleanupIds' not in selected:
             selected['cleanupIds'] = []
-            retained = []
+            retained = list(selected.get('initialRetainedReasons', []))
             for asset in assets:
                 if self.shared_record(operation, selected, asset):
                     retained.append('其他记录仍引用此文件。')
@@ -157,12 +180,13 @@ class RecordDeletion:
         # Re-read after asynchronous cleanup registration. Only our own cleanup
         # annotations may have changed since the accepted selection.
         row = self.row(kind, identity)
-        if not row or logical_record(row) != selected['logicalSignature']:
+        if not self.selection_matches(row, selected):
             selected.update(state='attention', message='记录已有新进度，未移除网页记录。')
             return
         visibility, store = self.registries[kind]
         action_id = 'delete-' + digest([operation['id'], kind, identity])[:48]
-        visibility.hide(store, action_id, [{'id': identity, 'expectedRevision': int(row.get('revision', 0))}])
+        visibility.hide(store, action_id, [{'id': identity, 'expectedRevision': int(row.get('revision', 0))}],
+                        allow_hidden=kind == 'collection')
         selected.update(state='complete', message='记录已移除；' + ('本地文件保留：' + '；'.join(selected['retainedReasons'])
             if selected.get('retainedReasons') else '已核验的绑定文件已清理。' if selected['cleanupIds'] else '后台进度和云端成果保留。'))
 

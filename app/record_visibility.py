@@ -28,7 +28,7 @@ class RecordVisibility:
             return saved
         return None
 
-    def prepare_hide(self, store, request_id, selections, *, rows=None):
+    def prepare_hide(self, store, request_id, selections, *, rows=None, allow_hidden=False):
         choices = sorted(selections, key=lambda s: s['id'])
         if len({s['id'] for s in choices}) != len(choices):
             raise ValueError('不能重复选择同一条记录。')
@@ -49,7 +49,7 @@ class RecordVisibility:
             if int(row.get('revision', 0)) != choice['expectedRevision']:
                 label = row.get('name') or row.get('videoName') or row.get('title') or choice['id']
                 raise Conflict(f'“{label}”已有新进度，本次均未删除；请刷新后重新选择。')
-            if choice['id'] in hidden:
+            if choice['id'] in hidden and not allow_hidden:
                 raise Conflict('记录已从列表删除，请刷新。')
         result = {'removalId': request_id, 'ids': [s['id'] for s in choices]}
         action = {'signature': signature, 'result': result, 'at': now_iso()}
@@ -58,12 +58,12 @@ class RecordVisibility:
     def write_hide(self, request_id, action):
         if action is None:
             return
-        self.db.executemany(f'INSERT INTO {self.hidden_table} VALUES(?,?)',
+        self.db.executemany(f'INSERT OR IGNORE INTO {self.hidden_table} VALUES(?,?)',
             [(identity, json.dumps({'removalId': request_id, 'at': action['at']})) for identity in action['result']['ids']])
         self.db.execute(f'INSERT INTO {self.actions_table} VALUES(?,?)', (request_id, json.dumps(action)))
 
-    def hide(self, store, request_id, selections):
-        result, action = self.prepare_hide(store, request_id, selections)
+    def hide(self, store, request_id, selections, *, allow_hidden=False):
+        result, action = self.prepare_hide(store, request_id, selections, allow_hidden=allow_hidden)
         with self.db:
             self.write_hide(request_id, action)
         return result

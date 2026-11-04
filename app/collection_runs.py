@@ -73,10 +73,24 @@ class CollectionRunManager:
         return [json.loads(row[0]) for row in self.db.execute(
             "SELECT payload FROM simple_collection_runs ORDER BY rowid DESC")]
 
-    @staticmethod
-    def public(row, *, details=False, page=1, page_size=20):
+    def public(self, row, *, details=False, page=1, page_size=20):
         if row is None:
             return None
+        if (row.get('status') in {'complete', 'attention'} and not row.get('pendingSubmissionId')
+                and row.get('stage') in {'confirm', 'reconcile'} and any(
+                    item['status'] == 'duplicate' for identity in row.get('jobIds', [])
+                    for item in (self.store.get(identity) or {}).get('items', []))):
+            # Old releases closed reused captures with zero ready items. Present
+            # their current receipts without rewriting the submitted plan/history.
+            row = copy.deepcopy(row)
+            self.review.aggregate_counts(row)
+            ready, waiting, attention = (row['counts'][key] for key in ('ready', 'waiting', 'attention'))
+            row.update(status='waiting' if waiting else 'attention' if attention else 'complete',
+                       stage='platform' if waiting else 'confirm',
+                       errorCode='platform_attention' if attention else '',
+                       message=f'等待平台采集完成，已可查看 {ready} 条。' if waiting else
+                               f'{attention} 条采集需要核对，已保留原记录。' if attention else
+                               f'{ready} 条采集已可查看，请确认最终区间。')
         fields = ("id", "revision", "status", "stage", "message", "filters", "rule", "admissionRule",
                   "admissionRevision", "counts", "scanned", "total", "createdAt", "updatedAt", "jobId", "errorCode", "planRevision", "pendingSubmissionId")
         value = {key: copy.deepcopy(row[key]) for key in fields if key in row}
@@ -92,10 +106,15 @@ class CollectionRunManager:
                          recordCount=len(records), page=current, pageSize=size)
         return value
 
-    def state(self, *, page=1, page_size=20):
+    def state(self, *, page=1, page_size=20, current_only=False):
         size = min(20, max(1, int(page_size)))
         hidden = self.visibility.hidden()
         rows = [row for row in self.list() if row['id'] not in hidden]
+        if current_only:
+            # The form needs outstanding plans and the result of the latest
+            # query. Submitted history belongs to the submission ledger.
+            return {"runs": [self.public(row) for index, row in enumerate(rows)
+                             if index == 0 or row["status"] not in _TERMINAL]}
         pages = max(1, (len(rows) + size - 1) // size)
         current = min(max(1, int(page)), pages)
         return {"runs": [self.public(row) for row in rows[(current - 1) * size:current * size]],
@@ -153,6 +172,9 @@ class CollectionRunManager:
                 row.update(reviewVersion=1, status='awaiting_review', stage='review',
                            message='未发送的采集计划等待人工确认；已有提交保留。')
                 self._save(row)
+            for row in self.list():
+                if self.review.refresh_historical_duplicates(row):
+                    self._save(row)
             self.resume_checked.clear()
             self.task = asyncio.create_task(self._loop())
             self.wake.set()
@@ -300,11 +322,8 @@ class CollectionRunManager:
     def _plan(self, row):
         # Store the exact rule snapshot, rather than applying settings changed later.
         tasks = build_tasks(row["records"], CollectionRule.model_validate(row["rule"]), row["target"],
-                            self.store.known_keys(), row["admissionRule"])
-        known_records = {str(item.get("recordId")) for job in self.store.list()
-                         if job.get("target", {}).get("cameraId") == row["target"]["cameraId"]
-                         for item in job.get("items", [])
-                         if item.get("status") in {"submitted", "submitting", "uncertain", "duplicate"}}
+                            self.store.known_keys(include_retired=False), row["admissionRule"])
+        known_records = self.store.known_records(row["target"])
         for item in tasks:
             if item["status"] == "ready" and str(item["recordId"]) in known_records:
                 item.update(status="duplicate", duplicateSource="local", reason="本条实绩已登记采集，不重复创建。")
@@ -326,9 +345,7 @@ class CollectionRunManager:
             (job for job in self.store.list() if job["planId"] == row["planId"]), None)
         if not job:
             plan = row.get("plan") or self._plan(row)
-            known = {str(t.get('recordId')) for saved in self.store.list() for t in saved.get('items', [])
-                     if saved.get('target', {}).get('cameraId') == row['target']['cameraId']
-                     and t.get('status') in {'pending','submitted','submitting','uncertain','duplicate'}}
+            known = self.store.known_records(row["target"])
             for task in plan['tasks']:
                 if task['status']=='ready' and str(task['recordId']) in known:
                     task.update(status='duplicate', reason='本条实绩已登记，不重复采集。')
@@ -366,6 +383,7 @@ class CollectionRunManager:
             return
         if job["status"] != "complete":
             job = await self.jobs.reconcile(job["id"])
+            self.videos.sync_jobs()
             uncertain = [item for item in job["items"] if item["status"] in {"uncertain", "submitting"}]
             identity_issues = [item for item in job["items"] if item.get("bindingIssue") and
                                item.get("bindingIssue") != "submission_missing"]
@@ -394,20 +412,13 @@ class CollectionRunManager:
                 self._save(row)
                 return
         self.videos.sync_jobs()
-        versions = [self.videos.version(video, 0) for video in self.videos.store.list()
-                    if video.get("jobId") == job["id"]]
-        versions = [version for version in versions if version]
-        submitted = sum(item.get("status") == "submitted" for item in job["items"])
-        ready = sum(version.get("state") in {"ready", "saved", "downloading", "publishing", "withdrawn", "replaced"}
-                    or bool(version.get("resultId")) for version in versions)
-        attention = sum(version.get("state") in {"attention", "failed"} and not version.get("resultId")
-                        for version in versions)
-        waiting = max(0, submitted - ready - attention)
-        row["counts"].update(submitted=submitted, ready=ready, waiting=waiting, attention=attention,
-                             duplicate=sum(item["status"] == "duplicate" for item in job["items"]))
+        progress = self.videos.job_progress(job)
+        ready, waiting, attention = (progress[key] for key in ('ready', 'waiting', 'attention'))
+        row["counts"].update(**progress, duplicate=sum(item["status"] == "duplicate" for item in job["items"]))
         row.update(status="waiting" if waiting else "attention" if attention else "complete",
                    stage="platform" if waiting else "confirm", errorCode="platform_attention" if attention else "",
                    message=f"等待平台采集完成，已可查看 {ready} 条。" if waiting else
+                           f"{attention} 条采集需要核对，已保留原记录。" if attention else
                            f"{ready} 条采集已可查看，请确认最终区间。")
         self._save(row)
         if row['status'] in {'complete', 'attention'}:

@@ -1,9 +1,27 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { batchDate, canDownload, completedPartialVideo, groupVideos, splitInspections, syncVideoSelection, videoCategory, videoStatusOptions, selectVideoScope, visibleVideoSelections } from '../src/record-groups.ts';
+import { batchDate, canDownload, captureStatusLabel, completedPartialVideo, groupVideos, groupVideoDays, splitInspections, syncVideoSelection, videoCategory, videoStatusOptions, selectVideoScope, visibleVideoSelections } from '../src/record-groups.ts';
 
 const video = (id, jobId, state, extra = {}) => ({id, jobId, activeRevision: 0, revision: 0,
   versions: [{revision: 0, state}], capabilities:{version:0,expectedRevision:0,canConfirmFinal:state==='ready'}, ...extra});
+
+test('independent same-day submissions share one grid; cross-midnight items keep their real day',()=>{
+  const records=[video('a','one','ready',{submittedAt:'2026-11-03T02:00:00Z'}),
+    video('b','two','ready'),video('c','three','ready'),
+    video('d','one','ready',{submittedAt:'2026-11-03T16:00:00Z'}),video('unknown','missing','ready')];
+  const jobs=['one','two','three'].map(id=>({id,createdAt:'2026-11-03T03:00:00Z',status:'complete',items:[]}));
+  const days=groupVideoDays(records,jobs);
+  assert.deepEqual(days.map(day=>[day.day,day.records.map(row=>row.id),day.submissionCount]),[
+    ['2026-11-04',['d'],1],['2026-11-03',['a','b','c'],3],['',['unknown'],1]]);
+  assert.strictEqual(days[1].records[0],records[0]);
+});
+
+test('pending submission and a bound platform queue have distinct labels', () => {
+  assert.equal(captureStatusLabel({state:'pending'}), '尚未提交采集');
+  assert.equal(captureStatusLabel({state:'waiting', taskId:'bound', platformStatus:'PENDING'}), '平台排队中');
+  assert.equal(captureStatusLabel({state:'waiting', taskId:'bound', platformStatus:'FIXED'}), '等待平台结果');
+  assert.equal(captureStatusLabel({state:'ready', taskId:'bound', platformStatus:'FIXED'}), '待确认');
+});
 
 test('bulk selection never silently adopts a newer revision or version', () => {
   const selection = new Map([['keep', {id:'keep', version:1, expectedRevision:2}],

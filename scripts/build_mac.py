@@ -124,7 +124,6 @@ def collect_licenses(resources, wheels):
         shutil.copy2(resources / "runtime" / group / "lib" / f"python{version}" / "LICENSE.txt",
                      destination / f"Python-{version}-LICENSE.txt")
     shutil.copy2(ROOT / "build/ffmpeg-tools/FFmpeg-LICENSE.txt", destination / "FFmpeg-LICENSE.txt")
-    shutil.copy2(ROOT / "docs/third-party.md", destination / "说明.md")
     (resources / "dependencies.json").write_text(json.dumps(inventory, indent=2) + "\n")
 
 
@@ -242,12 +241,7 @@ def assemble(args):
                "algorithmChanged": False}
     (resources / "release.json").write_text(json.dumps(package, indent=2) + "\n")
     (resources / "source-manifest.json").write_text(json.dumps({"files": sources}, ensure_ascii=False, indent=2) + "\n")
-    stop = output / "停止采集助手.command"
-    stop.write_text('#!/bin/sh\nset -eu\nfolder=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)\n'
-                    'exec "$folder/采集助手.app/Contents/Resources/runtime/backend/bin/python3.13" -I -B '
-                    '"$folder/采集助手.app/Contents/Resources/application/launcher.py" stop\n')
-    stop.chmod(0o755)
-    shutil.copy2(ROOT / "docs/mac-quickstart.md", output / "使用说明.md")
+    shutil.copy2(ROOT / "README.md", output / "README.md")
     binaries = audit_binaries(app)
     # Export the actual working tree, including reviewed new modules. HEAD alone
     # cannot reproduce an uncommitted pre-release; never label it as that commit.

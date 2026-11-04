@@ -222,7 +222,7 @@ export default function SliceHistory({snapshot,onChanged}:{snapshot?:SliceHistor
   }
   const current=key===loadedKey,days=current?value?.recordDays||[]:[];
   const disabled=busy||search.trim()!==appliedSearch||!current;
-  return <section className="panel slice-history" aria-labelledby="slice-history-title">
+  return <section className="panel slice-history" data-selection-scope="slicing" aria-labelledby="slice-history-title">
     <div className="section-title"><h2 id="slice-history-title">视频记录</h2></div>
     <div className="slice-filter-bar"><label>状态<select value={status} disabled={busy} onChange={event=>setStatus(event.target.value)}>
       {[['all','全部'],['unsliced','未完成'],['attention','需处理'],['pending','待识别'],['analyzing','识别中'],['waiting_connection','等待恢复'],['platform_processing','照片处理中'],['complete','完整处理完成'],['partial_complete','可用部分完成'],['no_target','未检出目标'],['uncuttable','无可用画面']].map(([id,label])=><option value={id} key={id}>{label}</option>)}</select></label>

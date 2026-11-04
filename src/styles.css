@@ -41,7 +41,3 @@ button:focus-visible,summary:focus-visible,select:focus-visible{outline:2px soli
 .login-card .login-form input:not([type=checkbox]){min-width:125px;flex:1 1 125px}
 .submission-records>.secondary,.slice-records>.secondary{margin:4px 0 12px}
 @media(max-width:700px){.site-header{align-items:flex-start;flex-direction:column;gap:12px}.site-header nav{grid-template-columns:repeat(2,minmax(0,1fr));width:100%}.site-header nav button{white-space:normal}.hero.compact h1{font-size:22px}.login-card .login-form input:not([type=checkbox]){flex-basis:100%}}
-.collection-runs { margin-top: 1rem; }
-.collection-runs > details + details { margin-top: .6rem; }
-.collection-runs summary { padding: .65rem 0; cursor: pointer; }
-.collection-runs summary > span { display: block; margin-top: .3rem; color: var(--text-secondary, #52685b); font-size: .875rem; line-height: 1.5; }

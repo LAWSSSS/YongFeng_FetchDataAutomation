@@ -62,24 +62,49 @@ class JobManager:
                 raise RemoteError("原站任务分页数据不完整，暂不提交，请稍后重新核对。", "PAGINATION")
         raise RemoteError("原站任务数量超出核对范围，暂不提交。", "LIMIT")
 
-    async def remote_tasks(self, target: dict, tasks: list[dict]) -> dict[str, dict]:
+    async def remote_tasks(self, target: dict, tasks: list[dict]) -> dict[str, list[dict]]:
         if not tasks:
             return {}
         result = {}
         for row in (await self.remote_parents(target)).values():
             start, end = format_time(row.get("startTime")), format_time(row.get("endTime"))
-            if start and end and row.get("taskType", "VIDEO") == "VIDEO":
-                result[task_key(target, start, end)] = row
+            if start and end and str(row.get("taskType", "VIDEO")).upper() == "VIDEO":
+                result.setdefault(task_key(target, start, end), []).append(row)
         return result
 
     @staticmethod
     def parent_matches(row: dict, target: dict, item: dict) -> bool:
         return (str(row.get("cameraId", target["cameraId"])) == str(target["cameraId"])
+                and (not row.get("embedId") or str(row["embedId"]) == str(target["embedId"]))
                 and str(row.get("taskType", "VIDEO")).upper() == "VIDEO"
                 and not row.get("isRepeat")
                 and format_time(row.get("startTime")) == format_time(item.get("startTime"))
                 and format_time(row.get("endTime")) == format_time(item.get("endTime"))
                 and str(row.get("videoName") or row.get("taskName") or "") == str(item.get("videoName") or ""))
+
+    def bind_existing_item(self, target, item, parents):
+        """Reuse a pre-existing capture only after an unambiguous identity check.
+
+        This path is never used for a write whose response was lost: those writes
+        still require their submission snapshot in bind_remote_item.
+        """
+        if item.get("submission") or item.get("bindingVerified"):
+            return self.bind_remote_item(target, item, parents)
+        candidates = [row for row in parents.values() if self.parent_matches(row, target, item)]
+        identity = str(item.get("remoteId") or "")
+        if identity and (identity not in parents or not self.parent_matches(parents[identity], target, item)):
+            return self.bind_remote_item(target, item, parents)
+        if len(candidates) != 1:
+            code = "duplicate_ambiguous" if candidates else "duplicate_identity_mismatch"
+            message = ("同一区间存在多个同名平台任务，请核对确切任务 ID；尚未认领或重复提交。" if candidates else
+                       "平台有相同时段任务，但名称或采集身份不一致；原记录保留，请核对任务 ID。")
+            item.update(bindingVerified=False, bindingIssue=code, bindingMessage=message)
+            return None, message
+        item.update(remoteId=str(candidates[0]["id"]), bindingSource="existing_platform")
+        row, issue = self.bind_remote_item(target, item, parents)
+        if row:
+            item["message"] = "已核实并复用平台已有采集，可在视频确认中查看或重新采集。"
+        return row, issue
 
     def bind_remote_item(self, target: dict, item: dict, parents: dict[str, dict]) -> tuple[dict | None, str]:
         """Bind only a known ID or a unique post-submission inventory difference."""
@@ -175,17 +200,16 @@ class JobManager:
                     raise ValueError("实绩未通过采集准入校验，已阻止提交。请重新查询。")
                 await self.camera(job["target"])
                 remote = await self.remote_tasks(job["target"], pending)
-                local = self.store.known_keys(exclude_job=job["id"])
+                local = self.store.known_keys(exclude_job=job["id"], include_retired=False)
                 for item in pending:
-                    if row := remote.get(item["key"]):
-                        item.update(status="duplicate", duplicateSource="remote", remoteId=str(row["id"]),
-                                    remoteStatus=str(row.get("taskStatus") or row.get("status") or ""),
-                                    message="原站已有相同相机和采集时段的任务，无需重复创建。")
-                        if row.get("videoName"):
-                            item.update(videoName=str(row["videoName"]), taskName=str(row.get("taskName") or row["videoName"]))
-                    elif item["key"] in local:
+                    if item['key'] in local:
                         item.update(status="duplicate", duplicateSource="local",
-                                    message="本地记录已登记相同相机和采集时段，请核对原站状态。")
+                                    message="本条已有采集，请打开已有视频查看或按当前区间重新采集。")
+                    elif candidates := remote.get(item["key"]):
+                        item.update(status="duplicate", duplicateSource="remote")
+                        _, issue = self.bind_existing_item(job["target"], item, {str(row["id"]): row for row in candidates})
+                        if issue:
+                            item["message"] = issue
                 pending = [item for item in pending if item["status"] == "pending"]
                 self.event(job, f"核对完成，准备提交 {len(pending)} 条，每批最多 {BATCH_LIMIT} 条。")
                 for offset in range(0, len(pending), BATCH_LIMIT):
@@ -231,7 +255,7 @@ class JobManager:
                         self.event(job, "已核对当前批次的确切任务 ID，并暂停后续提交；可核对后继续剩余任务。")
                         return
                     self.event(job, f"第 {offset // BATCH_LIMIT + 1} 批已提交成功。")
-                job["status"] = "complete"
+                job["status"] = "attention" if any(item.get("bindingIssue") for item in job["items"]) else "complete"
                 self.event(job, "全部任务已处理；可刷新原站状态查看视频采集结果。")
             except asyncio.CancelledError:
                 for item in job["items"]:
@@ -253,28 +277,39 @@ class JobManager:
         job["events"].append({"at": now_iso(), "message": message})
         self.store.save(job)
 
-    async def reconcile(self, job_id: str) -> dict:
+    async def reconcile(self, job_id: str, *, parents=None, item_key=None) -> dict:
         if job_id in self.running:
             raise ValueError("任务正在提交，请等待当前批次结束。")
         job = self.store.get(job_id)
         if not job:
             raise KeyError("任务不存在。")
         active = [item for item in job["items"] if item["status"] != "removed"]
-        remote = await self.remote_parents(job["target"]) if active else {}
+        remote = (await self.remote_parents(job["target"]) if parents is None else parents) if active else {}
+        if job_id in self.running:
+            raise ValueError("任务正在提交，请等待当前批次结束。")
+        # The network read may overlap a stop/removal; do not save its old copy.
+        job = self.store.get(job_id)
+        if not job:
+            raise KeyError("任务不存在。")
+        active = [item for item in job["items"] if item["status"] != "removed"]
         matched = 0
         for item in job["items"]:
-            if item["status"] == "removed":
+            if item["status"] == "removed" or (item_key is not None and item.get('key') != item_key):
                 continue
+            if item['status'] == 'duplicate' and item.get('existingVideoId'):
+                continue  # The canonical video owns its binding and correction history.
             if item["status"] == "pending" and not item.get("remoteId") and not item.get("submission"):
                 continue  # 尚未写入的新任务由 execute 按原有规则完成初次去重。
-            row, issue = self.bind_remote_item(job["target"], item, remote)
+            binder = self.bind_existing_item if item["status"] == "duplicate" else self.bind_remote_item
+            row, issue = binder(job["target"], item, remote)
             if row:
                 matched += 1
                 if item["status"] in ("uncertain", "pending", "failed"):
                     item.update(status="submitted", message="已在原站找到对应采集任务。")
             else:
                 item["message"] = issue
-        if all(item["status"] == "removed" or (item["status"] in ("submitted", "duplicate") and item.get("bindingVerified"))
+        if all(item["status"] == "removed" or (item["status"] in ("submitted", "duplicate")
+               and (item.get("bindingVerified") or item.get('existingVideoId')))
                for item in job["items"]):
             job["status"] = "complete"
         elif any(item.get("bindingIssue") for item in active):

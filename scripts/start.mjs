@@ -38,14 +38,14 @@ if (process.platform === 'darwin') {
         try {
             const response = await fetch(`${appUrl}/api/health`, { signal: AbortSignal.timeout(1200) });
             if (response.ok && (await response.json()).app === 'inspection-video-gather-simple') {
-                console.log(`程序已启动：${appUrl}。关闭本终端后任务继续运行；停止请双击“停止简易版.command”。`);
+                console.log(`程序已启动：${appUrl}。关闭本终端后任务继续运行；停止请运行 ./启动简易版.command stop。`);
                 openBrowser();
                 process.exit(0);
             }
         } catch { /* 等待已保存连接和队列恢复。 */ }
         await new Promise(resolve => setTimeout(resolve, 500));
     }
-    console.error('后台服务仍在启动，请稍后打开网页，或查看 data/local-service.log。');
+    console.error('后台服务仍在启动，请稍后打开网页，或查看 数据/系统/local-service.log。');
     process.exit(1);
 }
 const server = spawn(python, ['-m', 'app.main'], { stdio: 'inherit', cwd: root });

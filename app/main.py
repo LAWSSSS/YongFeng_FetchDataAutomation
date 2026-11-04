@@ -28,6 +28,7 @@ from .models import (BulkVideoInput, CollectionRule, CorrectionInput, DirectoryI
                      LoginInput, PreviewInput, RecordRemoveInput, SearchInput, SubmitInput, VersionActionInput,
                      UploadAuditInput, UploadAuditLoginInput, AuditMovePreviewInput, AuditMoveConfirmInput)
 from .models import AdmissionSettingsInput, UploadScanInput, VideoDownloadLimitInput
+from .models import CollectionRecaptureInput, RecaptureInput
 from .models import FileCleanupInput
 from .models import SliceClassifyConfirmInput
 from .slice_classify import SliceClassification
@@ -413,8 +414,8 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
         return collection_runs.public(collection_runs.start(payload.model_dump()))
 
     @application.get('/api/collection-runs')
-    async def list_collection_runs(request: Request, page: int = Query(1, ge=1)):
-        return state_response(collection_runs.state(page=page), request)
+    async def list_collection_runs(request: Request, page: int = Query(1, ge=1), currentOnly: bool = False):
+        return state_response(collection_runs.state(page=page, current_only=currentOnly), request)
 
     @application.post('/api/collection-runs/records/remove')
     async def hide_collection_run_records(payload: SlicingRecordRemoveInput):
@@ -444,6 +445,10 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
     @application.post('/api/collection-runs/{identity}/submit', status_code=202)
     async def confirm_collection_plan(identity: str, payload: CollectionSubmitInput):
         return collection_runs.review.submit(identity, payload.model_dump())
+
+    @application.post('/api/collection-runs/{identity}/recapture', status_code=202)
+    async def recapture_collection_record(identity: str, payload: CollectionRecaptureInput):
+        return await collection_runs.review.recapture(identity, payload.model_dump())
 
     @application.get('/api/collection-operations/{identity}')
     async def collection_operation(identity: str):
@@ -1059,7 +1064,7 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
         records = [row for row in run["records"] if row["id"] in wanted]
         if len(records) != len(wanted):
             raise ValueError("所选实绩已变化，请重新选择。")
-        known = store.known_keys()
+        known = store.known_keys(include_retired=False)
         rule = CollectionRule()
         provisional = build_tasks(records, rule, dict(target_config), known, admission["rule"])
         remote = {}
@@ -1070,8 +1075,9 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
         tasks = build_tasks(records, rule, dict(target_config), known, admission["rule"])
         for task in tasks:
             if task["status"] == "duplicate" and task["key"] in remote:
-                task.update(duplicateSource="remote", remoteId=str(remote[task["key"]].get("id") or ""),
-                            reason="平台已有相同时段任务；简易版不自动认领其他程序的任务。")
+                candidates = [row for row in remote[task["key"]] if jobs.parent_matches(row, target_config, task)]
+                task.update(duplicateSource="remote", remoteId=str(candidates[0]["id"]) if len(candidates) == 1 else "",
+                            reason="平台已有相同时段任务，请打开已有采集核对；不会重复提交。")
         plan = {"id": uuid4().hex, "searchId": run["id"], "demo": False,
                 "target": dict(target_config), "rule": rule.model_dump(),
                 "admissionRule": admission["rule"], "admissionRevision": admission["revision"],
@@ -1153,7 +1159,7 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
         if not rows:
             raise HTTPException(404, '这条视频记录不存在或已清除，未打开其他同名视频。')
         return state_response({'video': compact_video(rows[0]),
-                               'recordHidden': identity in videos.record_visibility.hidden()}, request)
+                               'recordHidden': rows[0]['id'] in videos.record_visibility.hidden()}, request)
 
     @application.post("/api/videos/download-limit")
     async def video_download_limit(payload: VideoDownloadLimitInput):
@@ -1228,8 +1234,8 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
             raise HTTPException(404, str(error)) from None
 
     @application.post("/api/videos/{identity}/recapture", status_code=202)
-    async def recapture_unavailable(identity: str, payload: VersionActionInput):
-        return await videos.recapture_unavailable(identity, payload.model_dump())
+    async def recapture_unavailable(identity: str, payload: RecaptureInput):
+        return await videos.recapture_unavailable(identity, payload.model_dump(exclude_defaults=True))
 
     @application.post("/api/videos/{identity}/remove-uncorrected")
     async def remove_uncorrected(identity: str, payload: HistoryRemoveInput):
