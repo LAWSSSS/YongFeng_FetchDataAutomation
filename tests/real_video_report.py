@@ -251,7 +251,7 @@ def build_report(root):
               '报告、JUnit、脱敏检查点与浏览器截图保留。',
               '- `media-cleanup-manifest.json` / `media-cleanup-journal.jsonl` 保存逐文件清单；'
               '业务先按安全策略保留测试原片，再由演练清理明确删除测试副本，两者分别记录。', '',
-              '复现入口：`scripts/run_real_video_e2e.py`，见 `README.md` 的隔离验证。'
+              '复现入口：`scripts/run_real_video_e2e.py --help`。'
               '清理后请使用新的运行目录进行下一次完整媒体演练。', '',
               '## 逐案例索引', '',
               '|节点 / 场景|类型|符合预期|墙钟秒|', '|---|---|---|---:|']

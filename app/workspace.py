@@ -1190,9 +1190,9 @@ class WorkspaceManager(WorkspaceScheduler):
         except ValueError:
             return 0
 
-    async def request_cleanup_completed(self, expected_revision, request_id, only=None):
+    async def request_cleanup_completed(self, expected_revision, request_id, only=None, *, token=None):
         from .workspace_cleanup import request_completed
-        return await request_completed(self, expected_revision, request_id, only)
+        return await request_completed(self, expected_revision, request_id, only, token=token)
 
     def cleanup_operation(self, identity):
         from .workspace_cleanup import public_operation

@@ -55,6 +55,14 @@ def file_digest(path: Path) -> str:
     return digest.hexdigest()
 
 
+def edge_digest(stream, size: int) -> str:
+    digest = hashlib.sha256(stream.read(65536))
+    if size > 65536:
+        stream.seek(size - 65536)
+        digest.update(stream.read(65536))
+    return digest.hexdigest()
+
+
 def copy_exclusive(source: Path, destination: Path, expected_digest: str | None = None):
     """Portable publication for filesystems without exclusive rename or hard links."""
     created = None

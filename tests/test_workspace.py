@@ -492,7 +492,7 @@ async def test_cleanup_restarts_after_unlink_before_acknowledgement(env,tmp_path
     async def interrupt(function,*args):
         nonlocal deletions
         value=await saved(function,*args)
-        if getattr(function,'__name__','')=='unlink':
+        if getattr(function,'__name__','')=='unlink_workspace_file':
             deletions+=1
             if deletions==interrupt_at:raise asyncio.CancelledError()
         return value

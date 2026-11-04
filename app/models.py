@@ -261,6 +261,10 @@ class WorkspaceActionInput(BaseModel):
     pilot: bool = False
 
 
+class WorkspaceCleanupInput(WorkspaceActionInput):
+    previewToken: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+
+
 class RecordSelection(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True)
     id: str = Field(min_length=1, max_length=100)

@@ -2,6 +2,7 @@ import {useCallback,useEffect,useRef,useState} from 'react';
 import {FolderOpen} from '@phosphor-icons/react';
 import {usePolling} from './usePolling';
 import {createReadCycle,localJson} from './local-api';
+import CompletedCleanup from './CompletedCleanup';
 import './workspace.css';
 
 type State={online:boolean;maintenance:boolean;totalBytes:number;freeBytes?:number;fixedLocation?:boolean;
@@ -26,5 +27,6 @@ export default function Workspace({onChanged:_onChanged}:{onChanged:()=>Promise<
       {state.online?'可用':'等待磁盘恢复'} · 已登记 {size(state.totalBytes)}{typeof state.freeBytes==='number'&&` · 可用空间 ${size(state.freeBytes)}`}</p>}
     {!state?.online&&state?.availability?.message&&<p className="notice">{state.availability.message}</p>}
     {error&&<p className="error" role="alert">{error}</p>}
+    <CompletedCleanup embedded/>
   </section>;
 }

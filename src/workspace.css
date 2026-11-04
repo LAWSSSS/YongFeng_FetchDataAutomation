@@ -1,4 +1,7 @@
 .workspace-panel { margin-bottom: 24px; }
+.workspace-cleanup { border-top: 1px solid #dce5df; margin-top: 16px; padding-top: 16px; }
+.workspace-cleanup h3 { margin: 0; }
+.cleanup-issues { overflow-wrap: anywhere; }
 .workspace-heading, .workspace-status, .workspace-heading h2 { display: flex; align-items: center; gap: 12px; }
 .workspace-heading { justify-content: space-between; flex-wrap: wrap; }
 .workspace-heading h2 { margin: 0; font-size: 1.125rem; }

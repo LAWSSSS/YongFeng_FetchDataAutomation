@@ -227,7 +227,7 @@ async def test_existing_attention_request_resumes_same_scope_then_restarts_safel
         async def stop_after_unlink(function, *args):
             nonlocal interrupted
             result = await original_io(function, *args)
-            if getattr(function, '__name__', '') == 'unlink' and not interrupted:
+            if getattr(function, '__name__', '') == 'unlink_workspace_file' and not interrupted:
                 interrupted = True
                 import asyncio
                 raise asyncio.CancelledError()

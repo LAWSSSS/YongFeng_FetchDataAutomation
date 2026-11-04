@@ -7,7 +7,7 @@ from contextlib import ExitStack
 
 from .audit_moves import checked_path
 from .domain import now_iso
-from .workspace_files import compatible, file_version
+from .workspace_files import compatible, file_version, unlink_workspace_file
 from .file_leases import FileEnvironmentError
 
 
@@ -123,7 +123,6 @@ def receipt_signature(manager, asset):
 
 
 def authorization(manager, asset):
-    from .cleanup_remount import candidate
     if hasattr(manager, '_cleanup_authorization_cache'):
         return manager._cleanup_authorization_cache.get(asset['id'], (None, None))
     rows = manager.db.execute("""SELECT payload FROM simple_workspace_requests
@@ -135,16 +134,17 @@ def authorization(manager, asset):
         if request.get('kind') != 'cleanup-completed' or request.get('state') == 'complete':
             continue
         saved = next((row for row in request.get('assets', []) if row['id'] == asset['id']), None)
-        if saved and candidate(asset, saved, request['id']):
-            return request, saved
-        journal = asset.get('cleanup') or {}
-        if journal.get('requestId') == request['id'] and rejected_journal(journal):
-            continue
-        if request.get('state') == 'attention':
-            continue
-        if saved and saved.get('state') not in {'complete', 'attention'}:
+        if saved and authorized_snapshot(asset, request, saved):
             return request, saved
     return None, None
+
+
+def authorized_snapshot(asset, request, saved):
+    from .cleanup_remount import candidate
+    journal = asset.get('cleanup') or {}
+    return (candidate(asset, saved, request['id'])
+            or (request.get('state') != 'attention' and saved.get('state') not in {'complete', 'attention'}
+                and (journal.get('requestId') != request['id'] or not rejected_journal(journal))))
 
 
 REJECTION_REASONS = {'remount_unverified', 'receipt_changed', 'file_changed', 'file_missing', 'workspace_identity'}
@@ -231,15 +231,12 @@ class CleanupView:
         self.requests = manager.rows('requests')
         self._cleanup_registered_ids = {saved['id'] for request in self.requests
             if request.get('kind') == 'cleanup-completed' for saved in request.get('assets', [])}
-        from .cleanup_remount import candidate
         indexed_assets = {asset['id']: asset for asset in assets}
         for request in self.requests:
             if request.get('kind') == 'cleanup-completed' and request.get('state') != 'complete':
                 for saved in request.get('assets', []):
                     asset = indexed_assets.get(saved['id']) or {}
-                    if ((request.get('state') != 'attention' and saved.get('state') not in {'complete', 'attention'}
-                         and not rejected_journal(asset.get('cleanup') or {}))
-                            or candidate(asset, saved, request['id'])):
+                    if authorized_snapshot(asset, request, saved):
                         self._cleanup_authorization_cache[saved['id']] = (request, saved)
 
     def __getattr__(self, name):
@@ -291,24 +288,14 @@ def summary(manager, assets=None, links=None, packages=None):
         return copy.deepcopy(cached[1])
     assets = manager.rows('assets') if assets is None else assets
     view = CleanupView(manager, assets, links, packages)
-    eligible = []
-    for asset in assets:
-        if asset.get('cleanup', {}).get('state') == 'complete' or asset.get('status') not in {'managed', 'waiting'}:
-            continue
-        relevant = view.linked(asset)
-        if not relevant or any(category.get('state') not in {'complete', 'no_target', 'uncuttable', 'not_applicable'}
-                               for item in relevant for category in item.get('categories', {}).values()):
-            continue
-        if registered_cleanup(view, asset) or not eligibility(view, asset)[0]:
-            continue
-        try:
-            entries = snapshot_entries(view, asset, validate=False)
-        except ValueError:
-            continue
-        eligible.append((asset, entries))
-    latest = next((row for row in reversed(view.requests) if row.get('kind') == 'cleanup-completed'), None)
+    eligible = cleanup_candidates(view, assets)
+    requests = [row for row in reversed(view.requests) if row.get('kind') == 'cleanup-completed' and row.get('total')]
+    latest = next((row for row in requests if row.get('state') in {'queued', 'running', 'waiting'}), None)
+    if not latest and requests:
+        latest = requests[0]
     result = {'eligibleCount': len(eligible), 'eligibleBytes': sum(
-        entry['expected'].get('size', 0) for _asset, entries in eligible for entry in entries if entry['state'] != 'deleted'),
+        entry['expected']['size'] for row in eligible for entry in row['manifest'] if entry['state'] != 'deleted'),
+        'previewToken': preview_token(manager, eligible),
         'latestOperation': public_operation(latest, assets) if latest else None}
     manager._cleanup_summary_cache = (changes, result)
     return copy.deepcopy(result)
@@ -318,7 +305,12 @@ def snapshot_entries(manager, asset, validate=True):
     from pathlib import Path
     if not manager.enabled:
         raise ValueError('工作区尚未启用。')
-    entries = copy.deepcopy(list({row['path']: row for row in manager.media_entries(asset)}.values()))
+    entries = {}
+    for row in manager.media_entries(asset):
+        prior = entries.setdefault(row['path'], row)
+        if prior != row:
+            raise ValueError('同一路径绑定了不同文件记录，原位保留。')
+    entries = copy.deepcopy(list(entries.values()))
     previous = {row.get('path'): row for row in asset.get('cleanup', {}).get('manifest', [])}
     for entry in entries:
         path = checked_path(entry['path']) if validate else Path(entry['path'])
@@ -338,12 +330,74 @@ def snapshot_entries(manager, asset, validate=True):
     return entries
 
 
-async def request_completed(manager, revision, request_id, only=None):
+def moving_asset_ids(manager):
+    return {identity for identity, in manager.db.execute(
+        """SELECT json_extract(payload, '$.assetId') FROM simple_workspace_moves
+           WHERE json_extract(payload, '$.state') = 'moving'
+              OR (json_extract(payload, '$.state') = 'attention'
+                  AND (json_extract(payload, '$.destinationVersion') IS NOT NULL
+                       OR json_extract(payload, '$.temporaryVersion') IS NOT NULL))""")}
+
+
+def eligible_entries(manager, asset, moving):
+    if asset['id'] in moving or not eligibility(manager, asset)[0]:
+        return None
+    registered = registered_cleanup(manager, asset)
+    journal = asset.get('cleanup') or {}
+    if registered and (journal.get('state') != 'attention' or journal.get('reasonCode') != 'file_missing'
+                       or authorization(manager, asset)[0]):
+        return None
+    try:
+        entries = snapshot_entries(manager, asset, validate=False)
+    except ValueError:
+        return None
+    if not registered:
+        return entries
+
+    # A new click may retry a stale snapshot only if verified moves explain
+    # the change, with exactly the same files and no partial deletion.
+    from .file_locations import resolve
+    current = {(e['path'], e['kind'], e.get('packageId')): e['expected'] for e in entries}
+    moved = False
+    for entry in journal.get('manifest', []):
+        if entry.get('state') != 'planned':
+            return None
+        target, version = resolve(manager.db, entry['path'], entry['expected'])
+        expected = current.pop((target, entry['kind'], entry.get('packageId')), None)
+        if not expected or not compatible(expected, version):
+            return None
+        moved |= target != entry['path']
+    return entries if moved and not current else None
+
+
+def cleanup_candidates(manager, assets, only=None):
+    moving = moving_asset_ids(manager)
+    rows = []
+    for asset in assets:
+        if ((only and asset['id'] != only) or asset.get('status') not in {'managed', 'waiting'}
+                or asset.get('cleanup', {}).get('state') == 'complete'):
+            continue
+        entries = eligible_entries(manager, asset, moving)
+        if entries:
+            rows.append({'id': asset['id'], 'name': asset.get('name', ''), 'path': asset['path'],
+                         'fileVersion': copy.deepcopy(asset['fileVersion']),
+                         'manifest': entries, 'state': 'queued', 'message': '等待安全清理。'})
+    return rows
+
+
+def preview_token(manager, rows):
+    from .cleanup_remount import digest
+    scope = [{'id': row['id'], 'manifest': row['manifest']} for row in rows]
+    return digest({'revision': manager.config['revision'], 'scope': scope})
+
+
+async def request_completed(manager, revision, request_id, only=None, *, token=None):
     from .videos import Conflict
     async with manager.cleanup_registration_lock:
         prior = manager.get('requests', request_id)
         if prior:
-            if prior.get('kind') != 'cleanup-completed' or prior.get('only') != only:
+            if (prior.get('kind') != 'cleanup-completed' or prior.get('only') != only
+                    or prior.get('previewToken') != token):
                 raise Conflict('请求编号已用于其他操作。')
             return public_operation(prior, manager.rows('assets'))
         if revision != manager.config['revision']:
@@ -353,24 +407,21 @@ async def request_completed(manager, revision, request_id, only=None):
         control = getattr(manager.slicing, 'control', None)
         if control:
             control.refresh()
-        rows = []
-        for asset in manager.rows('assets'):
-            if (only and asset['id'] != only) or asset.get('status') not in {'managed', 'waiting'} or asset.get('cleanup', {}).get('state') == 'complete':
-                continue
-            if registered_cleanup(manager, asset) or not eligibility(manager, asset)[0]:
-                continue
-            try:
-                entries = snapshot_entries(manager, asset, validate=False)
-            except ValueError:
-                continue
-            rows.append({'id': asset['id'], 'name': asset.get('name', ''), 'path': asset['path'],
-                         'fileVersion': copy.deepcopy(asset['fileVersion']), 'receiptSignature': receipt_signature(manager, asset),
-                         'manifest': entries, 'state': 'queued', 'message': '等待安全清理。'})
+        assets = manager.rows('assets')
+        view = CleanupView(manager, assets)
+        rows = cleanup_candidates(view, assets, only)
+        if token is not None and token != preview_token(manager, rows):
+            raise Conflict('可清理的文件已变化，请核对更新后的数量和空间，再确认清理。')
+        by_id = {asset['id']: asset for asset in assets}
+        for row in rows:
+            row['receiptSignature'] = receipt_signature(view, by_id[row['id']])
         request = {'id': request_id, 'operationId': request_id, 'kind': 'cleanup-completed', 'only': only,
+                   'previewToken': token,
                    'state': 'queued' if rows else 'complete', 'assets': rows, 'total': len(rows),
                    'totalBytes': sum(e['expected']['size'] for row in rows for e in row['manifest'] if e['state'] != 'deleted'),
                    'finished': 0, 'waiting': len(rows), 'failed': 0, 'createdAt': now_iso(),
-                   'message': f'已登记 {len(rows)} 条；以后完成的视频等待下次清理。'}
+                   'message': (f'已登记 {len(rows)} 条；以后完成的视频等待下次清理。'
+                               if rows else '当前没有可登记的文件。正在归档的文件将在归档后可清理。')}
         manager.save('requests', request)
         manager.wake.set()
         return public_operation(request)
@@ -509,7 +560,7 @@ async def cleanup(manager, asset):
                 update_operations(manager)
                 return
         accepted = effective_snapshot(saved, journal)
-        remounted = mapping(saved, journal) is not None
+        remount = mapping(saved, journal)
         if (asset.get('path') != accepted['path']
                 or not compatible(asset.get('fileVersion') or {}, accepted['fileVersion'])
                 or receipt_signature(manager, asset) != accepted['receiptSignature']):
@@ -532,7 +583,7 @@ async def cleanup(manager, asset):
             actual = await manager.videos.file_operation(file_version, path, 'edgeHash' in expected)
             if not compatible(actual, expected):
                 raise ValueError('文件版本变化，剩余文件保留。')
-            if remounted:
+            if remount:
                 await manager.videos.file_operation(verify_remount_current, path, entry, saved, journal)
         journal.update(state='running', reasonCode='', currentName=asset.get('name', ''))
         asset['cleanup'] = journal
@@ -558,7 +609,7 @@ async def cleanup(manager, asset):
                         raise ValueError(reason or '处理指令已更新，停止清理。')
                     if receipt_signature(manager, asset) != accepted['receiptSignature']:
                         raise ValueError('照片或处理版本已变化，本次剩余文件保留。')
-                    if remounted:
+                    if remount:
                         await manager.videos.file_operation(verify_remount_current, path, entry, saved, journal)
                         # The ctime check also yields to the event loop. Keep a
                         # pause/correction arriving during that last disk read.
@@ -567,7 +618,9 @@ async def cleanup(manager, asset):
                             raise ValueError(reason or '照片或处理版本已变化，本次剩余文件保留。')
                     entry['state'] = 'deleting'
                     manager.save('assets', asset)
-                    await manager.videos.file_operation(path.unlink)
+                    ctime = remount['files'][entry['path']]['ctimeNs'] if remount else None
+                    await manager.videos.file_operation(
+                        unlink_workspace_file, manager.root, manager.config['workspaceId'], path, expected, ctime)
                 elif entry['state'] != 'deleting':
                     raise ValueError('缺少文件删除凭证，停止清理。')
                 entry.update(state='deleted', deletedAt=now_iso())
@@ -575,14 +628,6 @@ async def cleanup(manager, asset):
                 if time.monotonic() - progress_at >= 1:
                     update_operations(manager)
                     progress_at = time.monotonic()
-            # Remove empty program-created leaf folders only. Unknown siblings stay.
-            for parent in (path.parent, path.parent.parent):
-                if parent.parent == manager.root or parent == manager.root:
-                    continue
-                try:
-                    await manager.videos.file_operation(parent.rmdir)
-                except OSError:
-                    pass
         journal.update(state='complete', reasonCode='', currentName='', completedAt=now_iso(), message='本地媒体已清理；云端成果和历史记录保留。')
         asset.update(status='cleaned', message=journal['message'])
         # Tombstones prevent historical items from rebuilding removed media.

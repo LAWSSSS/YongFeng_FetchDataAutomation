@@ -11,7 +11,7 @@ import subprocess
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name, parse_wheel_filename
 
-ROOT_FILES = {".gitignore", "README.md", "pytest.ini", "index.html", "package.json",
+ROOT_FILES = {".gitignore", "README.md", "THIRD_PARTY_NOTICES.md", "pytest.ini", "index.html", "package.json",
               "package-lock.json", "tsconfig.json", "vite.config.ts", "packaging.lock.json",
               "requirements.txt", "requirements.lock.txt", "requirements-slicing.txt",
               "requirements-slicing.lock.txt", "启动简易版.command"}

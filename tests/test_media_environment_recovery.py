@@ -234,7 +234,7 @@ async def test_interrupted_cleanup_keeps_real_byte_progress_and_resumes_same_fil
 
     async def io(function, *args, **kwargs):
         nonlocal deletes
-        if getattr(function, '__name__', '') == 'unlink':
+        if getattr(function, '__name__', '') == 'unlink_workspace_file':
             deletes += 1
             if deletes == 2:
                 raise OSError(errno.EIO, 'injected read/write interruption')

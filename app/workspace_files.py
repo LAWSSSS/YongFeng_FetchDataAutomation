@@ -1,11 +1,15 @@
 """Filesystem primitives for the managed workspace. No platform operations."""
+import errno
 import hashlib
 import json
 import os
 import re
+import stat
+from contextlib import ExitStack
 from pathlib import Path
 
-from .audit_moves import checked_path, source_fingerprint
+from .audit_moves import checked_path, fingerprint, source_fingerprint
+from .media import edge_digest
 
 VIDEO_BRANCHES = ('采集视频', '未切片', '车斗未切片', '磁盘吊未切片', '已切片')
 OUTPUT_BRANCHES = {'bed': '车斗已切片', 'magnet': '磁盘吊已切片'}
@@ -22,7 +26,7 @@ def read_marker(root):
         if path.stat().st_size > 4096:
             return None
         data = json.loads(path.read_text())
-        return data if data.get('format') == FORMAT and data.get('id') else None
+        return data if isinstance(data, dict) and data.get('format') == FORMAT and data.get('id') else None
     except (ValueError, OSError, TypeError):
         return None
 
@@ -95,6 +99,69 @@ def file_version(path, edge=False):
         from .slicing import source_version
         return source_version(path)
     return source_fingerprint(Path(path))
+
+
+def unlink_workspace_file(root, workspace_id, path, expected, expected_ctime=None):
+    """Recheck the bound file using directory handles at the deletion boundary."""
+    root = checked_path(root)
+    path = checked_path(path)
+    if not path.is_relative_to(root) or len(path.relative_to(root).parts) < 3:
+        raise ValueError('待清理文件不属于已登记工作区。')
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    try:
+        with ExitStack() as handles:
+            def open_entry(name, parent=None, *, directory=False):
+                fd = os.open(name, flags | (os.O_DIRECTORY if directory else 0), dir_fd=parent)
+                handles.callback(os.close, fd)
+                return fd
+
+            root_fd = open_entry(root.anchor, directory=True)
+            for part in root.parts[1:]:
+                root_fd = open_entry(part, root_fd, directory=True)
+            marker_fd = open_entry(MARKER, root_fd)
+            info = os.fstat(marker_fd)
+            try:
+                data = json.loads(os.read(marker_fd, 4096)) if stat.S_ISREG(info.st_mode) and info.st_size <= 4096 else None
+            except ValueError:
+                data = None
+            if not isinstance(data, dict) or data.get('id') != workspace_id or data.get('format') != FORMAT:
+                raise ValueError('工作区身份无法确认，文件保留。')
+
+            parent_fd = root_fd
+            directories = []
+            for part in path.relative_to(root).parts[:-1]:
+                child_fd = open_entry(part, parent_fd, directory=True)
+                directories.append((parent_fd, part, child_fd))
+                parent_fd = child_fd
+
+            file_fd = open_entry(path.name, parent_fd)
+            before = os.fstat(file_fd)
+            actual = fingerprint(before)
+            if not stat.S_ISREG(before.st_mode) or any(expected.get(key) != value for key, value in actual.items()):
+                raise ValueError('文件在清理前发生变化，剩余文件保留。')
+            if 'edgeHash' in expected:
+                with os.fdopen(file_fd, 'rb', closefd=False) as stream:
+                    if edge_digest(stream, before.st_size) != expected['edgeHash']:
+                        raise ValueError('文件内容在清理前发生变化，剩余文件保留。')
+            current = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+            if (not stat.S_ISREG(current.st_mode) or fingerprint(current) != actual
+                    or current.st_ctime_ns != before.st_ctime_ns
+                    or (expected_ctime is not None and current.st_ctime_ns != expected_ctime)):
+                raise ValueError('文件在清理前发生变化，剩余文件保留。')
+            os.unlink(path.name, dir_fd=parent_fd)
+
+            # Only prune empty folders below the named workspace branches.
+            for directory_fd, name, child_fd in reversed(directories[1:][-2:]):
+                try:
+                    current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                    if os.path.samestat(current, os.fstat(child_fd)):
+                        os.rmdir(name, dir_fd=directory_fd)
+                except OSError:
+                    pass
+    except OSError as error:
+        if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise ValueError('清理路径已变化或经过符号链接，剩余文件保留。') from error
+        raise
 
 
 def birth_ns(path):

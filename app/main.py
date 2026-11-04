@@ -63,7 +63,7 @@ from .collection_runs import CollectionRunManager
 from .models import CollectionRunInput, CollectionDraftInput, CollectionSubmitInput, FinalConfirmationInput, RecordDeletionInput
 from .presentation import slicing_view
 from .package_gallery import PackageGallery
-from .models import WorkspacePreviewInput, WorkspaceActionInput
+from .models import WorkspacePreviewInput, WorkspaceActionInput, WorkspaceCleanupInput
 from .models import PipelineControlInput, PipelineBatchInput
 from . import runtime
 from .event_loop_health import EventLoopHealth
@@ -395,12 +395,16 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
         return {'ok': True}
 
     @application.post('/api/workspace/cleanup-completed', status_code=202)
-    async def cleanup_completed(payload: WorkspaceActionInput):
-        return await workspace.request_cleanup_completed(payload.expectedRevision, payload.requestId)
+    async def cleanup_completed(payload: WorkspaceCleanupInput):
+        if payload.previewToken is None:
+            raise Conflict('请刷新页面，查看当前清理范围后再确认。')
+        return await workspace.request_cleanup_completed(payload.expectedRevision, payload.requestId,
+                                                         token=payload.previewToken)
 
     @application.get('/api/workspace/cleanup-summary')
     async def completed_cleanup_summary(request: Request):
-        return state_response({'revision': workspace.config['revision'], 'cleanupCompleted': workspace.cleanup_summary()}, request)
+        return state_response({'revision': workspace.config['revision'], 'availability': dict(workspace.availability),
+                               'cleanupCompleted': workspace.cleanup_summary()}, request)
 
     @application.get('/api/workspace/cleanup-operations/{identity}')
     async def cleanup_operation(identity: str, request: Request):

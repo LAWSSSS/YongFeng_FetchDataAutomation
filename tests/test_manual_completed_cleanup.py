@@ -2,6 +2,7 @@
 import asyncio
 from pathlib import Path
 
+import httpx
 import pytest
 
 from app.main import create_app
@@ -135,7 +136,7 @@ async def test_delete_crash_after_unlink_resumes_same_journal(tmp_path, monkeypa
     async def crash_after_delete(function, *args):
         nonlocal crashed
         value = await original(function, *args)
-        if getattr(function, '__name__', '') == 'unlink' and not crashed:
+        if getattr(function, '__name__', '') == 'unlink_workspace_file' and not crashed:
             crashed = True
             raise asyncio.CancelledError()
         return value
@@ -183,6 +184,126 @@ async def test_cleanup_registration_does_not_wait_for_slow_organizer(tmp_path):
         async with w.lock:
             result = await asyncio.wait_for(w.request_cleanup_completed(w.config['revision'], 'fast-click'), 0.5)
         assert result['total'] == 1 and Path(asset['path']).exists()
+    finally:
+        await close_app(app)
+
+
+@pytest.mark.asyncio
+async def test_cleanup_skips_asset_with_move_in_progress(tmp_path):
+    app, w, asset = await prepared(tmp_path)
+    try:
+        w.save('moves', {'id': 'archiving', 'assetId': asset['id'], 'state': 'moving'})
+        assert w.cleanup_summary()['eligibleCount'] == 0
+        request = await w.request_cleanup_completed(w.config['revision'], 'while-moving')
+        assert request['total'] == 0
+        assert Path(asset['path']).exists()
+    finally:
+        await close_app(app)
+
+
+@pytest.mark.asyncio
+async def test_cleanup_retry_requires_verified_archive_move_and_new_click(tmp_path):
+    app, w, asset = await prepared(tmp_path)
+    try:
+        old = await w.request_cleanup_completed(w.config['revision'], 'before-archive')
+        manifest = w.get('requests', old['id'])['assets'][0]['manifest']
+        entry = next(e for e in manifest if e['kind'] == 'image')
+        source = Path(entry['path'])
+        destination = source.parent / '归档位置' / source.name
+        move = w.move_entry(source, destination, entry['expected'], asset['id'], entry['kind'])
+        move['packageId'] = entry['packageId']
+        # Reproduce an archive move already underway when the old snapshot was taken.
+        await w.process_move(move)
+        await w.cleanup(asset)
+        assert w.cleanup_operation(old['id'])['reasonCode'] == 'file_missing'
+        assert destination.is_file() and Path(asset['path']).is_file()
+
+        empty = await w.request_cleanup_completed(w.config['revision'], 'empty-click', only='other-asset')
+        assert empty['total'] == 0
+        summary = w.cleanup_summary()
+        assert summary['latestOperation']['id'] == old['id']
+        assert summary['latestOperation']['assets'][0]['name'] == asset['name']
+        assert summary['eligibleCount'] == 1
+        await w.cleanup(w.get('assets', asset['id']))
+        assert destination.is_file()
+
+        renewed = await w.request_cleanup_completed(w.config['revision'], 'retry-at-verified-location')
+        assert renewed['total'] == 1 and renewed['totalFiles'] == old['totalFiles']
+        assert w.cleanup_summary()['eligibleCount'] == 0
+        await w.cleanup(w.get('assets', asset['id']))
+        assert not destination.exists() and not Path(asset['path']).exists()
+        assert w.cleanup_operation(renewed['id'])['state'] == 'complete'
+        assert w.get('requests', old['id'])['assets'][0]['manifest'] == manifest
+    finally:
+        await close_app(app)
+
+
+@pytest.mark.asyncio
+async def test_cleanup_api_requires_confirmation_of_current_paths(tmp_path):
+    app, w, asset = await prepared(tmp_path)
+    try:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://127.0.0.1') as client:
+            endpoint = '/api/workspace/cleanup-completed'
+            summary = (await client.get('/api/workspace/cleanup-summary')).json()
+            original = summary['cleanupCompleted']
+            assert summary['availability']['online']
+            request = {'expectedRevision': summary['revision'], 'requestId': 'preview-cleanup'}
+            assert (await client.post(endpoint, json=request)).status_code == 409
+
+            entry = next(entry for entry in w.media_entries(asset) if entry['kind'] == 'image')
+            source = Path(entry['path'])
+            destination = source.parent / '归档位置' / source.name
+            move = w.move_entry(source, destination, entry['expected'], asset['id'], entry['kind'])
+            move['packageId'] = entry['packageId']
+            await w.process_move(move)
+
+            updated = (await client.get('/api/workspace/cleanup-summary')).json()['cleanupCompleted']
+            assert updated['eligibleCount'] == original['eligibleCount'] == 1
+            assert updated['eligibleBytes'] == original['eligibleBytes']
+            response = await client.post(endpoint, json={**request, 'previewToken': original['previewToken']})
+            assert response.status_code == 409
+            assert w.get('requests', request['requestId']) is None
+            assert destination.is_file()
+
+            confirmed = {**request, 'previewToken': updated['previewToken']}
+            response = await client.post(endpoint, json=confirmed)
+            assert response.status_code == 202, response.text
+            replay = await client.post(endpoint, json=confirmed)
+            assert replay.status_code == 202 and replay.json()['total'] == 1
+    finally:
+        await close_app(app)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('replacement', ['file', 'parent_symlink'])
+async def test_cleanup_rejects_path_replacement_at_unlink_boundary(tmp_path, monkeypatch, replacement):
+    app, w, asset = await prepared(tmp_path)
+    try:
+        await w.request_cleanup_completed(w.config['revision'], 'unlink-boundary')
+        target = Path(asset['path'])
+        external = tmp_path / 'outside-workspace'
+        external.mkdir()
+        protected = external / target.name
+        protected.write_bytes(b'user-owned')
+        preserved = target.parent / 'original-kept.mp4'
+        original = w.videos.file_operation
+
+        async def replace_after_checks(function, *args):
+            if function.__name__ == 'unlink_workspace_file':
+                if replacement == 'file':
+                    target.rename(preserved)
+                    target.write_bytes(b'user-owned')
+                else:
+                    target.parent.rename(external / 'original-folder')
+                    target.parent.symlink_to(external, target_is_directory=True)
+            return await original(function, *args)
+
+        monkeypatch.setattr(w.videos, 'file_operation', replace_after_checks)
+        await w.cleanup(asset)
+        assert w.cleanup_operation('unlink-boundary')['state'] == 'attention'
+        assert protected.read_bytes() == b'user-owned'
+        assert target.read_bytes() == b'user-owned'
+        assert (preserved if replacement == 'file' else external / 'original-folder' / target.name).is_file()
     finally:
         await close_app(app)
 

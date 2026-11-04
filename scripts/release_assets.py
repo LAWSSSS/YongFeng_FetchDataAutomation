@@ -53,6 +53,7 @@ def main():
             raise ValueError(f'Corresponding source checksum mismatch: {entry["archive"]}')
         shutil.copy2(source, args.output / source.name)
     shutil.copy2(ROOT / "README.md", args.output / "README.md")
+    shutil.copy2(ROOT / "THIRD_PARTY_NOTICES.md", args.output / "THIRD_PARTY_NOTICES.md")
     shutil.copy2(ROOT / "packaging.lock.json", args.output / "packaging.lock.json")
     paths = sorted(path for path in args.output.iterdir() if path.is_file())
     for path in paths:

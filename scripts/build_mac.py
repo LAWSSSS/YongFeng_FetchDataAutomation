@@ -242,6 +242,7 @@ def assemble(args):
     (resources / "release.json").write_text(json.dumps(package, indent=2) + "\n")
     (resources / "source-manifest.json").write_text(json.dumps({"files": sources}, ensure_ascii=False, indent=2) + "\n")
     shutil.copy2(ROOT / "README.md", output / "README.md")
+    shutil.copy2(ROOT / "THIRD_PARTY_NOTICES.md", output / "THIRD_PARTY_NOTICES.md")
     binaries = audit_binaries(app)
     # Export the actual working tree, including reviewed new modules. HEAD alone
     # cannot reproduce an uncommitted pre-release; never label it as that commit.

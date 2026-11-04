@@ -267,6 +267,12 @@ class WorkspaceScheduler:
                 journal = json.loads(raw)
                 pending[(journal['source'], journal['destination'], json.dumps(journal.get('expected'), sort_keys=True))] = journal
             for index, entry in enumerate(entries):
+                if registered_cleanup(self, asset):
+                    # A cleanup request may have been registered while the
+                    # organizer was checking files. Its snapshot now owns them.
+                    current = self.get('assets', asset['id']) or asset
+                    self._record_outcome(current)
+                    return current
                 if self.leases.busy(entry['source']) or self.leases.busy(entry['destination']):
                     return self._wait_asset(asset, '文件使用中，释放后自动整理。', [entry['source'], entry['destination']])
                 self._activity('moving', f'正在整理 {index + 1}/{len(entries)} 个文件。', asset['name'])

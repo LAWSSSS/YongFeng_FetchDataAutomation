@@ -153,18 +153,15 @@ def _hash_file(path):
 
 
 def source_version(path):
+    from .media import edge_digest
     path = safe_path(path, must_exist=True, kind="file")
     info = path.lstat()
     if not stat.S_ISREG(info.st_mode):
         raise ValueError("绑定文件不是普通视频文件。")
-    edge = hashlib.sha256()
     with path.open("rb") as stream:
-        edge.update(stream.read(65536))
-        if info.st_size > 65536:
-            stream.seek(max(0, info.st_size - 65536))
-            edge.update(stream.read(65536))
+        edge = edge_digest(stream, info.st_size)
     return {"device": info.st_dev, "inode": info.st_ino, "size": info.st_size,
-            "modifiedNs": info.st_mtime_ns, "edgeHash": edge.hexdigest()}
+            "modifiedNs": info.st_mtime_ns, "edgeHash": edge}
 
 
 def ffprobe_file(path, ffmpeg_path):
