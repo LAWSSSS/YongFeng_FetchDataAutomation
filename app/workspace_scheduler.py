@@ -300,6 +300,8 @@ class WorkspaceScheduler:
             return self.state() if include_state else None
         cleanup_ids = []
         async with self.lock:
+            if self.maintenance:
+                return self.state() if include_state else None
             self._activity('discovering', '正在读取已登记视频。')
             await self.check_root()
             # Finish acknowledged publications before inspecting stale source
@@ -737,11 +739,13 @@ class WorkspaceScheduler:
 
     async def _cleanup_ids(self, identities):
         for identity in identities:
+            if self.maintenance:
+                return
             current = self.get('assets', identity)
             if not current or current.get('status') != 'managed':
                 continue
             async with self._asset_locks(current) as acquired:
-                if not acquired:
+                if not acquired or self.maintenance:
                     continue
                 self.cleanup_active.add(identity)
                 try:

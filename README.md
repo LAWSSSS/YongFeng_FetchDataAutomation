@@ -6,7 +6,7 @@
 
 **需要 Apple 芯片 Mac（M 系列），系统为 macOS 14 或更新版本。** 点击屏幕左上角的苹果图标，选择 **关于本机**，查看「芯片」和系统版本。
 
-1. 登录有下载权限的 GitHub 账号，点击 **[下载 Mac 完整版 ZIP](https://github.com/zhaochengxiaohao-design/search_download_upload_auto/releases/download/v1.3.3/gather-assistant-1.3.3-macos-arm64.zip)**。也可以从 [GitHub 发布页](https://github.com/zhaochengxiaohao-design/search_download_upload_auto/releases/tag/v1.3.3) 的 **Assets** 下载同一文件。完整包已带齐运行环境、视频工具和识别模型。
+1. 登录有下载权限的 GitHub 账号，点击 **[下载 Mac 完整版 ZIP](https://github.com/zhaochengxiaohao-design/search_download_upload_auto/releases/download/v1.3.4/gather-assistant-1.3.4-macos-arm64.zip)**。也可以从 [GitHub 发布页](https://github.com/zhaochengxiaohao-design/search_download_upload_auto/releases/tag/v1.3.4) 的 **Assets** 下载同一文件。完整包已带齐运行环境、视频工具和识别模型。
 2. 在访达的 **下载** 文件夹双击 ZIP。打开解压得到的 **采集助手-Mac-arm64** 文件夹，确认里面有 **采集助手**、**停止采集助手** 和 **使用说明.html**。访达可能隐藏应用文件名结尾的 `.app`。
 3. 把解压后的文件夹移到你自己的 **文稿** 或其他可写位置。双击里面的 **采集助手**，等浏览器自动打开。看到页面上方的 **日期采集、视频确认、处理结果、设置**，就可以使用了。
 
@@ -52,7 +52,7 @@
 
 点网页顶部的 **处理结果**，跟踪下载、识别、照片上传和导入核验。照片导入核验结束后，页面才会显示完成。关闭浏览器窗口后，采集助手会继续在后台运行。关闭电脑或让电脑休眠前，可先查看正在运行的任务。
 
-程序导入的是照片。本机下载的视频原片保存在应用旁的 **数据** 文件夹里。
+程序导入的是照片。视频和切片文件默认保存在应用旁的 **数据 → 媒体**，可以在设置里改到外置盘。
 
 ## 4. 常见问题
 
@@ -73,10 +73,18 @@
 
 ## 5. 停止、更新和清理空间
 
+### 把视频放到外置盘
+
+1. 接上外置盘。在 **设置 → 本地数据** 点击 **更改保存位置**。
+2. 在访达选中外置盘或盘内的文件夹，按 **Option–Command–C** 复制完整路径，粘贴到网页。例如 `/Volumes/工作盘`。
+3. 点击 **预览迁移**，核对目标位置和文件数量，再确认。程序会建立 **视频工作区**，下载视频、切片照片、压缩包和媒体缓存都在里面。迁移只移动旧工作区内已登记且能核实的文件。
+
+拔盘前先停止采集助手。意外断开时，本地处理会等待原磁盘接回，任务记录仍可查看。想移回应用旁的 **数据 → 媒体** 时，接上原盘，在同一位置点击 **恢复默认位置**。
+
 - **停止程序**。双击同一文件夹里的 **停止采集助手**。已有网页标签可能还开着，可以关闭。下次双击 **采集助手**，后台会继续使用之前的数据。
 - **更新程序**。先停止旧版，备份旁边的 **数据** 文件夹。将新版解压到另一个位置，把备份的 **数据** 放到新版应用旁，再打开新版。**采集助手** 和 **停止采集助手** 始终放在同一文件夹中。
 - **释放空间**。先核对照片导入成果，再在 **处理结果** 点击 **清理已结束文件**。查看数量和大小，确认后清理本机文件。平台成果和任务历史会保留。
 
 ## 已经下载了源码？
 
-日常使用直接下载上面的 Mac 完整版。需要运行源码时，在解压目录使用终端，先安装 Python 3.13 和 Node.js 22.13 或更新版本，再运行 `zsh ./启动简易版.command`。要使用照片识别，还需要 Python 3.11、FFmpeg 和 ffprobe，以及 [从 GitHub 下载的 `models-v1.zip`](https://github.com/zhaochengxiaohao-design/search_download_upload_auto/releases/download/v1.3.3/models-v1.zip)。在源码目录运行 `zsh ./启动简易版.command setup-models ./models-v1.zip`，安装后重新启动。源码版可运行 `zsh ./启动简易版.command stop` 停止。
+日常使用直接下载上面的 Mac 完整版。需要运行源码时，在解压目录使用终端，先安装 Python 3.13 和 Node.js 22.13 或更新版本，再运行 `zsh ./启动简易版.command`。要使用照片识别，还需要 Python 3.11、FFmpeg 和 ffprobe，以及 [从 GitHub 下载的 `models-v1.zip`](https://github.com/zhaochengxiaohao-design/search_download_upload_auto/releases/download/v1.3.4/models-v1.zip)。在源码目录运行 `zsh ./启动简易版.command setup-models ./models-v1.zip`，安装后重新启动。源码版可运行 `zsh ./启动简易版.command stop` 停止。

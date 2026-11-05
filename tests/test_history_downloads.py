@@ -6,6 +6,7 @@ import pytest
 
 from app.main import create_app
 from app.videos import Conflict
+from app.workspace_files import create_root
 from tests.test_simple_flow import FakePlatform
 from tests.test_slicing_performance import close_app
 
@@ -20,6 +21,7 @@ async def test_history_download_resumes_without_confirming_or_overwriting_curren
     videos.target.client = httpx.AsyncClient(transport=httpx.MockTransport(platform.handle))
     videos.target.connected = True
     app.state.workspace.config.update(enabled=True, root=str(tmp_path/'media'))
+    create_root(app.state.workspace.root, app.state.workspace.config['workspaceId'])
     app.state.workspace.online = True
     old = {'revision':0,'state':'ready','taskId':'task-old','resultId':'result-old',
            'startTime':'2026-10-01 00:00:00','etag':'"v1"','totalBytes':len(platform.media)}

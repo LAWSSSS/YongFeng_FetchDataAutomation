@@ -12,7 +12,7 @@ const active=(operation:Operation|null)=>!!operation&&['queued','running','waiti
 const reasons:Record<string,string>={disk_offline:'等待工作区磁盘恢复',disk_io:'等待磁盘读写恢复',file_busy:'等待文件使用结束',paused:'已暂停，清理范围保留',
   file_changed:'文件已变化，保留待核对',receipt_changed:'成果凭证已变化，保留待核对',file_missing:'文件位置需核对'};
 const bytes=(value:number)=>value>=1024**3?`${(value/1024**3).toFixed(2)} GB`:`${(value/1024**2).toFixed(1)} MB`;
-export default function CompletedCleanup({embedded = false}: {embedded?: boolean}){
+export default function CompletedCleanup({embedded = false, blocked = false}: {embedded?: boolean; blocked?: boolean}){
   const [state,setState]=useState<State|null>(null),[busy,setBusy]=useState(false),[error,setError]=useState(''),[operation,setOperation]=useState<Operation|null>(null);
   const [notice,setNotice]=useState('');
   const [readError,setReadError]=useState('');
@@ -26,7 +26,7 @@ export default function CompletedCleanup({embedded = false}: {embedded?: boolean
   usePolling(refresh,readInterval(active(operation)&&!offline,offline),{immediate:false});
   const pending=state?.cleanupCompleted;
   async function clean(){
-    if(!state||offline||locked.current||active(operation)||!pending?.eligibleCount||!pending.previewToken)return;
+    if(!state||offline||blocked||locked.current||active(operation)||!pending?.eligibleCount||!pending.previewToken)return;
     if(!window.confirm(`清理当前 ${pending.eligibleCount} 个已结束项目（约 ${bytes(pending.eligibleBytes)}）的本地下载视频、照片、ZIP及临时文件。云端成果和历史保留；之后完成的项目不会被加入本次清理。`))return;
     locked.current=true;setBusy(true);setError('');setNotice('');reads.current.cancel();
     try{const result=await localJson<Operation>('/api/workspace/cleanup-completed',intents.current.payload('cleanup',{
@@ -43,7 +43,7 @@ export default function CompletedCleanup({embedded = false}: {embedded?: boolean
   return <section className={embedded ? 'workspace-cleanup' : 'panel cleanup-completed'} aria-label="清理已完成文件">
     <div className="section-title">
     <div>{embedded ? <h3>已完成文件</h3> : <h2>本地文件</h2>}</div>
-    <button className="secondary" disabled={busy||offline||active(operation)||!pending?.eligibleCount||!pending.previewToken} onClick={()=>void clean()}>
+    <button className="secondary" disabled={busy||offline||blocked||active(operation)||!pending?.eligibleCount||!pending.previewToken} onClick={()=>void clean()}>
       {busy ? '正在登记…' : active(operation) ? '本次清理已登记' : `${actionLabel}${pending ? `（${pending.eligibleCount}）` : ''}`}
     </button></div>
     {pending&&<p className="subtle">{active(operation)?'下一次可清理':'可清理'} {pending.eligibleCount} 个项目，约 {bytes(pending.eligibleBytes)}；原始目录、模型和云端成果保留。</p>}

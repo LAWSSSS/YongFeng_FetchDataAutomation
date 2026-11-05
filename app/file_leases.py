@@ -24,7 +24,7 @@ def filesystem_wait_code(error):
         return error.code
     if isinstance(error, OSError) and error.errno in {
             errno.EIO, errno.ENOSPC, errno.EDQUOT, errno.EBUSY, errno.ENODEV,
-            errno.ENXIO, errno.ETIMEDOUT, errno.EACCES, errno.EPERM}:
+            errno.ENXIO, errno.ETIMEDOUT, errno.EACCES, errno.EPERM, errno.EROFS}:
         return 'disk_io'
     return ''
 

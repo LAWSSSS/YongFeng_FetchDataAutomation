@@ -5,10 +5,12 @@ import json
 import os
 import re
 import stat
+import tempfile
 from contextlib import ExitStack
 from pathlib import Path
 
 from .audit_moves import checked_path, fingerprint, source_fingerprint
+from .file_leases import FileEnvironmentError
 from .media import edge_digest
 
 VIDEO_BRANCHES = ('采集视频', '未切片', '车斗未切片', '磁盘吊未切片', '已切片')
@@ -53,6 +55,34 @@ def choose_root(parent, workspace_id, current=None):
         if marker and marker['id'] == workspace_id:
             return root
     raise ValueError('工作区同名目录过多，请选择其他父目录。')
+
+
+def location_parent(root):
+    parent = checked_path(root).parent
+    try:
+        info = parent.stat()
+    except FileNotFoundError:
+        raise FileEnvironmentError('目标文件夹不可用，请连接磁盘或恢复原文件夹。', 'disk_offline') from None
+    if not stat.S_ISDIR(info.st_mode):
+        raise ValueError('请选择已存在的文件夹。')
+    return {'device': info.st_dev, 'inode': info.st_ino}
+
+
+def prepare_location(root, workspace_id, parent_identity):
+    current = location_parent(root)
+    marker = read_marker(root)
+    if current != parent_identity and (not marker or marker['id'] != workspace_id):
+        raise ValueError('目标文件夹或磁盘已更换，请重新预览。')
+    root = create_root(root, workspace_id)
+    # A disk may be mounted read-only despite its marker and branches being
+    # readable. Check with a real write before switching any paths.
+    with tempfile.TemporaryFile(dir=checked_path(root / '.缓存')) as probe:
+        probe.write(b'ok')
+        probe.flush()
+        os.fsync(probe.fileno())
+    for name in ('下载', '历史下载'):
+        checked_path(root / '.缓存' / name).mkdir(exist_ok=True)
+    return root
 
 
 def create_root(root, workspace_id):

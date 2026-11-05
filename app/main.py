@@ -298,8 +298,8 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
             if request.method == 'POST' and any(part in request.url.path for part in ('/records/restore', '/records/restore-group', '/submissions/items/restore', '/submissions/restore-group')):
                 return JSONResponse({'message': '记录删除后不再提供恢复，请刷新页面。'}, status_code=410)
             if managed_root and request.method in ('POST', 'PUT', 'PATCH') and request.url.path in (
-                    '/api/workspace/preview', '/api/videos/directory', '/api/directory', '/api/settings/directory'):
-                return JSONResponse({'message': '文件由程序自动管理，无需设置目录。'}, status_code=409)
+                    '/api/videos/directory', '/api/directory', '/api/settings/directory'):
+                return JSONResponse({'message': '请在“设置 → 本地数据”统一更改保存位置。'}, status_code=409)
             if (workspace.maintenance and request.method in ('POST', 'PUT', 'PATCH', 'DELETE')
                     and not request.url.path.startswith('/api/workspace/')
                     and not request.url.path.endswith('/pause')):
@@ -390,7 +390,11 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
         if not managed_root:
             raise HTTPException(409, '当前为隔离测试实例。')
         import subprocess
-        await asyncio.to_thread(subprocess.run, ['/usr/bin/open', str(managed_root)], check=True)
+        root = await workspace.check_root()
+        try:
+            await asyncio.to_thread(subprocess.run, ['/usr/bin/open', str(root)], check=True, capture_output=True)
+        except (OSError, subprocess.CalledProcessError):
+            raise ValueError('无法在访达打开工作区，请检查磁盘和访问权限。') from None
         return {'ok': True}
 
     @application.post('/api/workspace/cleanup-completed', status_code=202)
@@ -491,7 +495,8 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
 
     @application.post('/api/workspace/preview')
     async def workspace_preview(payload: WorkspacePreviewInput):
-        return await workspace.preview(payload.parent.strip(), payload.expectedRevision, payload.requestId)
+        return await workspace.preview(payload.parent.strip(), payload.expectedRevision, payload.requestId,
+                                       use_default=payload.useDefault)
 
     @application.post('/api/workspace/preserve-uploaded')
     async def workspace_preserve_uploaded(payload: WorkspaceActionInput):

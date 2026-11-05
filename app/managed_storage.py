@@ -1,4 +1,4 @@
-"""Fixed media layout and durable relative paths; no user-selected storage roots.
+"""Application data and durable relative paths for the default media location.
 
 Operational JSON keeps resolved paths for existing SQLite projections. A
 transactional relative journal is the portable authority, rebuilt only for
@@ -125,8 +125,12 @@ class ManagedConnection(sqlite3.Connection):
 
 def configure(workspace, root):
     workspace.fixed_data_root = Path(root)
-    marker = read_marker(Path(root) / '媒体')
-    workspace.config.update(enabled=True, fixedLocation=True, root=str(Path(root) / '媒体'),
-                            parent=str(root), workspaceId=marker['id'])
-    workspace.save('settings', workspace.config)
+    # A previously selected disk may be unplugged during startup. Its saved
+    # path and workspace marker are still authoritative.
+    if workspace.config.get('locationMode') != 'custom':
+        media = Path(root) / '媒体'
+        marker = read_marker(media)
+        workspace.config.update(enabled=True, fixedLocation=True, locationMode='default',
+                                root=str(media), parent=str(root), workspaceId=marker['id'])
+        workspace.save('settings', workspace.config)
     workspace.derive_config()

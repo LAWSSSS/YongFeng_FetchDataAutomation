@@ -4,8 +4,10 @@ SQLite stays in the application data directory. Only explicitly registered media
 is moved; discovery never grants permission to delete an unknown file.
 """
 import asyncio
+import errno
 import json
 import os
+import shutil
 import sqlite3
 import time
 import zipfile
@@ -18,12 +20,13 @@ from .audit_moves import (checked_path, copy_verified, finish_source, move_direc
                           source_fingerprint)
 from .domain import now_iso
 from .file_leases import FileEnvironmentError, ReadProbes, filesystem_wait_code
+from .media import transfer_reservation_identity
 from .videos import Conflict
 from . import file_locations
 from .workspace_scheduler import WorkspaceScheduler
 from .workspace_files import (BRANCHES, OUTPUT_BRANCHES, VIDEO_BRANCHES, birth_ns,
                               choose_root, compatible, content_id, create_root,
-                              file_version, folder_name, read_marker, scan_managed,
+                              file_version, folder_name, location_parent, prepare_location, read_marker, scan_managed,
                               reconnected_version)
 
 
@@ -32,6 +35,8 @@ class WorkspaceManager(WorkspaceScheduler):
         self.db, self.data_dir = store.db, Path(data_dir)
         self.videos, self.uploads, self.slicing = videos, uploads, slicing
         self.audit, self.moves, self.files, self.leases = audit, moves, files, leases
+        self.fixed_data_root = None
+        self.history_downloads = None
         self.lock = asyncio.Lock()
         self.cleanup_registration_lock = asyncio.Lock()
         self.task = self.loop_task = None
@@ -180,7 +185,16 @@ class WorkspaceManager(WorkspaceScheduler):
 
     def _availability(self, online, code='', message=''):
         self.online = online
+        if not online:
+            self.free_bytes = None
         self.availability = {'online': online, 'reasonCode': code, 'message': message, 'checkedAt': now_iso()}
+
+    def _root_with_usage(self, root, workspace_id):
+        root = self._inspect_root(root, workspace_id)
+        try:
+            return root, shutil.disk_usage(root).free
+        except OSError:
+            return root, None
 
     async def check_root(self):
         """Background availability probe; GETs use the stored snapshot only."""
@@ -188,7 +202,7 @@ class WorkspaceManager(WorkspaceScheduler):
             raise Conflict('请先预览并启用视频工作区。')
         root, identity = self.root, self.config['workspaceId']
         try:
-            result = await self.file_checks.run((str(root), identity), self._inspect_root, root, identity)
+            result, free = await self.file_checks.run((str(root), identity), self._root_with_usage, root, identity)
         except FileEnvironmentError as error:
             if root != self.root or identity != self.config['workspaceId']:
                 raise Conflict('工作区配置已变化，稍后重新检查。') from None
@@ -202,9 +216,17 @@ class WorkspaceManager(WorkspaceScheduler):
         if root != self.root or identity != self.config['workspaceId']:
             raise Conflict('工作区配置已变化，稍后重新检查。')
         self._availability(True)
-        import shutil
-        self.free_bytes = (await asyncio.to_thread(shutil.disk_usage, result)).free
+        self.free_bytes = free
         return result
+
+    def media_path(self, path, *, create_parent=False):
+        root = self.require_root()
+        path = checked_path(path)
+        if not path.is_relative_to(root) or path == root:
+            raise ValueError('文件路径不在当前视频工作区内。')
+        if create_parent:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        return path
 
     def require_directory(self, value, *, download=False):
         if not self.enabled:
@@ -238,6 +260,8 @@ class WorkspaceManager(WorkspaceScheduler):
             packages.setdefault(asset['id'], [])
         inventory = [entry for asset in inventory_assets
                      for entry in self.media_entries(asset, existing_only=False, cached_packages=packages[asset['id']])]
+        if self.history_downloads:
+            inventory.extend(self.history_downloads.completed_files())
         # Each photo belongs to at most one top-level branch. Classify it once
         # instead of walking its parents for every branch on every poll.
         branch_paths = {name: {} for name in BRANCHES}
@@ -252,7 +276,8 @@ class WorkspaceManager(WorkspaceScheduler):
                      'files': len(paths), 'bytes': sum(paths.values())}
                     for name, paths in branch_paths.items()]
         plans = self.rows('plans')
-        plan = plans[-1] if plans else None
+        plan = next((p for p in reversed(plans) if p['state'] != 'superseded'
+                     and (not self.fixed_data_root or p.get('locationMode'))), None)
         last_action = next((r for r in reversed(self.rows('requests')) if r.get('kind') == 'reconcile'), None)
         if last_action and last_action.get('canonicalId'):
             last_action = self.get('requests', last_action['canonicalId']) or last_action
@@ -262,6 +287,7 @@ class WorkspaceManager(WorkspaceScheduler):
         from .workspace_progress import snapshot
         return {'enabled': self.enabled, 'revision': self.config['revision'], 'parent': self.config.get('parent', ''),
                 'fixedLocation': bool(self.config.get('fixedLocation')), 'freeBytes': getattr(self, 'free_bytes', None),
+                'defaultRoot': str(self.fixed_data_root / '媒体') if self.fixed_data_root else None,
                 'root': self.config.get('root', ''), 'online': self.online, 'maintenance': self.maintenance,
                 'availability': dict(self.availability),
                 'branches': branches, 'assets': public_assets, 'totalBytes': sum(b['bytes'] for b in branches),
@@ -337,9 +363,20 @@ class WorkspaceManager(WorkspaceScheduler):
         if not plan:
             return None
         return {k: plan.get(k) for k in ('id', 'root', 'parent', 'revision', 'state', 'message', 'createdAt',
-                                         'backup', 'completedAt', 'counts', 'bytes', 'totalItems', 'preserved')} | {
+                                         'backup', 'completedAt', 'counts', 'bytes', 'totalItems', 'preserved', 'reasonCode')} | {
+            'canCancel': self.can_cancel_plan(plan),
             'items': [{k: i.get(k) for k in ('id', 'source', 'destination', 'state', 'message', 'size')}
                       for i in self.plan_items(plan, limit=100)]}
+
+    def can_cancel_plan(self, plan):
+        if plan['state'] == 'preview':
+            return True
+        if plan['state'] != 'waiting' or not plan.get('locationMode'):
+            return False
+        return not self.db.execute("""SELECT 1 FROM simple_workspace_moves
+            WHERE json_extract(payload, '$.planId')=?
+              AND json_extract(payload, '$.state') IN ('moving', 'complete')
+            LIMIT 1""", (plan['id'],)).fetchone()
 
     def plan_items(self, plan, limit=None):
         query = "SELECT payload FROM simple_workspace_moves WHERE json_extract(payload, '$.planId')=? ORDER BY rowid"
@@ -612,7 +649,7 @@ class WorkspaceManager(WorkspaceScheduler):
                 'size': expected['size'], 'relativePath': Path(source).name,
                 'reservation': {'token': uuid4().hex}, 'state': 'planned'}
 
-    def plan_assets(self, root, only=None, checkpoints=True):
+    def plan_assets(self, root, only=None, checkpoints=True, *, relocate_from=()):
         entries = []
         assets = [self.get('assets', only)] if only is not None else self.rows('assets')
         for asset in assets:
@@ -627,6 +664,19 @@ class WorkspaceManager(WorkspaceScheduler):
             packages = self.packages(asset)
             packages_by_id = {package['id']: package for package in packages}
             for media in self.media_entries(asset, cached_packages=packages):
+                if relocate_from:
+                    source = Path(media['path'])
+                    previous_root = next((p for p in relocate_from if source.is_relative_to(p)), None)
+                    if previous_root is None:
+                        continue
+                    destination = root / source.relative_to(previous_root)
+                    if source != destination:
+                        entry = self.move_entry(source, destination, media['expected'], asset['id'], media['kind'])
+                        entry['locationOnly'] = True
+                        if media.get('packageId'):
+                            entry['packageId'] = media['packageId']
+                        entries.append(entry)
+                    continue
                 if media['kind'] == 'video':
                     destination = root / stage / asset['folder'] / asset['name']
                 else:
@@ -653,65 +703,166 @@ class WorkspaceManager(WorkspaceScheduler):
                     if media.get('packageId'):
                         entry['packageId'] = media['packageId']
                     entries.append(entry)
-        # Only registered version-specific download checkpoints, never arbitrary caches.
-        old_work = self.videos.work
-        if checkpoints and old_work != root / '.缓存' / '下载':
-            for row in self.videos.store.list(include_deleted=True):
-                for v in row.get('versions', []):
-                    part = old_work / row['id'] / f"v{v['revision']}.part"
-                    try:
-                        expected = source_fingerprint(part)
-                    except (OSError, ValueError):
-                        continue
-                    entries.append(self.move_entry(part, root / '.缓存' / '下载' / row['id'] / part.name,
-                                                   expected, '', 'checkpoint'))
+        if checkpoints:
+            entries.extend(self.checkpoint_moves(self.collection_checkpoint_paths(root)))
         return entries
 
-    async def preview(self, parent, revision, request_id):
+    def collection_checkpoint_paths(self, root):
+        work = root / '.缓存' / '下载'
+        if self.videos.work == work:
+            return
+        for row in self.videos.store.list(include_deleted=True):
+            for version in row.get('versions', []):
+                relative = Path(row['id']) / f"v{version['revision']}.part"
+                yield self.videos.work / relative, work / relative
+
+    def checkpoint_paths(self, root):
+        yield from self.collection_checkpoint_paths(root)
+        if self.history_downloads:
+            yield from self.history_downloads.checkpoint_paths(root)
+
+    def checkpoint_moves(self, paths):
+        # Never adopt arbitrary cache files. A part must have a recorded version.
+        for source, destination in paths:
+            try:
+                expected = source_fingerprint(source)
+            except (OSError, ValueError):
+                continue
+            yield self.move_entry(source, destination, expected, '', 'checkpoint')
+
+    @staticmethod
+    def verify_checkpoint_targets(paths, entries, *, published=False):
+        checkpoints = {entry['destination']: entry for entry in entries if entry['kind'] == 'checkpoint'}
+        for source, destination in paths:
+            entry = checkpoints.get(str(destination))
+            if entry and entry['state'] == 'attention':
+                raise ValueError('有下载断点无法核对，原保存位置保留。')
+            if os.path.lexists(destination):
+                if entry and (entry.get('destinationVersion') or entry.get('temporaryVersion')
+                              or (entry['state'] == 'moving' and not os.path.lexists(source))):
+                    if recover_published(entry) and (not published or entry['state'] == 'complete'):
+                        continue
+                if entry and not published:
+                    try:
+                        transfer_reservation_identity(checked_path(destination), entry['reservation'])
+                    except FileExistsError:
+                        pass
+                    else:
+                        continue
+                raise ValueError('目标工作区已有无法核对的下载断点，原保存位置保留。请移开冲突文件后重试。')
+            if (published and entry) or (not entry and os.path.lexists(source)):
+                raise ValueError('有下载断点尚未安全迁移，原保存位置保留。')
+
+    def location_target(self, parent, use_default):
+        default = self.fixed_data_root / '媒体' if self.fixed_data_root else None
+        if use_default and (not default or parent):
+            raise ValueError('请只选择一个保存位置。')
+        if not parent and not use_default:
+            raise ValueError('请填写已存在文件夹的完整路径。')
+        selected = default if use_default else checked_path(parent)
+        if selected == Path('/Volumes'):
+            raise ValueError('请选择外置盘或盘内文件夹，不要选择 /Volumes 本身。')
+        current = self.root if self.enabled else None
+        if default and selected in (default, self.fixed_data_root):
+            marker = read_marker(default)
+            if not marker:
+                raise ValueError('默认工作区不可用，请检查程序旁“数据”文件夹。')
+            return default, 'default', marker['id']
+        if default and selected.is_relative_to(self.fixed_data_root):
+            raise ValueError('请选择程序数据目录以外的位置，或恢复默认位置。')
+        if current and selected != current and selected.is_relative_to(current):
+            raise ValueError('请勿选择现有工作区的子文件夹。')
+        root = choose_root(selected, self.config['workspaceId'], current)
+        if current and root != current and (root.is_relative_to(current) or current.is_relative_to(root)):
+            raise ValueError('新旧工作区不能互相嵌套，请选择其他文件夹。')
+        return root, 'custom' if default else None, self.config['workspaceId']
+
+    def migration_entries(self, plan):
+        root = Path(plan['root'])
+        sources = ()
+        if plan.get('locationMode'):
+            sources = (self.root,)
+            previous = self.get('plans', self.config.get('lastMigrationId', ''))
+            if previous and previous.get('sourceRoot'):
+                prior = Path(previous['sourceRoot'])
+                marker = read_marker(prior)
+                if prior not in sources and marker and marker['id'] == previous.get('sourceWorkspaceId'):
+                    sources += (prior,)
+        entries = self.plan_assets(root, checkpoints=not sources, relocate_from=sources)
+        if plan.get('locationMode') and self.history_downloads:
+            entries.extend(self.history_downloads.migration_entries(root, sources))
+        if sources:
+            checkpoints = list(self.checkpoint_moves(self.checkpoint_paths(root)))
+            for entry in checkpoints:
+                entry['keepSource'] = True
+            entries = checkpoints + entries
+        for entry in entries:
+            entry['planId'] = plan['id']
+            if plan.get('locationMode'):
+                entry.update(targetRoot=str(root), targetWorkspaceId=plan['targetWorkspaceId'])
+        return entries
+
+    async def save_preview_entries(self, plan, *, replace=False):
+        entries = self.migration_entries(plan)
+        def validate():
+            for entry in entries:
+                try:
+                    actual = file_version(entry['source'], 'edgeHash' in entry['expected'])
+                    if not compatible(actual, entry['expected']):
+                        raise ValueError('changed')
+                except (OSError, ValueError) as error:
+                    if replace and filesystem_wait_code(error):
+                        raise
+                    entry.update(state='attention', message='文件不可读或版本不符，保留原记录。')
+        await asyncio.to_thread(validate)
+        if replace:
+            self.db.execute("DELETE FROM simple_workspace_moves WHERE json_extract(payload, '$.planId')=?", (plan['id'],))
+            plan['frozen'] = True
+        self.db.executemany('INSERT INTO simple_workspace_moves VALUES(?,?)',
+                            [(e['id'], json.dumps(e, ensure_ascii=False)) for e in entries])
+        self.update_counts(plan, entries)
+        self.save('plans', plan)
+
+    async def preview(self, parent, revision, request_id, *, use_default=False):
         async with self.lock:
             old = self.get('requests', request_id)
             if old:
-                if old.get('kind') != 'preview' or old.get('parent') != parent:
+                if (old.get('kind') != 'preview' or old.get('parent') != parent
+                        or bool(old.get('useDefault')) != use_default):
                     raise Conflict('请求编号已用于其他操作。')
                 return self.public_plan(self.get('plans', old['planId']))
             if revision != self.config['revision']:
                 raise Conflict('工作区已被其他页面修改，请刷新后重试。')
             if self.maintenance:
                 raise Conflict('工作区正在整理，请等待完成。')
-            root = await asyncio.to_thread(choose_root, parent, self.config['workspaceId'], self.config.get('root'))
+            try:
+                root, mode, target_identity = await asyncio.to_thread(self.location_target, parent, use_default)
+            except OSError:
+                raise ValueError('无法读取目标文件夹，请检查路径和访问权限。') from None
+            if mode:
+                await self.check_root()
             await self.discover()
-            for asset in self.rows('assets'):
-                if self.is_preserved(asset) or asset.get('cleanup', {}).get('state') == 'complete':
-                    continue
-                try:
-                    await self.refresh_archive_photos(asset)
-                except (OSError, ValueError, zipfile.BadZipFile):
-                    asset.update(status='attention', message='照片与已核验压缩包暂不能确认一致，原位保留。')
-                    self.save('assets', asset)
+            if not mode:
+                for asset in self.rows('assets'):
+                    if self.is_preserved(asset) or asset.get('cleanup', {}).get('state') == 'complete':
+                        continue
+                    try:
+                        await self.refresh_archive_photos(asset)
+                    except (OSError, ValueError, zipfile.BadZipFile):
+                        asset.update(status='attention', message='照片与已核验压缩包暂不能确认一致，原位保留。')
+                        self.save('assets', asset)
             plan = {'id': uuid4().hex, 'root': str(root), 'parent': str(root.parent), 'revision': revision,
                     'state': 'preview', 'createdAt': now_iso(),
                     'message': '仅整理程序已绑定的文件；未知文件保持原位。'}
-            entries = self.plan_assets(root)
-            def validate():
-                for entry in entries:
-                    try:
-                        checked_path(entry['source'])
-                        actual = file_version(entry['source'], 'edgeHash' in entry['expected'])
-                        if not compatible(actual, entry['expected']):
-                            raise ValueError('changed')
-                    except (OSError, ValueError):
-                        entry.update(state='attention', message='文件不可读或版本不符，保留原记录。')
-            await asyncio.to_thread(validate)
-            for entry in entries:
-                entry['planId'] = plan['id']
+            if mode:
+                plan.update(locationMode=mode, targetWorkspaceId=target_identity,
+                            targetParent=await asyncio.to_thread(location_parent, root),
+                            requestedParent=parent, sourceRoot=str(self.root), sourceWorkspaceId=self.config['workspaceId'])
             plan['preserved'] = sum(self.is_preserved(a) and a.get('cleanup', {}).get('state') != 'complete'
                                     for a in self.rows('assets'))
-            self.db.executemany('INSERT INTO simple_workspace_moves VALUES(?,?)',
-                                [(e['id'], json.dumps(e, ensure_ascii=False)) for e in entries])
-            self.db.commit()
-            self.update_counts(plan, entries)
-            self.save('plans', plan)
-            self.save('requests', {'id': request_id, 'kind': 'preview', 'parent': parent, 'planId': plan['id']})
+            await self.save_preview_entries(plan)
+            self.save('requests', {'id': request_id, 'kind': 'preview', 'parent': parent, 'useDefault': use_default,
+                                   'planId': plan['id']})
             return self.public_plan(plan)
 
     @staticmethod
@@ -733,10 +884,18 @@ class WorkspaceManager(WorkspaceScheduler):
             plan = self.get('plans', identity)
             if not plan:
                 raise ValueError('整理预览不存在，请重新预览。')
+            if self.fixed_data_root and (not plan.get('locationMode') or pilot):
+                raise Conflict('请在“设置 → 本地数据”重新预览保存位置。')
             if revision != self.config['revision'] or plan['revision'] != revision:
                 raise Conflict('工作区配置已更新，请重新预览。')
             if plan['state'] != 'preview':
                 raise Conflict('此预览已执行，请重试整理或重新预览。')
+            if plan.get('locationMode') and self.cleanup_in_progress():
+                raise Conflict('已有登记的文件清理任务，请等该任务结束后再更改保存位置。')
+            for other in self.rows('plans'):
+                if other['id'] != identity and other['state'] == 'preview':
+                    other.update(state='superseded', message='另一个整理方案已执行。')
+                    self.save('plans', other)
             plan.update(state='waiting', pilot=pilot, message='等待本地写入和文件使用结束。')
             self.save('plans', plan)
             self.save('requests', {'id': request_id, 'kind': 'apply', 'planId': identity, 'pilot': pilot})
@@ -754,21 +913,39 @@ class WorkspaceManager(WorkspaceScheduler):
             if revision != self.config['revision']:
                 raise Conflict('工作区已更新，请刷新后重试。')
             plan = self.get('plans', identity)
-            if not plan or plan['state'] != 'preview':
-                raise Conflict('此预览已更新，请刷新后重试。')
-            plan.update(state='cancelled', message='预览已取消，文件未移动。')
+            if not plan or not self.can_cancel_plan(plan):
+                raise Conflict('已开始迁移文件，完成后可以更改保存位置。')
+            waiting = plan['state'] == 'waiting'
+            plan.update(state='cancelled', message='位置变更已取消，文件仍在原位。')
             self.save('plans', plan)
             self.save('requests', {'id': request_id, 'kind': 'cancel-preview', 'planId': identity})
+            if waiting:
+                if self.task and not self.task.done():
+                    self.task.cancel()
+                    await asyncio.gather(self.task, return_exceptions=True)
+                self.maintenance = False
+                self.wake.set()
             return self.state()
 
     def local_busy(self):
         return bool(self.videos.running or self.uploads.running or self.slicing._active_analysis_tasks()
                     or self.slicing.exporting or self.slicing.packages.running or self.leases.readers or self.leases.writers
                     or self.audit.busy or self.moves.busy or self.uploads.busy or
-                    self.files.busy or self.videos.jobs.busy or any(l.locked() for l in self.videos.row_locks.values())
+                    self.files.busy or self.videos.jobs.busy or self.videos.local_operations_busy() or self.cleanup_active
+                    or any(l.locked() for l in self.videos.row_locks.values())
                     or self.uploads.tick_lock.locked() or self.slicing.tick_lock.locked()
                     or self.slicing.packages.tick_lock.locked()
+                    or (self.videos.storage_check_task and not self.videos.storage_check_task.done())
                     or (self.slicing.scan_task and not self.slicing.scan_task.done()))
+
+    def pending_publication(self):
+        return (any(v.get('downloadRequested') and v.get('state') == 'publishing' and v['revision'] == row['activeRevision']
+                    for row in self.videos.store.list() for v in row.get('versions', []))
+                or (self.history_downloads and self.history_downloads.pending_publication()))
+
+    def cleanup_in_progress(self):
+        return any(request.get('kind') == 'cleanup-completed' and request.get('state') in {'queued', 'running', 'waiting'}
+                   for request in self.rows('requests'))
 
     def backup(self, identity):
         directory = self.data_dir / 'backups'
@@ -780,15 +957,31 @@ class WorkspaceManager(WorkspaceScheduler):
         return str(path)
 
     async def run_plan(self, identity):
+        keep_maintenance = False
         try:
             while self.local_busy():
                 await asyncio.sleep(1)
             async with self.lock:
                 plan = self.get('plans', identity)
+                mode = plan.get('locationMode')
+                if mode:
+                    await self.check_root()
+                    if not plan.get('frozen'):
+                        if self.cleanup_in_progress():
+                            raise ValueError('已有登记的文件清理任务，请等该任务结束后再更改保存位置。')
+                        if self.pending_publication():
+                            raise ValueError('有视频正等待核对上次保存结果。保存完成后请重试迁移；断点和文件已保留。')
+                        # Any download active at preview time has now finished
+                        # its write. Capture its final file or latest checkpoint.
+                        await self.discover()
+                        await self.save_preview_entries(plan, replace=True)
                 if not plan.get('backup'):
                     plan['backup'] = self.backup(identity)
                     self.save('plans', plan)
-                await asyncio.to_thread(create_root, plan['root'], self.config['workspaceId'])
+                if mode:
+                    await asyncio.to_thread(prepare_location, plan['root'], plan['targetWorkspaceId'], plan['targetParent'])
+                else:
+                    await asyncio.to_thread(create_root, plan['root'], self.config['workspaceId'])
                 plan.update(state='moving', reasonCode='', message='正在按文件清单整理，任务进度保留。')
                 self.save('plans', plan)
                 selected = plan.get('pilotAssetId')
@@ -800,21 +993,36 @@ class WorkspaceManager(WorkspaceScheduler):
                     self.save('plans', plan)
                 entries = self.plan_items(plan)
                 previous_moves = {(j['source'], j['destination']): j for j in self.rows('moves')
-                                  if j.get('planId') != plan['id'] and j['state'] in {'moving', 'attention'}}
+                                  if j.get('planId') != plan['id'] and (j['state'] in {'moving', 'attention'}
+                                      or (j.get('keepSource') and j['state'] == 'complete'))}
+                previous_by_entry = {}
+                for entry in entries:
+                    if entry['state'] != 'planned':
+                        continue
+                    previous = previous_moves.get((entry['source'], entry['destination']))
+                    if previous and previous.get('expected') == entry['expected']:
+                        previous_by_entry[entry['id']] = previous
+                        entry.update({key: previous[key] for key in
+                                      ('reservation', 'temporary', 'temporaryVersion', 'destinationVersion', 'sha256')
+                                      if key in previous})
+                switching = mode and self.config.get('lastMigrationId') != identity
+                root = Path(plan['root'])
+                if switching:
+                    entries.sort(key=lambda entry: entry['kind'] != 'checkpoint')
+                    await asyncio.to_thread(self.verify_checkpoint_targets, list(self.checkpoint_paths(root)), entries)
+                checkpoints_checked = False
                 updated = time.monotonic()
                 for index, entry in enumerate(entries):
+                    if switching and not checkpoints_checked and entry['kind'] != 'checkpoint':
+                        await asyncio.to_thread(self.verify_checkpoint_targets, list(self.checkpoint_paths(root)),
+                                                entries, published=True)
+                        checkpoints_checked = True
                     if plan.get('pilot') and entry.get('assetId') != selected:
                         continue
                     if entry['state'] in {'complete', 'attention'}:
                         continue
                     try:
-                        previous = previous_moves.get((entry['source'], entry['destination']))
-                        if previous and previous.get('expected') != entry['expected']:
-                            previous = None
-                        if previous:
-                            for key in ('reservation', 'temporary', 'temporaryVersion', 'destinationVersion', 'sha256'):
-                                if key in previous:
-                                    entry[key] = previous[key]
+                        previous = previous_by_entry.get(entry['id'])
                         await self.process_move(entry)
                         if previous:
                             previous['state'] = 'superseded'
@@ -833,44 +1041,68 @@ class WorkspaceManager(WorkspaceScheduler):
                         updated = time.monotonic()
                 # Enabling derived paths is one durable commit after migration,
                 # including held rows whose original bindings remain usable.
-                self.config.update(enabled=True, parent=plan['parent'], root=plan['root'], revision=self.config['revision'] + 1,
-                                   pilotAssetId=selected if plan.get('pilot') else None)
-                self.save('settings', self.config)
+                if mode:
+                    await asyncio.to_thread(self._inspect_root, root, plan['targetWorkspaceId'])
+                if switching:
+                    await asyncio.to_thread(self.verify_checkpoint_targets, list(self.checkpoint_paths(root)), entries, published=True)
+                if self.config.get('lastMigrationId') != identity:
+                    self.config.update(enabled=True, parent=plan['parent'], root=plan['root'], revision=self.config['revision'] + 1,
+                                       pilotAssetId=selected if plan.get('pilot') else None, lastMigrationId=identity)
+                    if mode:
+                        self.config.update(locationMode=mode, fixedLocation=mode == 'default', workspaceId=plan['targetWorkspaceId'])
+                    self.save('settings', self.config)
                 self._availability(True)
+                self.free_bytes = None
                 self.derive_config()
                 self.videos.storage_ready = True
                 self.videos.storage_error = ''
-                self.videos.work.mkdir(parents=True, exist_ok=True)
+                if not mode:
+                    self.videos.work.mkdir(parents=True, exist_ok=True)
+                retained_checkpoints = 0
+                for entry in entries:
+                    if entry.get('keepSource') and entry['state'] == 'complete':
+                        try:
+                            await self.videos.file_operation(finish_source, entry)
+                        except (OSError, ValueError):
+                            retained_checkpoints += 1
                 for asset in self.rows('assets'):
                     asset.update(stage=self.stage(asset), categories=self.outcomes(asset))
                     self.save('assets', asset)
                 self.update_counts(plan, entries)
                 plan.update(state='attention' if any(e['state'] == 'attention' for e in entries) else
                             'pilot_complete' if plan.get('pilot') else 'complete', completedAt=now_iso(),
-                            message='首条整理已完成，等待全量整理。' if plan.get('pilot') else '整理完成；无法确认的文件保留原位。')
+                            message='首条整理已完成，等待全量整理。' if plan.get('pilot') else
+                            ('保存位置已更新。部分旧下载断点保留在原位。' if retained_checkpoints else '保存位置已更新。')
+                            if mode and not any(e['state'] == 'attention' for e in entries) else
+                            '整理完成；无法确认的文件保留原位。')
                 self.save('plans', plan)
         except asyncio.CancelledError:
             raise
         except Exception as error:
             plan = self.get('plans', identity)
             if code := filesystem_wait_code(error):
+                keep_maintenance = bool(plan.get('locationMode'))
+                reason = ('目标磁盘空间不足，请释放空间后继续。' if getattr(error, 'errno', None) == errno.ENOSPC
+                          else '等待磁盘或文件恢复，随后继续原整理计划。')
                 plan.update(state='waiting', reasonCode=code, retryNotBefore=time.time() + 5,
-                            message='等待磁盘或文件恢复，随后继续原整理计划。')
+                            message=reason)
             else:
                 plan.update(state='attention', message=str(error) if isinstance(error, ValueError) else '整理未完成，原文件与进度保留。')
             self.save('plans', plan)
         finally:
-            self.maintenance = False
+            self.maintenance = keep_maintenance
             self.videos.wake.set()
             self.uploads.wake.set()
             self.slicing.wake.set()
+            if self.history_downloads:
+                self.history_downloads.wake.set()
             self.wake.set()
 
     @staticmethod
     def is_final_move(entry):
         parts = Path(entry.get('destination') or '').parts
         kind = entry.get('kind')
-        return ((kind == 'video' and len(parts) >= 3 and parts[-3] == '已切片') or
+        return not entry.get('locationOnly') and ((kind == 'video' and len(parts) >= 3 and parts[-3] == '已切片') or
                 (kind == 'archive' and len(parts) >= 3 and parts[-3] in OUTPUT_BRANCHES.values()) or
                 (kind == 'image' and len(parts) >= 4 and parts[-4] in OUTPUT_BRANCHES.values()))
 
@@ -884,7 +1116,7 @@ class WorkspaceManager(WorkspaceScheduler):
             # neither can leave path and version pointing at different files.
             self._restore_locations()
             current = self.get('assets', entry.get('assetId', ''))
-            if current and self._asset_wait_reason(current):
+            if current and not entry.get('locationOnly') and self._asset_wait_reason(current):
                 self.files.refresh()
             else:
                 self.moves.update_bindings(entry)
@@ -896,6 +1128,8 @@ class WorkspaceManager(WorkspaceScheduler):
             # identity, result receipt and upload object.
             file_locations.package(self.db, package)
             self.slicing.packages.store.save('items', package)
+        elif entry.get('historyId') and self.history_downloads:
+            self.history_downloads.reconcile_location(entry['historyId'])
 
     async def process_move(self, entry):
         if entry['state'] == 'complete':
@@ -907,7 +1141,7 @@ class WorkspaceManager(WorkspaceScheduler):
             return
         def require_current():
             current = self.get('assets', entry.get('assetId', ''))
-            if current:
+            if current and not entry.get('locationOnly'):
                 reason = self._asset_wait_reason(current)
                 if reason:
                     raise ValueError(reason)
@@ -917,6 +1151,8 @@ class WorkspaceManager(WorkspaceScheduler):
         with self.leases.write(entry['source']), self.leases.write(entry['destination']):
             async def io(fn, *args):
                 return await self.videos.file_operation(fn, *args)
+            if entry.get('targetWorkspaceId'):
+                await io(self._inspect_root, Path(entry['targetRoot']), entry['targetWorkspaceId'])
             entry['state'] = 'moving'
             self.save('moves', entry)
             if await io(recover_published, entry):
@@ -928,8 +1164,14 @@ class WorkspaceManager(WorkspaceScheduler):
                 current = await io(file_version, source, 'edgeHash' in entry['expected'])
                 if not compatible(current, entry['expected']):
                     raise ValueError('file_changed')
+                if (entry.get('keepSource') and entry.get('temporaryVersion')
+                        and not await io(os.path.lexists, entry['temporary'])):
+                    # A prior copy was published and later removed. The active
+                    # source is still present and can be copied again.
+                    for key in ('temporaryVersion', 'destinationVersion', 'sha256'):
+                        entry.pop(key, None)
                 if not entry.get('temporaryVersion'):
-                    direct = await io(same_device, source, destination)
+                    direct = not entry.get('keepSource') and await io(same_device, source, destination)
                     # Hashing and volume checks yield to newer photo receipts
                     # and manual instructions. Re-read at the mutation boundary.
                     require_current()
@@ -947,8 +1189,11 @@ class WorkspaceManager(WorkspaceScheduler):
             # Persist and propagate the committed location even if a newer
             # command now prohibits further writes. This does not restart an
             # old generation or change any category outcome.
-            self._record_move_publication(entry)
-            if await io(os.path.lexists, entry['source']):
+            if not entry.get('keepSource'):
+                # A checkpoint remains at the active path until the new
+                # root and all its verified checkpoints are committed.
+                self._record_move_publication(entry)
+            if not entry.get('keepSource') and await io(os.path.lexists, entry['source']):
                 # Cross-volume copies may still own a source. Deleting that
                 # copy remains subject to the latest command and photo proof.
                 require_current()
@@ -994,14 +1239,11 @@ class WorkspaceManager(WorkspaceScheduler):
         return json.loads(row[0]) if row else None
 
     def download_destination(self, filename):
-        root = self.require_root()
         base = folder_name(filename)
         matches = [a for a in self.rows('assets') if a['name'] == filename and a.get('cleanup', {}).get('state') != 'complete']
         folder = matches[0]['folder'] if len(matches) == 1 else base
-        path = root / '采集视频' / folder / filename
         # Publication itself remains exclusive, including unregistered collisions.
-        path.parent.mkdir(parents=True, exist_ok=True)
-        return path
+        return self.media_path(self.root / '采集视频' / folder / filename, create_parent=True)
 
     def output_directory(self, item, category):
         root = self.require_root()
@@ -1022,7 +1264,9 @@ class WorkspaceManager(WorkspaceScheduler):
         if not plan:
             raise ValueError('整理记录不存在。')
         # Re-preview current bindings, never replay an obsolete destination plan.
-        preview = await self.preview(plan['parent'], revision, request_id + '-preview')
+        use_default = plan.get('locationMode') == 'default'
+        parent = '' if use_default else plan.get('requestedParent', plan['parent'])
+        preview = await self.preview(parent, revision, request_id + '-preview', use_default=use_default)
         return await self.apply(preview['id'], revision, request_id)
 
     def request_archive_retry(self, identity, request_id):
@@ -1112,7 +1356,8 @@ class WorkspaceManager(WorkspaceScheduler):
     async def startup(self):
         self.stopping = False
         self.event_loop = asyncio.get_running_loop()
-        unfinished = next((p for p in reversed(self.rows('plans')) if p['state'] in {'moving', 'waiting'}), None)
+        unfinished = next((p for p in reversed(self.rows('plans')) if p['state'] in {'moving', 'waiting'}
+                           and (not self.fixed_data_root or p.get('locationMode'))), None)
         if unfinished:
             self.maintenance = True
             self.task = asyncio.create_task(self.run_plan(unfinished['id']))
@@ -1131,9 +1376,10 @@ class WorkspaceManager(WorkspaceScheduler):
             # during this pass must survive and trigger the next pass.
             self.wake.clear()
             try:
-                if not self.maintenance and (not self.task or self.task.done()):
+                if not self.task or self.task.done():
                     pending_plan = next((plan for plan in reversed(self.rows('plans'))
-                        if plan.get('state') == 'waiting' and plan.get('reasonCode') in {'disk_offline', 'disk_io', 'file_busy'}
+                        if plan.get('state') == 'waiting' and (not self.fixed_data_root or plan.get('locationMode'))
+                        and plan.get('reasonCode') in {'disk_offline', 'disk_io', 'file_busy'}
                         and plan.get('retryNotBefore', 0) <= time.time()), None)
                     if pending_plan:
                         self.maintenance = True
@@ -1161,7 +1407,7 @@ class WorkspaceManager(WorkspaceScheduler):
             try:
                 pending = (self._pipeline_request() is not None or
                            any(a.get('status') == 'waiting' for a in self._targets()))
-                await asyncio.wait_for(self.wake.wait(), timeout=5 if pending else 30)
+                await asyncio.wait_for(self.wake.wait(), timeout=5 if pending or self.blocked else 30)
             except asyncio.TimeoutError:
                 pass
 

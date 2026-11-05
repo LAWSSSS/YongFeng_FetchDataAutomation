@@ -155,7 +155,8 @@ def transfer_reservation_identity(destination: Path, reservation: dict):
     if not re.fullmatch(r"[0-9a-f]{32}", token):
         raise FileExistsError(errno.EEXIST, "目标文件名已存在。")
     marker = b"simple-video-transfer-reservation:" + token.encode("ascii")
-    with os.fdopen(os.open(destination, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)), "rb") as held:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    with os.fdopen(os.open(destination, flags), "rb") as held:
         identity = os.fstat(held.fileno())
         if (not stat.S_ISREG(identity.st_mode) or identity.st_size != len(marker)
                 or held.read(len(marker)) != marker):

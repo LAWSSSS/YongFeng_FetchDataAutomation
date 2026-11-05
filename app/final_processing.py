@@ -372,6 +372,8 @@ class FinalProcessing:
             self.save(operation)
 
     async def advance(self, operation):
+        if self.workspace.maintenance:
+            return
         operation = self.get(operation['id']) or operation
         action_revision = (bool(operation.get('manualPaused')), int(operation.get('resumeRevision') or 0))
         row = self.videos.store.get(operation['videoId'])

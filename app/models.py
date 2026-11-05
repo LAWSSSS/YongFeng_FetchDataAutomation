@@ -249,7 +249,8 @@ class FileCleanupInput(BaseModel):
 
 class WorkspacePreviewInput(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
-    parent: str = Field(min_length=1, max_length=4000)
+    parent: str = Field(default='', max_length=4000)
+    useDefault: bool = False
     expectedRevision: int = Field(ge=0)
     requestId: str = Field(pattern=r"^[A-Za-z0-9_-]{1,100}$")
 

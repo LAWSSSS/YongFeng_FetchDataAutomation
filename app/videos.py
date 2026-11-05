@@ -14,6 +14,7 @@ import tempfile
 import time
 from contextlib import ExitStack, nullcontext
 from datetime import timedelta
+from functools import partial
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
@@ -515,9 +516,8 @@ class VideoManager:
 
     def prepare_fixed_storage(self):
         if getattr(self, 'workspace', None) and self.workspace.enabled:
-            self.workspace.require_root()
-            self.fixed_directory.mkdir(parents=True, exist_ok=True)
-            self.work.mkdir(parents=True, exist_ok=True)
+            self.workspace.media_path(self.fixed_directory).mkdir(parents=True, exist_ok=True)
+            self.workspace.media_path(self.work).mkdir(parents=True, exist_ok=True)
             return
         if self.require_mounted_external and not os.path.ismount(str(self.fixed_directory.parent)):
             raise OSError("外置盘未挂载。")
@@ -696,9 +696,11 @@ class VideoManager:
         while True:
             self.wake.clear()
             self.schedule_downloads()  # Local publication can continue without a platform connection.
-            if self.fixed_directory and not self.storage_ready and not self.require_mounted_external:
+            workspace = getattr(self, 'workspace', None)
+            if (self.fixed_directory and not self.storage_ready and not self.require_mounted_external
+                    and not (workspace and workspace.maintenance)):
                 if not self.storage_check_task or self.storage_check_task.done():
-                    self.storage_error = self.storage_error or "外置盘不可用；视频会先下载到本机暂存。"
+                    self.storage_error = self.storage_error or "保存目录不可用，下载暂停，进度已保留。"
                     self.storage_check_task = asyncio.create_task(self.refresh_storage())
             if self.target.connected:
                 try:
@@ -1100,9 +1102,22 @@ class VideoManager:
             raise ValueError("后台操作不存在。")
         return self.public_operation(operation)
 
+    def local_operations_busy(self):
+        for identity, task in self.operation_tasks.items():
+            if task.done():
+                continue
+            operation = self.store.get_operation(identity) or {}
+            if (operation.get('kind') == 'restart-download'
+                    or (operation.get('kind') == 'recover-decodable' and operation.get('stage') != 'partial_slicing')):
+                return True
+        return False
+
     async def _run_operation(self, operation_id):
         operation = self.store.get_operation(operation_id)
         if not operation or operation.get("state") in {"complete", "attention", "conflict"}:
+            return
+        if (operation['kind'] in {'recover-decodable', 'restart-download'}
+                and getattr(self, 'workspace', None) and self.workspace.maintenance):
             return
         try:
             operation.update(state="running", stage="starting", message="正在处理。")
@@ -2438,8 +2453,13 @@ class VideoManager:
 
     async def download_bound(self, row, version):
         folder = self.work / row["id"]
-        folder.mkdir(parents=True, exist_ok=True)
         part = folder / f"v{version['revision']}.part"
+        workspace = getattr(self, 'workspace', None)
+        managed = workspace and workspace.enabled
+        if managed:
+            await self.file_operation(partial(workspace.media_path, part, create_parent=True))
+        else:
+            folder.mkdir(parents=True, exist_ok=True)
         progress_before, stalled = -1, 0
         for attempt, delay in enumerate(RETRY_DELAYS, 1):
             version["attempts"] = attempt
@@ -2454,6 +2474,8 @@ class VideoManager:
                 if offset and version.get("etag"):
                     headers["If-Range"] = version["etag"]
                 async with self.target.client.stream("GET", url, headers=headers, timeout=httpx.Timeout(60, connect=15)) as response:
+                    if managed:
+                        await self.file_operation(workspace.media_path, part)
                     if response.status_code in (401, 403, 429, 500, 502, 503, 504):
                         raise DownloadFailure("媒体链接或服务器暂时不可用，稍后续传。", "temporary_media", retryable=True)
                     if response.status_code == 416:
@@ -2508,7 +2530,12 @@ class VideoManager:
                     version.update(etag=etag, totalBytes=total, receivedBytes=offset)
                     self.store.save(row)
                     received, saved_at = offset, time.monotonic()
-                    output = part.open("ab" if offset else "wb")
+                    mode = "ab" if offset else "wb"
+                    if managed:
+                        flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | (os.O_APPEND if offset else os.O_TRUNC)
+                        output = os.fdopen(os.open(part, flags, 0o600), mode)
+                    else:
+                        output = part.open(mode)
                     try:
                         async for block in response.aiter_bytes(chunk_size=1024 * 1024):
                             if received == 0 and not valid_video_header(block[:512]):
@@ -2553,7 +2580,8 @@ class VideoManager:
                 return
             if getattr(self, 'workspace', None) and self.workspace.enabled:
                 try:
-                    self.workspace.require_root()
+                    await self.file_operation(self.workspace.require_root)
+                    version["outputDirectory"] = str(self.workspace.root / '采集视频')
                 except (OSError, ValueError):
                     self.storage_ready = False
                     self.storage_error = '等待原工作区磁盘连接；下载意图和断点保留。'
@@ -2650,6 +2678,20 @@ class VideoManager:
                 self.store.save(row)
                 raise
             except (DownloadFailure, ValueError, OSError, RemoteError, httpx.HTTPError) as error:
+                unavailable = isinstance(error, FileEnvironmentError)
+                if (not unavailable and isinstance(error, OSError)
+                        and getattr(self, 'workspace', None) and self.workspace.enabled):
+                    try:
+                        await self.workspace.check_root()
+                    except (OSError, ValueError):
+                        unavailable = True
+                if unavailable:
+                    self.storage_ready = False
+                    self.storage_error = '等待原工作区磁盘连接；下载意图和断点保留。'
+                    version.update(state='publishing' if version.get('publishing') else 'ready',
+                                   errorCode=getattr(error, 'code', 'disk_offline'), message=self.storage_error)
+                    self.store.save(row)
+                    return
                 if isinstance(error, OSError) and version.get("publishing"):
                     version["state"] = "publishing"
                     stage = getattr(error, "transfer_stage", "transfer")
