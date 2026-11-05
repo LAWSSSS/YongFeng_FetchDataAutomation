@@ -195,7 +195,7 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
     connection_restorer = ConnectionRestorer()
 
     async def restore_saved_credentials():
-        if not production_data:
+        if not production_data or os.environ.get("IVG_SKIP_SAVED_CONNECTIONS") == "1":
             return
         async def restore_one(service, client):
             try:

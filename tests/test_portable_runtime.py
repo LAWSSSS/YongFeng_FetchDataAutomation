@@ -3,6 +3,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -95,3 +96,46 @@ def test_profile_id_survives_restart_without_reading_legacy_data(portable):
     assert launcher.prepare_profile()[1] == first
     assert json.loads((home / "profile.json").read_text())["bundleId"] == runtime.BUNDLE_ID
     assert (home / "profile.json").stat().st_mode & 0o077 == 0
+
+
+def test_source_launcher_skips_other_checkout_and_finds_its_own_nondefault_port(tmp_path, monkeypatch, capsys):
+    from scripts import local_service
+
+    data = tmp_path / "数据" / "系统"
+    data.mkdir(parents=True)
+    monkeypatch.setattr(local_service, "ROOT", tmp_path)
+    monkeypatch.setattr(local_service, "DATA", data)
+    owned = set()
+    monkeypatch.setattr(local_service, "can_bind", lambda port: port == 8787)
+
+    def launchctl(argv, **_):
+        if argv[1] == "bootstrap":
+            config = local_service.plistlib.loads(Path(argv[-1]).read_bytes())
+            assert config["ProgramArguments"][0] == str(tmp_path / ".venv/bin/python")
+            owned.add(config["Label"])
+            return SimpleNamespace(returncode=0)
+        label = argv[-1].rsplit("/", 1)[-1]
+        return SimpleNamespace(returncode=int(label not in owned), stdout="")
+
+    monkeypatch.setattr(local_service.subprocess, "run", launchctl)
+    local_service.run("start", 8786, False)
+    endpoint = json.loads(capsys.readouterr().out)
+    assert endpoint["port"] == 8787
+    assert endpoint["instanceId"] == local_service.service_label(8787)
+    local_service.run("start", 8786, False)
+    assert json.loads(capsys.readouterr().out) == endpoint
+    local_service.run("status", 8786, False)
+    assert "127.0.0.1:8787/" in capsys.readouterr().out
+    assert len(owned) == 1
+
+
+def test_source_uses_system_media_tools_without_building_them(tmp_path, monkeypatch):
+    monkeypatch.setattr(runtime, "__file__", str(tmp_path / "app/runtime.py"))
+    tool_dir = tmp_path / "program tools"
+    tool_dir.mkdir()
+    for tool in ("ffmpeg", "ffprobe"):
+        path = tool_dir / tool
+        path.write_text("#!/bin/sh\nexit 0\n")
+        path.chmod(0o700)
+    monkeypatch.setenv("PATH", str(tool_dir))
+    assert runtime.source_model_paths()["frameToolPath"] == str(tool_dir / "ffmpeg")

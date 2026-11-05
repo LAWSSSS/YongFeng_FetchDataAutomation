@@ -5,13 +5,14 @@ import json
 import shutil
 import subprocess
 import sys
+import tempfile
 import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from app.runtime import VERSION
-from scripts.package_safety import verify_tree
+from scripts.package_safety import inventory_tree, verify_tree
 
 
 def sha(path):
@@ -34,8 +35,16 @@ def main():
     destination = args.output / f"gather-assistant-{VERSION}-macos-arm64.zip"
     # App signatures and executable modes survive Archive Utility extraction.
     # Source files have no resource forks; exclude incidental build metadata.
-    subprocess.run(["/usr/bin/ditto", "-c", "-k", "--norsrc", "--keepParent", str(args.folder.resolve()),
-                    str(destination.resolve())], check=True)
+    with tempfile.TemporaryDirectory(prefix=".package-", dir=args.output) as staging:
+        package = Path(staging) / args.folder.name
+        # Developers get a separate source archive. The user opens one of two
+        # apps or the offline guide directly after extracting the download.
+        shutil.copytree(args.folder, package, symlinks=True,
+                        ignore=shutil.ignore_patterns("源码与模型.zip", "文件校验.json"))
+        delivered = {**manifest, "files": inventory_tree(package)}
+        (package / "文件校验.json").write_text(json.dumps(delivered, ensure_ascii=False, indent=2) + "\n")
+        subprocess.run(["/usr/bin/ditto", "-c", "-k", "--norsrc", "--keepParent", str(package),
+                        str(destination.resolve())], check=True)
     resources = args.folder / "采集助手.app/Contents/Resources"
     shutil.copy2(args.folder / "源码与模型.zip", args.output / f"source-and-models-{VERSION}.zip")
     model_manifest = json.loads((ROOT / "assets/models/manifest.json").read_text())

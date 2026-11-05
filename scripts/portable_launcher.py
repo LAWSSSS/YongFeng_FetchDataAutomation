@@ -41,6 +41,12 @@ def read_json(path):
         return {}
 
 
+def clear_server_state(home, instance_id):
+    path = home / "server.json"
+    if read_json(path).get("instanceId") == instance_id:
+        path.unlink(missing_ok=True)
+
+
 def profile():
     return Path(os.environ.get("IVG_PROFILE_DIR") or
                 RESOURCES.parents[2] / "数据" / "系统").expanduser().resolve()
@@ -92,7 +98,10 @@ def verified_server(state, profile_id, package_id=None):
 
 def open_browser(port, disabled=False):
     if not disabled:
-        subprocess.run(["/usr/bin/open", f"http://127.0.0.1:{port}/"], check=False)
+        address = f"http://127.0.0.1:{port}/"
+        result = subprocess.run(["/usr/bin/open", address], capture_output=True, check=False)
+        if result.returncode:
+            raise RuntimeError(f"采集助手已启动。请在浏览器地址栏手动打开 {address}")
 
 
 def server_locked(home):
@@ -160,7 +169,7 @@ def launch(no_browser=False):
                 open_browser(state["port"], no_browser)
                 return state
             if child.poll() is not None:
-                raise RuntimeError("采集助手启动失败，请查看独立数据目录中的 logs/service.log。")
+                raise RuntimeError("采集助手启动失败。请在应用旁打开“数据 → 系统 → logs”，查看 service.log。")
             time.sleep(0.25)
         raise RuntimeError("采集助手仍在启动，请稍后再次打开。原程序不会被停止。")
 
@@ -189,8 +198,7 @@ def serve(instance_id):
                                          timeout_graceful_shutdown=30)).run(sockets=[sock])
         finally:
             sock.close()
-            if read_json(home / "server.json").get("instanceId") == instance_id:
-                (home / "server.json").unlink(missing_ok=True)
+            clear_server_state(home, instance_id)
 
 
 def stop():
@@ -200,23 +208,19 @@ def stop():
         state = read_json(home / "server.json")
         if not verified_server(state, profile_id, manifest["packageId"]):
             if server_locked(home):
-                return {"stopped": False, "message": "已有实例运行但无法核实为本包，请稍后重试或使用运行版本的停止入口。未停止其他实例。"}
+                return {"stopped": False, "retry": True,
+                        "message": "已有实例运行但无法核实为本包，请稍后重试或使用运行版本的停止入口。"}
             return {"stopped": False, "message": "本包没有正在运行的实例。"}
-        os.kill(state["pid"], signal.SIGTERM)
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(state["pid"], signal.SIGTERM)
         for _ in range(160):
-            try:
-                os.kill(state["pid"], 0)
-            except ProcessLookupError:
+            # Shutdown can outlast the listening socket. Keep the launch lock
+            # until the writer releases its lock, then remove its receipt.
+            if not server_locked(home):
+                clear_server_state(home, state["instanceId"])
                 return {"stopped": True}
-            if not verified_server(state, profile_id):
-                # Graceful shutdown can continue after the listening socket closes.
-                try:
-                    with lock(home / "server.lock", blocking=False):
-                        return {"stopped": True}
-                except BlockingIOError:
-                    pass
             time.sleep(0.25)
-        return {"stopped": False, "message": "正在等待当前写入安全结束，请稍后重试停止。"}
+        return {"stopped": False, "retry": True, "message": "正在等待当前写入安全结束，请稍后重试停止。"}
 
 
 def main():
@@ -230,6 +234,8 @@ def main():
             serve(args.instance_id)
         else:
             result = stop() if args.action == "stop" else launch(args.no_browser)
+            if result.get("retry"):
+                raise RuntimeError(result["message"])
             print(json.dumps(result, ensure_ascii=False))
     except (OSError, RuntimeError) as error:
         # No remote URL, credential or platform response is ever part of this error.

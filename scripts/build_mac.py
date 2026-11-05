@@ -224,8 +224,9 @@ def assemble(args):
     for name in ("react", "react-dom", "scheduler", "@phosphor-icons/react"):
         shutil.copy2(ROOT / "node_modules" / name / "LICENSE", web_licenses / (name.replace("/", "-") + ".txt"))
     env = {**os.environ, "MACOSX_DEPLOYMENT_TARGET": "14.0"}
+    launcher = contents / "MacOS/Launcher"
     run("/usr/bin/clang", "-arch", "arm64", "-mmacosx-version-min=14.0", "-fobjc-arc",
-        "-framework", "Cocoa", ROOT / "scripts/mac_launcher.m", "-o", contents / "MacOS/Launcher", env=env)
+        "-framework", "Cocoa", ROOT / "scripts/mac_launcher.m", "-o", launcher, env=env)
     info = {"CFBundleExecutable": "Launcher", "CFBundleIdentifier": BUNDLE_ID,
             "CFBundleName": "采集助手", "CFBundleDisplayName": "采集助手",
             "CFBundleShortVersionString": VERSION, "CFBundleVersion": VERSION,
@@ -233,6 +234,13 @@ def assemble(args):
             "LSArchitecturePriority": ["arm64"], "NSHighResolutionCapable": True,
             "NSLocalNetworkUsageDescription": "连接用户指定的质检、采集和视觉AI平台。"}
     (contents / "Info.plist").write_bytes(plistlib.dumps(info))
+    stop_app = output / "停止采集助手.app"
+    stop_contents = stop_app / "Contents"
+    (stop_contents / "MacOS").mkdir(parents=True)
+    shutil.copy2(launcher, stop_contents / "MacOS/Launcher")
+    stop_info = {**info, "CFBundleIdentifier": BUNDLE_ID + ".stop", "IVGStopOnly": True,
+                 "CFBundleName": "停止采集助手", "CFBundleDisplayName": "停止采集助手"}
+    (stop_contents / "Info.plist").write_bytes(plistlib.dumps(stop_info))
     package = {"bundleId": BUNDLE_ID, "version": VERSION, "packageId": uuid4().hex,
                "platform": "macos-arm64", "minimumMacOS": "14.0", "runtimes": runtimes,
                "sourceCommit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
@@ -241,9 +249,10 @@ def assemble(args):
                "algorithmChanged": False}
     (resources / "release.json").write_text(json.dumps(package, indent=2) + "\n")
     (resources / "source-manifest.json").write_text(json.dumps({"files": sources}, ensure_ascii=False, indent=2) + "\n")
-    shutil.copy2(ROOT / "README.md", output / "README.md")
+    run(args.pandoc, "--from=gfm", "--to=html5", "--standalone", "--variable=lang:zh-CN",
+        "--metadata=pagetitle:采集助手使用说明", ROOT / "README.md", "--output", output / "使用说明.html")
     shutil.copy2(ROOT / "THIRD_PARTY_NOTICES.md", output / "THIRD_PARTY_NOTICES.md")
-    binaries = audit_binaries(app)
+    binaries = audit_binaries(app) + audit_binaries(stop_app)
     # Export the actual working tree, including reviewed new modules. HEAD alone
     # cannot reproduce an uncommitted pre-release; never label it as that commit.
     if sources != source_inventory(ROOT):
@@ -271,10 +280,13 @@ def main():
     parser.add_argument("--models", type=Path, default=ROOT / "build/models")
     parser.add_argument("--wheels", type=Path, default=ROOT / "build/wheels")
     parser.add_argument("--web", type=Path, default=ROOT / "build/web")
+    parser.add_argument("--pandoc", default=shutil.which("pandoc"), help="Pandoc executable used to generate the offline guide")
     parser.add_argument("--output", type=Path, default=Path.home() / "Library/Caches/InspectionVideoGatherBuild" / VERSION / "采集助手-Mac-arm64")
     args = parser.parse_args()
     if sys.platform != "darwin" or os.uname().machine != "arm64":
         parser.error("Build on an Apple Silicon Mac.")
+    if not args.pandoc:
+        parser.error("Install Pandoc or provide its path with --pandoc.")
     assemble(args)
 
 

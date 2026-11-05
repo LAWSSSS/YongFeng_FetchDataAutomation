@@ -10,46 +10,49 @@ if (!existsSync(python)) {
     console.error('请先安装 Python 后端依赖。Mac 请双击“启动简易版.command”，或按 README.md 完成安装。');
     process.exit(1);
 }
-const appUrl = `http://127.0.0.1:${process.env.PORT || '8786'}`;
-try {
-    const result = await fetch(`${appUrl}/api/health`, { signal: AbortSignal.timeout(1200) });
-    if (result.ok && (await result.json()).app === 'inspection-video-gather-simple') {
-        console.log(`程序已在运行：${appUrl}`);
-        openBrowser();
-        process.exit(0);
-    }
-    console.error('端口已被其他程序占用，请使用 PORT=8787 npm start。');
-    process.exit(1);
-} catch { /* 没有运行中的服务，继续启动。 */ }
-
 const newest = directory => Math.max(0, ...readdirSync(directory, { withFileTypes: true }).map(entry => {
     const filename = path.join(directory, entry.name);
     return entry.isDirectory() ? newest(filename) : statSync(filename).mtimeMs;
 }));
 const build = path.join(root, 'dist/index.html');
-if (!existsSync(build) || newest(path.join(root, 'src')) > statSync(build).mtimeMs || statSync('package-lock.json').mtimeMs > statSync(build).mtimeMs) {
+const buildTime = existsSync(build) ? statSync(build).mtimeMs : 0;
+if (!buildTime || newest(path.join(root, 'src')) > buildTime || newest(path.join(root, 'public')) > buildTime ||
+    ['index.html', 'package.json', 'package-lock.json', 'tsconfig.json', 'vite.config.ts']
+        .some(file => statSync(file).mtimeMs > buildTime)) {
+    console.log('正在构建网页…');
     const result = spawnSync(process.platform === 'win32' ? 'npm.cmd' : 'npm', ['run', 'build'], { stdio: 'inherit', shell: process.platform === 'win32' });
-    if (result.status) process.exit(result.status);
+    if (result.status !== 0) {
+        console.error('网页构建失败，请查看上方第一条报错。');
+        process.exit(result.status ?? 1);
+    }
 }
 if (process.platform === 'darwin') {
-    const result = spawnSync(python, [path.join(root, 'scripts/local_service.py'), 'start'], { stdio: 'inherit', cwd: root });
-    if (result.status) process.exit(result.status);
-    for (let attempt = 0; attempt < 120; attempt++) {
+    const result = spawnSync(python, [path.join(root, 'scripts/local_service.py'), 'start'], {
+        encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'], cwd: root,
+    });
+    if (result.status !== 0) process.exit(result.status ?? 1);
+    const { port, instanceId, logPath } = JSON.parse(result.stdout);
+    const appUrl = `http://127.0.0.1:${port}/`;
+    console.log(`正在检查后台服务：${appUrl}`);
+    const deadline = Date.now() + 30_000;
+    while (Date.now() < deadline) {
         try {
-            const response = await fetch(`${appUrl}/api/health`, { signal: AbortSignal.timeout(1200) });
-            if (response.ok && (await response.json()).app === 'inspection-video-gather-simple') {
-                console.log(`程序已启动：${appUrl}。关闭本终端后任务继续运行；停止请运行 ./启动简易版.command stop。`);
-                openBrowser();
+            const response = await fetch(`${appUrl}api/health`, { signal: AbortSignal.timeout(1200) });
+            const health = response.ok ? await response.json() : null;
+            if (health?.app === 'inspection-video-gather-simple' && health.instanceId === instanceId) {
+                console.log(`程序已启动：${appUrl}\n关闭终端后仍会继续运行。停止：zsh ./启动简易版.command stop`);
+                openBrowser(appUrl);
                 process.exit(0);
             }
         } catch { /* 等待已保存连接和队列恢复。 */ }
         await new Promise(resolve => setTimeout(resolve, 500));
     }
-    console.error('后台服务仍在启动，请稍后打开网页，或查看 数据/系统/local-service.log。');
+    console.error(`未能连接此文件夹的后台服务。请查看日志：${logPath}\n如需重新启动，请先运行 zsh ./启动简易版.command stop。`);
     process.exit(1);
 }
+const appUrl = `http://127.0.0.1:${process.env.PORT || '8786'}`;
 const server = spawn(python, ['-m', 'app.main'], { stdio: 'inherit', cwd: root });
-server.on('exit', code => process.exit(code || 0));
+server.on('exit', code => process.exit(code ?? 1));
 for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => server.kill(signal));
 for (let attempt = 0; attempt < 50; attempt++) {
     await new Promise(resolve => setTimeout(resolve, 200));
@@ -57,13 +60,13 @@ for (let attempt = 0; attempt < 50; attempt++) {
     try {
         if ((await fetch(`${appUrl}/api/health`, { signal: AbortSignal.timeout(1200) })).ok) {
             console.log(`\n简易版质检视频采集已启动：${appUrl}\n关闭本终端或按 Ctrl+C 可停止本地程序。`);
-            openBrowser();
+            openBrowser(appUrl);
             break;
         }
     } catch { /* 等待服务启动。 */ }
 }
 
-function openBrowser() {
+function openBrowser(appUrl) {
     if (process.argv.includes('--no-open')) return;
     const command = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'cmd' : 'xdg-open';
     const args = process.platform === 'win32' ? ['/c', 'start', '', appUrl] : [appUrl];

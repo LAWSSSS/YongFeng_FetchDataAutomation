@@ -67,6 +67,7 @@ def smoke(folder):
             second = invoke(folder, profile, "launch", "--no-browser")
             assert second["pid"] == first["pid"]
             assert invoke(folder, profile, "stop")["stopped"]
+            assert not (profile / "server.json").exists()
             assert not invoke(folder, profile, "stop")["stopped"]
             assert not (profile / "credentials/credentials.json").exists()
             print("Port conflict, empty profile, all API entries, repeat launch and safe stop passed.")

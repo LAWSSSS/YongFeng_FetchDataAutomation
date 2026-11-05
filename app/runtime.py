@@ -3,8 +3,9 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import shutil
 
-VERSION = "1.3.2"
+VERSION = "1.3.3"
 BUNDLE_ID = "cn.yongfeng.video-gather.standalone"
 PROFILE_NAME = "InspectionVideoGatherStandalone"
 
@@ -65,12 +66,20 @@ def source_model_paths() -> dict:
     models = root / "assets" / "models"
     if not (models / "magnet" / "best.onnx").is_file() and (root / "build/models/magnet/best.onnx").is_file():
         models = root / "build" / "models"
+    frame_tool = root / "build/ffmpeg-tools/bin/ffmpeg"
+    # Source downloads can use installed media tools without compiling FFmpeg.
+    # Keep both executables in the same directory for the inference worker.
+    for candidate in (frame_tool, shutil.which("ffmpeg"), "/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"):
+        if candidate and all(path.is_file() and os.access(path, os.X_OK)
+                             for path in (Path(candidate), Path(candidate).with_name("ffprobe"))):
+            frame_tool = Path(candidate)
+            break
     return {"magnetDeployDirectory": str(models / "magnet"),
             "magnetModelPath": str(models / "magnet/best.onnx"),
             "bedDeployDirectory": str(models / "bed"),
             "bedModelPath": str(models / "bed/model.pt"),
             "bedGeometryPath": str(models / "bed/geometry.npz"),
-            "frameToolPath": str(root / "build/ffmpeg-tools/bin/ffmpeg"),
+            "frameToolPath": str(frame_tool),
             "workerPythonPath": str(root / ".venv-slicing/bin/python")}
 
 
