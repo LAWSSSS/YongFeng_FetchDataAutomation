@@ -1,0 +1,68 @@
+/* Single source of truth for the operations console.
+   Every colour, radius, type size and spacing step used by the UI resolves here.
+   Business styles keep their state names; they reference these tokens instead of
+   carrying their own hex values. */
+:root {
+  color-scheme: light;
+
+  /* Surfaces */
+  --canvas: #f6f7f8;
+  --surface: #fff;
+  --surface-sunken: #f1f3f5;
+  --line: #e3e6ea;
+  --line-strong: #cfd4da;
+
+  /* Text */
+  --ink: #16181c;
+  --ink-2: #4b5058;
+  --muted: #626975;
+  --subtle: #636b76;
+
+  /* Brand */
+  --brand: #2f6b4f;
+  --brand-hover: #255a41;
+  --brand-soft: #e8f1ec;
+  --brand-ink: #1f4f38;
+
+  /* Status: each pair is a soft surface + its readable ink */
+  --ok: #e3f2e9;
+  --ok-ink: #1e6b43;
+  --warn: #fdf0e0;
+  --warn-ink: #8a5418;
+  --info: #e6effa;
+  --info-ink: #2f5c8a;
+  --danger: #a33a2c;
+  --danger-hover: #862c21;
+  --danger-soft: #fbebe8;
+
+  --focus: #2f6b4f;
+  --video-bg: #141614;
+
+  /* Radii: small inset, standard card, large container, pill */
+  --r-sm: 8px;
+  --r-md: 12px;
+  --r-lg: 16px;
+  --r-pill: 999px;
+
+  /* Type scale */
+  --fs-xs: 11px;
+  --fs-sm: 12px;
+  --fs-base: 13px;
+  --fs-md: 14px;
+  --fs-lg: 16px;
+  --fs-xl: 20px;
+  --fs-2xl: 26px;
+
+  /* Spacing */
+  --s-1: 4px;
+  --s-2: 8px;
+  --s-3: 12px;
+  --s-4: 16px;
+  --s-5: 20px;
+  --s-6: 24px;
+  --s-8: 32px;
+
+  /* Elevation: resting card and floating overlay only */
+  --shadow-card: 0 1px 2px rgba(16, 24, 40, .04);
+  --shadow-pop: 0 8px 24px rgba(16, 24, 40, .10);
+}

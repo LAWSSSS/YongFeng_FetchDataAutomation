@@ -1,18 +1,18 @@
 .record-delete{display:flex;justify-content:flex-end;min-width:0;margin-top:12px}
-.record-delete-trigger{display:inline-flex;align-items:center;gap:7px;min-height:40px;padding:8px 10px;background:transparent;color:#8c4437;font-size:13px;font-weight:600}
-.record-delete-trigger:hover:not(:disabled){background:#fbefeb;color:#78382e}
-.record-delete-confirm{flex:1;min-width:0;padding:14px 16px;border:1px solid #e7d9cf;border-radius:12px;background:#fffaf6;color:#684630;font-size:13px;line-height:1.6;overflow-wrap:anywhere}
+.record-delete-trigger{display:inline-flex;align-items:center;gap:7px;min-height:40px;padding:8px 10px;background:transparent;color:var(--danger);font-size:var(--fs-base);font-weight:600}
+.record-delete-trigger:hover:not(:disabled){background:var(--danger-soft);color:var(--danger-hover)}
+.record-delete-confirm{flex:1;min-width:0;padding:14px 16px;border:1px solid var(--line);border-left:3px solid var(--danger);border-radius:var(--r-sm);background:var(--danger-soft);color:var(--danger);font-size:var(--fs-base);line-height:1.6;overflow-wrap:anywhere}
 .record-delete-confirm p{margin:7px 0 0;max-width:70ch}
 .record-delete-confirm .actions{justify-content:flex-end;margin-top:12px}
 .record-delete-confirm button{min-height:40px}
-.record-delete-confirm .danger{background:#984b3c;color:#fff}
-.record-delete-confirm .danger:hover:not(:disabled){background:#7b392d}
-.record-deleted-notice{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;padding:12px 0;color:#315c45;font-size:14px;line-height:1.6}
+.record-delete-confirm .danger{background:var(--danger);color:var(--surface)}
+.record-delete-confirm .danger:hover:not(:disabled){background:var(--danger-hover)}
+.record-deleted-notice{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;padding:12px 0;color:var(--brand);font-size:var(--fs-md);line-height:1.6}
 .record-deleted-notice .link{min-height:40px}
-@media(max-width:700px){.record-delete-trigger,.record-delete-confirm button{min-height:44px;font-size:14px}.record-delete-confirm .actions button{flex:1;white-space:normal}}
-.record-batch{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:12px 14px;margin:12px 0;background:#f1f6f0;border-radius:10px;color:#294c36;font-size:13px}
+@media(max-width:700px){.record-delete-trigger,.record-delete-confirm button{min-height:44px;font-size:var(--fs-md)}.record-delete-confirm .actions button{flex:1;white-space:normal}}
+.record-batch{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:12px 14px;margin:12px 0;background:var(--surface-sunken);border-radius:var(--r-sm);color:var(--brand-ink);font-size:var(--fs-base)}
 .record-batch .record-delete{margin:0}.record-batch .record-delete:has(.record-delete-confirm){flex:1 1 100%}
-.record-checkbox{display:inline-flex;align-items:center;gap:7px;color:#405d49;font-size:13px;min-height:36px}
+.record-checkbox{display:inline-flex;align-items:center;gap:7px;color:var(--muted);font-size:var(--fs-base);min-height:36px}
 .record-checkbox input{width:18px;height:18px;flex:none}
 
 .batch-entry{display:flex;justify-content:flex-end;margin:0 0 16px}
@@ -20,15 +20,15 @@
 [data-selection-scope]:not(:has([data-selecting="true"])) .record-checkbox input,
 [data-selection-scope]:not(:has([data-selecting="true"])) .date-tools>button{display:none}
 [data-selection-scope]:not(:has([data-selecting="true"])) .record-checkbox:has(input):not(:has(strong)){display:none}
-.record-batch-management[data-selecting="true"]{background:var(--surface-muted,#f1f6f0);margin:0 0 16px}
-.storage-summary{display:flex;align-items:center;gap:8px;flex-wrap:wrap;color:#526858}
-.status-dot{width:7px;height:7px;border-radius:50%;background:#a98753;flex:none}.status-dot.online{background:#4c7a58}
-.pipeline-counts{margin:8px 0 0;color:#526858;font-variant-numeric:tabular-nums}
+.record-batch-management[data-selecting="true"]{background:var(--surface-sunken);margin:0 0 16px}
+.storage-summary{display:flex;align-items:center;gap:8px;flex-wrap:wrap;color:var(--muted)}
+.status-dot{width:7px;height:7px;border-radius:50%;background:var(--warn-ink);flex:none}.status-dot.online{background:var(--ok-ink)}
+.pipeline-counts{margin:8px 0 0;color:var(--muted);font-variant-numeric:tabular-nums}
 .workspace-panel h2{display:flex;align-items:center;gap:8px}
 
-.video-card-details>summary{min-height:44px;display:flex;align-items:center;color:#315c45;font-weight:600;cursor:pointer;gap:8px}
-.video-card-details>summary::before{content:'›';font-size:20px;transition:transform .15s}
-.video-card-details[open]>summary::before{transform:rotate(90deg)}
-.video-card-details[open]>summary{border-bottom:1px solid #dce5dd;margin-bottom:12px}
-.record-time{color:#526858;font-variant-numeric:tabular-nums;margin:8px 0}
+.video-card-details>summary{min-height:44px;display:flex;align-items:center;color:var(--brand);font-weight:600;cursor:pointer;gap:8px}
+.video-card-details>summary::before{content:'';width:6px;height:6px;border-right:1px solid currentColor;border-bottom:1px solid currentColor;transform:rotate(-45deg);margin-right:9px;transition:transform .18s ease-out}
+.video-card-details[open]>summary::before{transform:rotate(45deg)}
+.video-card-details[open]>summary{border-bottom:1px solid var(--line);margin-bottom:12px}
+.record-time{color:var(--muted);font-variant-numeric:tabular-nums;margin:8px 0}
 .slice-history:not(:has([data-selecting="true"])) .slice-history-day>.actions>button{display:none}
