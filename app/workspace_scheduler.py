@@ -458,7 +458,16 @@ class WorkspaceScheduler:
                                if isinstance(value, dict)},
             })
         trigger = hashlib.sha256(json.dumps(signature, sort_keys=True, separators=(',', ':')).encode()).hexdigest()[:32]
-        if any(row.get('kind') == 'reconcile' and row.get('pipelineAutoKey') == trigger for row in self.rows('requests')):
+        previous = next((row for row in self.rows('requests') if row.get('kind') == 'reconcile'
+                         and row.get('pipelineAutoKey') == trigger), None)
+        if previous:
+            # Older local runs could end before queuing any analysis because
+            # they incorrectly required the platform-video scan's targets.
+            if previous.get('pipelineState') == 'attention' and any(
+                    blocker.get('reason') == '等待车斗和磁盘吊图片目标配置完成。'
+                    for blocker in previous.get('pipelineBlockers', [])):
+                self._pipeline_update(previous, 'queued', '继续处理已下载视频。', 'queued',
+                                      completedAt=None, pipelineBlockers=[])
             return
         identity = f'auto-workspace-{trigger}'
         self.save('requests', {'id': identity, 'kind': 'reconcile', 'state': 'queued',
@@ -679,7 +688,10 @@ class WorkspaceScheduler:
                         label = '车斗' if category == 'bed' else '磁盘吊'
                         reason = f'{label}视频集尚未关联到该原片。'
                 if not related and not reason:
-                    reason = '两个视频集中都没有唯一对应的原片记录。'
+                    if not self.slicing.store.settings.get('localExport', True):
+                        reason = '两个视频集中都没有唯一对应的原片记录。'
+                    elif any(row.get('name') in ('', asset['name']) for row in blockers):
+                        continue  # The local queue already supplied the actual blocker.
                 if reason:
                     blockers.append({'name': asset['name'], 'reason': reason})
                 else:

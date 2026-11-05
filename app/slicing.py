@@ -768,11 +768,14 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
 
     def queue_collection_recovery(self, *, video_id, revision, path, file_version, metadata, name, request_id):
         """Queue a local-only item without inventing a platform source-video ID."""
-        if not self.auth.connected and not self.store.settings.get('localExport', True):
-            raise AuditError(ERROR_TEXT["auth"], "auth", 401)
-        targets = self.store.settings.get("targetDatasetIds") or {}
-        if not all(str(targets.get(key) or "").isdigit() for key in ("27912", "27944")):
-            raise ValueError("车斗和磁盘吊图片目标尚未配置，请先完成目标数据集设置。")
+        targets = PACKAGE_DATASETS
+        if not self.store.settings.get('localExport', True):
+            if not self.auth.connected:
+                raise AuditError(ERROR_TEXT["auth"], "auth", 401)
+            legacy = self.store.settings.get("targetDatasetIds") or {}
+            targets = {"bed": legacy.get("27912"), "magnet": legacy.get("27944")}
+            if not all(str(target or "").isdigit() for target in targets.values()):
+                raise ValueError("车斗和磁盘吊图片目标尚未配置，请先完成目标数据集设置。")
         file_version = copy.deepcopy(file_version)
         source_identity = "collection:" + str(video_id) + ":v" + str(revision) + ":" + str(file_version.get("edgeHash", ""))
         if getattr(self, "control", None):
@@ -795,9 +798,9 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
                 self.store.save("items", existing)
         else:
             categories = {}
-            for category, key in (("bed", "27912"), ("magnet", "27944")):
+            for category, target in targets.items():
                 categories[category] = {"state": "pending", "intervals": [], "observations": 0,
-                    "estimatedImages": None, "actualImages": None, "targetDatasetId": str(targets[key]),
+                    "estimatedImages": None, "actualImages": None, "targetDatasetId": str(target),
                     "taskId": "", "intervalSeconds": None, "message": "仅处理可解码位置。",
                     "partialRecovery": True, "skippedSamples": 0}
             existing = {"id": identity, "runId": "", "sourceDatasetId": "27912", "sourceVideoId": "",
@@ -1536,7 +1539,9 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
                     "仅处理可解码片段；损坏位置已跳过，准备提交。" if partial else
                     "识别完成，准备核对平台任务槽位。"))
             target_key = "27912" if category == "bed" else "27944"
-            categories["targetDatasetId"] = settings.get("targetDatasetIds", {}).get(target_key)
+            local = settings.get('localExport', True) and (item.get('localWorkspace') or item.get('collectionRecovery'))
+            categories["targetDatasetId"] = (PACKAGE_DATASETS[category] if local else
+                                               settings.get("targetDatasetIds", {}).get(target_key))
         self._save_analysis_item(item)
         return metadata
 

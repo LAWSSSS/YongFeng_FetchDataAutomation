@@ -63,6 +63,20 @@ async def test_final_approval_is_fast_durable_and_replayed_without_download(env)
 
 
 @pytest.mark.asyncio
+async def test_saved_video_waits_for_recognition_before_a_worker_exists(env):
+    app, row = env
+    manager = app.state.final_processing
+    result = manager.confirm(row['id'], payload(row))
+    current = app.state.videos.store.get(row['id'])
+    current['acceptedRevision'] = 0
+    current['versions'][0]['state'] = 'saved'
+    app.state.videos.store.save(current)
+    await manager.tick()
+    status = manager.operation(result['operationId'])
+    assert (status['state'], status['stage'], status['progress']) == ('queued', 'recognition_queue', None)
+
+
+@pytest.mark.asyncio
 async def test_pause_wins_and_newer_version_cannot_be_downloaded_by_old_intent(env):
     app, row = env
     manager = app.state.final_processing

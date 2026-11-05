@@ -102,6 +102,16 @@ async def test_package_stage_updates_both_views_without_claiming_unverified_comp
 
 
 @pytest.mark.asyncio
+async def test_one_verified_package_does_not_hide_the_other_category_export(env):
+    app, row = env
+    _, item, _ = confirmed_photos(app, row, state='complete')
+    item['categories']['magnet'].update(state='ready')
+    app.state.slicing.store.save('items', item)
+    shown = app.state.pipeline.state()['items'][0]
+    assert shown['stage'] == '照片导出' and shown['state'] == 'processing'
+
+
+@pytest.mark.asyncio
 async def test_wrong_package_or_new_unconfirmed_version_never_acquires_the_old_results(env):
     app, row = env
     current, item, operation = confirmed_photos(app, row)

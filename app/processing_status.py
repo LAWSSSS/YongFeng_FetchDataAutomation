@@ -7,7 +7,7 @@ import copy
 
 STAGES = {
     'queued': '已登记', 'download': '下载', 'download_wait': '等待下载恢复',
-    'recognizing': '识别', 'photos': '照片处理', 'photo_export': '照片导出',
+    'recognition_queue': '等待识别', 'recognizing': '识别', 'photos': '照片处理', 'photo_export': '照片导出',
     'photo_upload': '照片上传', 'photos_paused': '照片上传已暂停',
     'photo_queued': '排队上传', 'photo_import': '照片导入', 'verification': '结果核验',
     'identity': '身份核对', 'waiting_disk': '等待磁盘', 'paused': '已暂停',
@@ -91,7 +91,14 @@ def current_presentations(flow):
                     else:
                         value.update(state='queued', stage='photo_queued', message='照片已打包，排队等待上传。')
                 elif states == {'complete'}:
-                    value.update(state='running', stage='verification', message='正在核对两类照片成果与处理结论。')
+                    unfinished = {slot.get('state') for item in linked for slot in item.get('categories', {}).values()
+                                  if not slot.get('packageId')}
+                    if unfinished & {'ready', 'waiting_slot', 'exporting'}:
+                        value.update(state='running', stage='photo_export', message='正在导出另一类照片。')
+                    elif 'pending' in unfinished:
+                        value.update(state='queued', stage='recognition_queue', message='等待识别剩余类别。')
+                    else:
+                        value.update(state='running', stage='verification', message='正在核对两类照片成果与处理结论。')
         if not terminal:
             wait = flow.wait_reason(row['id'])
             if wait and not value.get('issue'):

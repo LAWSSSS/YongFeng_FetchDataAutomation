@@ -433,7 +433,7 @@ class FinalProcessing:
                 if not operation.get('downloadEnrolled'):
                     self.pipeline.notify_saved(row['id'], version['revision'])
                     operation['downloadEnrolled'] = True
-                operation.update(stage='recognizing', message='正在识别、导出并导入照片。')
+                operation.update(state='queued', stage='recognition_queue', message='视频已下载，等待本地识别。')
             linked, conflicts = self.linked_items(row, version, operation['mediaGeneration'])
             self.recover_decode_once(operation, linked)
             linked, conflicts = self.linked_items(row, version, operation['mediaGeneration'])
@@ -445,8 +445,15 @@ class FinalProcessing:
                 operation['skippedSamples'] = sum(max((int(value.get('skippedSamples') or 0)
                     for value in item.get('categories', {}).values()), default=0) for item in linked)
                 if operation.get('state') != 'waiting':
-                    operation.update(stage='photos' if any(i.get('state') == 'platform_processing' for i in linked) else 'recognizing',
-                                     message=next((i.get('message') for i in linked if i.get('message')), '正在处理照片。'))
+                    states = {item.get('state') for item in linked}
+                    if 'platform_processing' in states:
+                        stage, state = 'photos', 'running'
+                    elif 'analyzing' in states:
+                        stage, state = 'recognizing', 'running'
+                    else:
+                        stage, state = 'recognition_queue', 'queued'
+                    operation.update(stage=stage, state=state,
+                                     message=next((i.get('message') for i in linked if i.get('message')), operation['message']))
                     if operation['stage'] == 'photos' and self.slicing.store.settings.get('localExport', True):
                         packages = self.linked_packages(linked)
                         stages = {package.get('state') for package in packages if package.get('state') != 'complete'}

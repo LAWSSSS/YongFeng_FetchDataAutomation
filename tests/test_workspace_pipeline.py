@@ -8,6 +8,7 @@ import pytest_asyncio
 
 from app.main import create_app
 from app.audit_moves import source_fingerprint
+from app.slice_export import PACKAGE_DATASETS
 from app.workspace_progress import snapshot
 from tests.test_media_control import collection
 from tests.test_workspace import enable
@@ -38,6 +39,8 @@ async def local_app(tmp_path, monkeypatch):
 @pytest.mark.asyncio
 async def test_local_analysis_does_not_scan_or_queue_original_uploads(local_app, monkeypatch):
     w = local_app.state.workspace
+    w.slicing.store.settings['targetDatasetIds'] = {'27912': None, '27944': None}
+    w.slicing.auth.access = ''
     await w._auto_start_pipeline()
     await w._advance_pipeline()
     items = w.slicing.store.list('items')
@@ -45,6 +48,7 @@ async def test_local_analysis_does_not_scan_or_queue_original_uploads(local_app,
     assert items[0]['sourceVideoId'] == '' and not items[0].get('collectionRecovery')
     assert items[0]['collectionVideoId'] == 'accepted-video'
     assert set(items[0]['categories']) == {'bed', 'magnet'}
+    assert {name: value['targetDatasetId'] for name, value in items[0]['categories'].items()} == PACKAGE_DATASETS
     assert not w.uploads.store.list('items')
     entered = asyncio.Event()
     async def process(item):
@@ -62,6 +66,20 @@ async def test_local_analysis_does_not_scan_or_queue_original_uploads(local_app,
     assert not w.uploads.store.list('items')
     w.slicing.queue_workspace_sources([], 'empty-repeat')
     assert len(w.slicing.store.list('items')) == 1
+
+
+@pytest.mark.asyncio
+async def test_auto_queue_reopens_request_blocked_by_legacy_target_setting(local_app):
+    w = local_app.state.workspace
+    await w._auto_start_pipeline()
+    request = w._pipeline_request()
+    w._pipeline_update(request, 'attention', '旧流程阻塞', 'attention',
+        pipelineBlockers=[{'name': '', 'reason': '等待车斗和磁盘吊图片目标配置完成。'}])
+    await w._auto_start_pipeline()
+    assert w._pipeline_request()['id'] == request['id']
+    await w._advance_pipeline()
+    assert len(w.slicing.store.list('items')) == 1
+    assert w._pipeline_request()['pipelineBlockers'] == []
 
 
 @pytest.mark.asyncio

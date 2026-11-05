@@ -157,10 +157,9 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
     workspace = WorkspaceManager(store, data_dir, videos, uploads, slicing, upload_audit, audit_moves, files, leases)
     if managed_root:
         from .managed_storage import configure
-        configure(workspace, managed_root)
         slicing.store.settings.update(runtime.slicing_paths() if runtime.portable() else runtime.source_model_paths())
         slicing.store.settings['localExport'] = True
-        slicing.store.save_settings()
+        configure(workspace, managed_root)
     media_control = MediaControl(store.db, videos, slicing, leases)
     media_control.submissions = submissions
     videos.control = slicing.control = slicing.packages.control = media_control

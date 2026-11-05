@@ -10,7 +10,9 @@ import pytest
 
 from app import runtime
 from app.main import create_app
+from app.models import SlicingSettingsInput
 from app.slicing import SlicingStore
+from tests.test_slicing_performance import close_app
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("portable_launcher", ROOT / "scripts/portable_launcher.py")
@@ -71,6 +73,22 @@ async def test_health_identifies_only_own_instance_and_fresh_data(portable):
         assert not videos["videos"]
         assert not videos["directory"]
     app.state.store.close()
+
+
+@pytest.mark.asyncio
+async def test_fresh_portable_workspace_keeps_derived_directories_and_can_save_settings(portable):
+    app = create_app()
+    try:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://127.0.0.1') as client:
+            settings = (await client.get('/api/slicing?summary=true')).json()['settings']
+            media = runtime.data_directory() / '媒体'
+            assert settings['directories'] and all(Path(path).is_relative_to(media) for path in settings['directories'])
+            data = {key: value for key, value in settings.items() if key in SlicingSettingsInput.model_fields}
+            response = await client.post('/api/slicing/settings', json={**data,
+                'expectedRevision': settings['revision'], 'requestId': 'fresh-portable-settings'})
+            assert response.status_code == 200, response.text
+    finally:
+        await close_app(app)
 
 
 def test_launcher_never_reuses_another_program_even_on_same_port(monkeypatch):

@@ -3,6 +3,7 @@ import asyncio
 import hashlib
 from uuid import uuid4
 from .domain import now_iso
+from .slice_export import PACKAGE_DATASETS
 from .videos import Conflict
 
 
@@ -78,9 +79,8 @@ class SlicingWorkflow:
                 run.get('state') == 'scanning' or run.get('pilotMode') or
                 (run.get('singleMode') and not run.get('localRecoveryOnly'))):
             raise Conflict('等待当前扫描或单条操作结束后继续本地识别。')
-        targets = self.store.settings.get('targetDatasetIds') or {}
-        if not all(str(targets.get(key) or '').isdigit() for key in ('27912', '27944')):
-            raise Conflict('等待车斗和磁盘吊图片目标配置完成。')
+        # Local export uses the fixed photo-import destinations, independently
+        # of the targets chosen by a legacy platform-video scan.
         identities = []
         for source in sources:
             if source.get('existingItemIds'):
@@ -104,9 +104,8 @@ class SlicingWorkflow:
                         assigned = {name for name, slot in owner.get('categories', {}).items()
                                     if slot.get('state') not in {None, 'not_applicable'}} | missing
                         for name in missing:
-                            dataset = '27912' if name == 'bed' else '27944'
                             owner.setdefault('categories', {})[name] = {'state': 'pending', 'intervals': [],
-                                'targetDatasetId': str(targets[dataset]), 'message': '补充本视频尚未处理的类别。'}
+                                'targetDatasetId': PACKAGE_DATASETS[name], 'message': '补充本视频尚未处理的类别。'}
                         owner.update(localWorkspace=True, localWorkspaceCategories=sorted(assigned), state='pending',
                                      errorCode='', revision=int(owner.get('revision', 0)) + 1)
                         self.store.save('items', owner)
@@ -116,9 +115,9 @@ class SlicingWorkflow:
             item = self.store.get('items', identity)
             if not item:
                 categories = {name: {'state': 'pending', 'intervals': [], 'observations': 0,
-                    'estimatedImages': None, 'actualImages': None, 'targetDatasetId': str(targets[dataset]),
+                    'estimatedImages': None, 'actualImages': None, 'targetDatasetId': target,
                     'taskId': '', 'intervalSeconds': None, 'message': '等待本地识别。'}
-                    for name, dataset in (('bed', '27912'), ('magnet', '27944'))}
+                    for name, target in PACKAGE_DATASETS.items()}
                 item = {'id': identity, 'runId': '', 'workspaceAssetId': source['id'],
                     'sourceIdentity': 'workspace:' + source['id'], 'sourceType': 'local_workspace',
                     'localWorkspace': True, 'sourceDatasetId': '27912', 'sourceVideoId': '', 'remote': {},
