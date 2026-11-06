@@ -3,9 +3,14 @@ from uuid import uuid4
 
 from .domain import BATCH_LIMIT, approval_issue, format_time, gather_payload, now_iso, task_key
 from .admission import admission_rule
+from .capture_history import unconfirmed_capture_keys
 from .remote import RemoteClient, RemoteError
 from .source import page_records
 from .store import JobStore
+
+
+ENDED_CAPTURES = {'FIXED', 'ENDED', 'FAIL', 'ABNORMAL_END'}
+UNCONFIRMED_CAPTURE = '该区间还有提交结果未确认，核对原任务后才能重新采集。'
 
 
 class JobManager:
@@ -65,8 +70,12 @@ class JobManager:
     async def remote_tasks(self, target: dict, tasks: list[dict]) -> dict[str, list[dict]]:
         if not tasks:
             return {}
+        return self.tasks_by_interval(target, (await self.remote_parents(target)).values())
+
+    @staticmethod
+    def tasks_by_interval(target, parents):
         result = {}
-        for row in (await self.remote_parents(target)).values():
+        for row in parents:
             start, end = format_time(row.get("startTime")), format_time(row.get("endTime"))
             if start and end and str(row.get("taskType", "VIDEO")).upper() == "VIDEO":
                 result.setdefault(task_key(target, start, end), []).append(row)
@@ -149,6 +158,33 @@ class JobManager:
             item["bindingSource"] = "submission_difference"
         return row, ""
 
+    def review_repeat(self, item, target, candidates):
+        """Allow an explicit repeat only against the previously verified interval owners."""
+        bindings = item['repeatBindings']
+        active = []
+        for parent in candidates:
+            identity = str(parent['id'])
+            old_name = bindings.get(identity)
+            if not old_name or not self.parent_matches(parent, target, {**item, 'videoName': old_name}):
+                item.update(status='failed', preflightRejected=True,
+                            message='该区间有未核实归属的平台任务，请先核对任务 ID。')
+                return False
+            status = str(parent.get('taskStatus') or parent.get('status') or '').upper()
+            if status not in ENDED_CAPTURES:
+                active.append(parent)
+        if not active:
+            return True
+        if len(active) != 1:
+            item.update(status='failed', preflightRejected=True, message='该区间有多个在途任务，请先核对任务 ID。')
+            return False
+        parent = active[0]
+        identity = str(parent['id'])
+        item.update(status='duplicate', duplicateSource='remote', remoteId=identity, videoName=bindings[identity],
+                    bindingVerified=True, bindingSource='reviewed_existing',
+                    remoteStatus=str(parent.get('taskStatus') or parent.get('status') or ''),
+                    message='同一区间仍在采集，已沿用原平台任务。')
+        return False
+
     def start(self, plan: dict, download_directory: str = "") -> dict:
         previous = next((job for job in self.store.list() if job["planId"] == plan["id"]), None)
         if previous:
@@ -199,17 +235,17 @@ class JobManager:
                 if any(item["status"] == "failed" for item in pending):
                     raise ValueError("实绩未通过采集准入校验，已阻止提交。请重新查询。")
                 await self.camera(job["target"])
-                remote = await self.remote_tasks(job["target"], pending)
                 local = self.store.known_keys(exclude_job=job["id"], include_retired=False)
+                unresolved = unconfirmed_capture_keys(self.store, job['target'], exclude_job=job['id'])
                 for item in pending:
+                    if item['key'] in unresolved:
+                        item.update(status='failed', preflightRejected=True, message=UNCONFIRMED_CAPTURE)
+                        continue
+                    if 'repeatBindings' in item:
+                        continue
                     if item['key'] in local:
                         item.update(status="duplicate", duplicateSource="local",
                                     message="本条已有采集，请打开已有视频查看或按当前区间重新采集。")
-                    elif candidates := remote.get(item["key"]):
-                        item.update(status="duplicate", duplicateSource="remote")
-                        _, issue = self.bind_existing_item(job["target"], item, {str(row["id"]): row for row in candidates})
-                        if issue:
-                            item["message"] = issue
                 pending = [item for item in pending if item["status"] == "pending"]
                 self.event(job, f"核对完成，准备提交 {len(pending)} 条，每批最多 {BATCH_LIMIT} 条。")
                 for offset in range(0, len(pending), BATCH_LIMIT):
@@ -217,8 +253,25 @@ class JobManager:
                         job["status"] = "stopped"
                         self.event(job, "已停止后续批次；已提交到原站的任务继续采集。")
                         return
-                    batch = pending[offset:offset + BATCH_LIMIT]
-                    before_ids = sorted(await self.remote_parents(job["target"]))
+                    parents = await self.remote_parents(job["target"])
+                    intervals = self.tasks_by_interval(job['target'], parents.values())
+                    batch = []
+                    for item in pending[offset:offset + BATCH_LIMIT]:
+                        candidates = intervals.get(item['key'], [])
+                        if 'repeatBindings' in item:
+                            if not self.review_repeat(item, job['target'], candidates):
+                                continue
+                        elif candidates:
+                            item.update(status='duplicate', duplicateSource='remote')
+                            _, issue = self.bind_existing_item(job['target'], item, {str(row['id']): row for row in candidates})
+                            if issue:
+                                item['message'] = issue
+                            continue
+                        batch.append(item)
+                    if not batch:
+                        self.store.save(job)
+                        continue
+                    before_ids = sorted(parents)
                     for item in batch:
                         item["status"] = "submitting"
                         item["submission"] = {
@@ -255,7 +308,8 @@ class JobManager:
                         self.event(job, "已核对当前批次的确切任务 ID，并暂停后续提交；可核对后继续剩余任务。")
                         return
                     self.event(job, f"第 {offset // BATCH_LIMIT + 1} 批已提交成功。")
-                job["status"] = "attention" if any(item.get("bindingIssue") for item in job["items"]) else "complete"
+                job["status"] = "attention" if any(item.get("bindingIssue") or item['status'] == 'failed'
+                                                  for item in job["items"]) else "complete"
                 self.event(job, "全部任务已处理；可刷新原站状态查看视频采集结果。")
             except asyncio.CancelledError:
                 for item in job["items"]:
@@ -298,6 +352,9 @@ class JobManager:
                 continue
             if item['status'] == 'duplicate' and item.get('existingVideoId'):
                 continue  # The canonical video owns its binding and correction history.
+            if (item['status'] == 'failed' and (item.get('preflightRejected') or 'repeatBindings' in item)
+                    and not item.get('remoteId') and not item.get('submission')):
+                continue  # The preflight rejected this item before any write.
             if item["status"] == "pending" and not item.get("remoteId") and not item.get("submission"):
                 continue  # 尚未写入的新任务由 execute 按原有规则完成初次去重。
             binder = self.bind_existing_item if item["status"] == "duplicate" else self.bind_remote_item

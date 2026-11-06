@@ -661,14 +661,18 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
             "SELECT id,json_extract(payload,'$.createdAt') FROM simple_slicing_operations"))
         package_dates = dict(self.store.db.execute(
             "SELECT id,json_extract(payload,'$.createdAt') FROM simple_slice_package_items"))
+        control = getattr(self, 'control', None)
+        hidden_videos = control.videos.record_visibility.hidden() if control else set()
         for item in items:
             public = ({key: value for key, value in item.items() if key in SUMMARY_ITEM | {'path'}}
                       if lean else dict(item))
             public['categories'] = {}
             if item['id'] in covered:
                 public['coveredByRecovery'] = covered[item['id']]
-            if getattr(self, "control", None):
-                public["processingBlockedReason"] = self.control.reason(item)
+            if control:
+                public["processingBlockedReason"] = control.reason(item)
+            if item.get('collectionVideoId') in hidden_videos:
+                public['canOpenVideo'] = False
             known_dates = []
             for name, category in item.get("categories", {}).items():
                 public["categories"][name] = {key: value for key, value in category.items()

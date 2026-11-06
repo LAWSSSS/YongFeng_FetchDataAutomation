@@ -322,6 +322,12 @@ async def test_video_date_snapshot_delete_and_exact_submit_dates_do_not_change_c
         assert (await delete_records(app, client, '/api/videos/records/remove', json={'requestId': 'date', 'selections': stale})).status_code == 409
         assert len(manager.state()['videos']) == 2
         body = {'requestId': 'date', 'selections': selections}
+        assert (await delete_records(app, client, '/api/videos/records/remove', json=body)).status_code == 409
+        assert manager.store.list() == original
+        for row in manager.store.list():
+            row['versions'][1]['state'] = 'ready'
+            manager.store.save(row)
+        original = copy.deepcopy(manager.store.list())
         assert (await delete_records(app, client, '/api/videos/records/remove', json=body)).status_code == 202
         assert manager.state()['videos'] == []
         assert manager.store.list() == original

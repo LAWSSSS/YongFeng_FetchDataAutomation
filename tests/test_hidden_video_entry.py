@@ -10,7 +10,7 @@ from tests.test_slicing_performance import close_app
 
 
 @pytest.mark.asyncio
-async def test_explicit_hidden_video_read_keeps_identity_and_hidden_scope(tmp_path):
+async def test_deleted_video_cannot_be_reopened_by_an_exact_link(tmp_path):
     app = create_app(data_dir=tmp_path / 'db')
     path = tmp_path / 'one.mp4'; path.write_bytes(b'old')
     other = tmp_path / 'two.mp4'; other.write_bytes(b'new')
@@ -22,9 +22,9 @@ async def test_explicit_hidden_video_read_keeps_identity_and_hidden_scope(tmp_pa
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://127.0.0.1') as client:
             listing = (await client.get('/api/videos?compact=true')).json()
             assert [r['id'] for r in listing['videos']] == ['visible-same-name']
-            detail = (await client.get('/api/videos/hidden-exact')).json()
-            assert detail['recordHidden'] is True and detail['video']['id'] == 'hidden-exact'
-            assert detail['video']['versions'][0]['filePath'] == str(path)
+            assert (await client.get('/api/videos/hidden-exact')).status_code == 404
+            detail = (await client.get('/api/videos/visible-same-name')).json()
+            assert detail['video']['id'] == 'visible-same-name'
             assert 'requests' not in detail['video']
             assert app.state.videos.record_visibility.hidden() == {'hidden-exact'}
             row['deletedAt'] = '2026-11-02T01:00:00Z'
@@ -61,7 +61,7 @@ async def test_hidden_running_record_can_be_deleted_while_download_progress_chan
             assert current['versions'][0]['downloadRequested']
             assert path.read_bytes() == b'keep-original'
             assert not (await client.get('/api/videos?compact=true')).json()['videos']
-            assert (await client.get('/api/videos/hidden-running')).json()['recordHidden']
+            assert (await client.get('/api/videos/hidden-running')).status_code == 404
     finally:
         await close_app(app)
 

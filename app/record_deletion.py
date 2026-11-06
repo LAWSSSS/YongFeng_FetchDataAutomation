@@ -6,6 +6,7 @@ import sqlite3
 
 from .domain import now_iso
 from .videos import Conflict
+from .video_termination import capture_in_flight
 from .workspace_files import compatible
 
 
@@ -83,6 +84,9 @@ class RecordDeletion:
             selection = {**choice, 'name': row.get('name') or row.get('title') or row.get('videoName') or '记录',
                          'logicalSignature': logical_record(row), 'state': 'queued'}
             if choice['kind'] == 'collection':
+                if any(v['revision'] == row['activeRevision'] and capture_in_flight(v)
+                       for v in row['versions']):
+                    raise Conflict('所选记录仍在采集，请打开视频详情终止采集后删除。')
                 # Deleting a running card is a display action. Do not wait for
                 # stable byte counters or clean files that finish after this click.
                 assets = self.assets('collection', row)
@@ -144,6 +148,10 @@ class RecordDeletion:
         row = self.row(kind, identity)
         if not self.selection_matches(row, selected):
             selected.update(state='attention', message='记录已有新进度，本条未删除，请刷新后重新选择。')
+            return
+        if kind == 'collection' and any(v['revision'] == row['activeRevision'] and capture_in_flight(v)
+                                        for v in row['versions']):
+            selected.update(state='attention', message='视频仍在采集，请打开详情终止采集后删除。')
             return
         assets = self.assets(kind, row)
         if 'cleanupAssetIds' in selected:

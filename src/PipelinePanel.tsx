@@ -14,7 +14,6 @@ import DateSection from './DateSection';
 import {groupSubmissionDays} from './submission-dates';
 
 type State={enabled:boolean;paused:boolean;revision:number;workspaceOnline:boolean;offlineWaiting?:boolean;items:PipelineVideo[];
-  backgroundCounts?:{processing:number;waiting:number;attention:number;complete:number};
   photoUploads?:{paused:boolean;queued:number;videos:number;images:number};
   counts:{processing:number;waiting:number;attention:number;complete:number};page:number;pages:number;total:number};
 type Operation={operationId:string;state:string;total:number;finished:number;outcomes:{mediaId:string;ok:boolean;message?:string}[]};
@@ -111,7 +110,6 @@ export default function PipelinePanel({onChanged,compact=false}:{onChanged:()=>P
   const current=loadedKey===query;
   const rows=current?state?.items||[]:[];
   const beforeSlicing=rows.filter(row=>row.hasResultRecord===false);
-  const hiddenActive=Object.entries(state?.backgroundCounts||{}).filter(([key])=>key!=='complete').reduce((sum,[,value])=>sum+value,0);
   const continuable=rows.filter(row=>row.nextAction.canContinue);
   const disabled=!!busy||!!operationId||!current||search.trim()!==appliedSearch;
   const open=(row:PipelineVideo)=>window.dispatchEvent(new CustomEvent('simple-open-video',{detail:{videoId:row.videoId,mediaId:row.mediaId}}));
@@ -131,7 +129,6 @@ export default function PipelinePanel({onChanged,compact=false}:{onChanged:()=>P
     <div className="pipeline-tools"><label>查找视频<input type="search" value={search} onChange={event=>setSearch(event.target.value)} placeholder="输入车牌或视频名"/></label>
       {continuable.length>1&&<button className="secondary" disabled={disabled} onClick={()=>void enqueue(continuable)}>继续本页可恢复的 {continuable.length} 条</button>}</div>
     </>}{compact&&state&&<p className="pipeline-counts">处理中 {state.counts.processing} · 等待恢复 {state.counts.waiting} · 需处理 {state.counts.attention} · 已完成 {state.counts.complete}</p>}
-    {!!hiddenActive&&<p className="subtle">另有 {hiddenActive} 条已隐藏记录在后台处理或等待，原进度保留。</p>}
     {error&&<p className="error" role="alert">{error}<button className="link" onClick={()=>{if(operationId)void refreshOperation().catch(f=>setError((f as Error).message));else void refresh();}}>重试读取</button></p>}
     {notice&&<p className="subtle" role="status">{notice}</p>}
     {operation&&(pipelineBusy(operation.state)||operation.outcomes.some(row=>!row.ok))&&<div className="pipeline-operation" role="status"><p>{pipelineBusy(operation.state)?`正在登记 ${operation.finished}/${operation.total}`:'部分项目需要核对'}</p>
@@ -143,7 +140,7 @@ export default function PipelinePanel({onChanged,compact=false}:{onChanged:()=>P
         {row.version!=null&&<p className="subtle">第 {row.version+1} 版 · 已确认</p>}<p className="subtle">{row.message}</p>
         {row.state!=='complete'&&row.nextAction.progress&&<div className="pipeline-progress"><progress aria-label={`${row.name} ${row.stage}`} value={row.nextAction.progress.done} max={row.nextAction.progress.total}/>
           <small>{row.nextAction.progress.unit==='bytes'?transferProgress(row.nextAction.progress.done,row.nextAction.progress.total):`${row.nextAction.progress.done}/${row.nextAction.progress.total} ${row.nextAction.progress.unit}`}</small></div>}
-        <button className="secondary" onClick={()=>open(row)}>查看详情</button>
+        {row.processingEntry!==null&&<button className="secondary" onClick={()=>open(row)}>查看详情</button>}
       </article>)}</div>
     </DateSection>)}
     {!compact&&<>{!current?<p className="subtle" role="status">正在读取处理状态…</p>:rows.length?<ul className="attention-list">{rows.map(row=>{
@@ -156,8 +153,8 @@ export default function PipelinePanel({onChanged,compact=false}:{onChanged:()=>P
         <div className="attention-actions">{next.canContinue?<button disabled={disabled} onClick={()=>void enqueue([row])}>{next.action==='archive'?'重试整理':'继续处理'}</button>:
           next.action==='resume'?<button disabled={disabled} onClick={()=>void enqueue([row],'resume')}>继续此视频</button>:
           next.kind==='automatic'&&next.canPause!==false?<button className="secondary" disabled={disabled} onClick={()=>void enqueue([row],'pause')}>暂停此视频</button>:
-          next.kind==='manual'||next.action==='open'?<button disabled={!!busy} onClick={()=>open(row)}>{next.kind==='manual'?'处理此视频':'查看详情'}</button>:null}
-          {next.kind!=='complete'&&next.kind!=='manual'&&next.action!=='open'&&<button className="secondary" onClick={()=>open(row)}>查看详情</button>}</div></li>;
+          row.processingEntry!==null&&(next.kind==='manual'||next.action==='open')?<button disabled={!!busy} onClick={()=>open(row)}>{next.kind==='manual'?'处理此视频':'查看详情'}</button>:null}
+          {row.processingEntry!==null&&next.kind!=='complete'&&next.kind!=='manual'&&next.action!=='open'&&<button className="secondary" onClick={()=>open(row)}>查看详情</button>}</div></li>;
     })}</ul>:<p className="attention-empty">{filter==='attention'?'没有需要你处理的视频。':'当前没有符合条件的视频。'}</p>}
     {state&&state.pages>1&&<div className="pagination"><button className="secondary" disabled={!current||state.page<=1} onClick={()=>setPage(state.page-1)}>上一页</button>
       <span>第 {state.page}/{state.pages} 页 · {state.total} 个视频</span><button className="secondary" disabled={!current||state.page>=state.pages} onClick={()=>setPage(state.page+1)}>下一页</button></div>}

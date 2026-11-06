@@ -123,6 +123,7 @@ class PipelineManager:
     def state(self, *, page=1, page_size=20, status='all', search=''):
         from .availability import connection_state
         groups = self._final_groups(self._groups())
+        hidden_videos = self.videos.record_visibility.hidden()
         # Derive this from effective versions before pagination; historical
         # attempts and the current page must not change the global pause notice.
         pending_photos = {}
@@ -160,7 +161,7 @@ class PipelineManager:
                           'hasResultRecord': group.get('hasResultRecord', bool(group.get('items'))),
                           'state': state, 'stage': action.get('stage') or '',
                           'message': action.get('reason') or '', 'nextAction': action,
-                          'processingEntry': group.get('processingEntry')})
+                          'processingEntry': None if group.get('videoId') in hidden_videos else group.get('processingEntry')})
         priority = {'attention': 0, 'processing': 1, 'waiting': 2, 'complete': 3}
         items.sort(key=lambda item: (priority[item['state']], item['name'].casefold(), item['mediaId']))
         total = len(items)

@@ -7,9 +7,9 @@ from hashlib import sha256
 def collection_record(job):
     return {'jobId': job['id'], 'downloadAfterCollection': bool(job.get('downloadAfterCollection')),
             'items': [{key: item.get(key) or '' for key in
-                       ('videoName', 'startTime', 'endTime', 'status', 'reason', 'taskId')}
+                       ('videoName', 'startTime', 'endTime', 'status', 'reason', 'message', 'taskId')}
                       | {'id': item.get('key') or item.get('recordId'), 'camera': item.get('cameraName') or ''}
-                      for item in job.get('items') or []]}
+                      for item in job.get('items') or [] if item.get('status') != 'removed']}
 
 
 class SubmissionViews:

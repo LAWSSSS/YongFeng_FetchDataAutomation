@@ -33,6 +33,8 @@ def capability(manager, row):
     version = manager.version(row, row.get('activeRevision')) or {}
     if row.get('deletion', {}).get('state') in {'pending', 'error'}:
         reason = '记录正在清理。'
+    elif version.get('state') == 'terminating':
+        reason = '本版正在终止采集。'
     elif not version.get('revision'):
         reason = '初次采集无需撤回。'
     elif (version.get('finalConfirmation') or row.get('acceptedRevision') == version['revision']

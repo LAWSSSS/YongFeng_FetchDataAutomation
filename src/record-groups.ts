@@ -13,7 +13,7 @@ export type CollectionJob = {
 
 export type BatchVideo = {
   id: string; jobId: string; submittedAt?:string; activeRevision: number; revision: number;
-  capabilities?:{version:number;expectedRevision:number;canConfirmFinal:boolean;confirmFinalReason?:string};
+  capabilities?:{version:number;expectedRevision:number;canConfirmFinal:boolean;confirmFinalReason?:string;captureInFlight?:boolean};
   versions: {revision: number; state: string; downloadRequested?: boolean;recovery?:{state:string;resultVerified?:boolean}}[];
   deletion?: {state: string};
   operation?:{kind:string;state:string;version?:number;expectedRevision?:number};
@@ -29,12 +29,13 @@ const captureStates:Record<string,string> = {
   pending: '尚未提交采集', awaiting_confirmation: '等待确认采集', submitting: '正在提交采集',
   submitted: '已提交采集', waiting: '等待平台结果', ready: '待确认', saved: '已保存',
   downloading: '下载中', publishing: '正在保存', failed: '需处理', attention: '待核对',
-  uncertain: '待核对', withdrawing: '撤回处理中', withdrawn: '已撤回', replaced: '已替换', cloud_deleted: '旧版已清理',
+  uncertain: '待核对', withdrawing: '撤回处理中', terminating: '终止采集中', withdrawn: '已撤回', replaced: '已替换', cloud_deleted: '旧版已清理',
 };
 
 export function captureStatusLabel(version:{state:string;taskId?:string;platformStatus?:string}) {
   if (['pending','submitted','waiting'].includes(version.state) && version.taskId) {
     if (version.platformStatus?.toUpperCase() === 'PENDING') return '平台排队中';
+    if (version.platformStatus?.toUpperCase() === 'RUNNING') return '正在采集';
     if (version.state === 'pending') return '等待平台结果';
   }
   return captureStates[version.state] || '状态待核对';

@@ -5,8 +5,10 @@ import json
 from datetime import timedelta
 
 from .capture_history import matching_receipts, same_target, target_of
-from .domain import TARGET_URL, format_time, now_iso, parse_time, task_key
+from .domain import TARGET_URL, approval_issue, format_time, now_iso, parse_time, task_key
 from .videos import Conflict
+
+SELECTABLE = {'ready', 'duplicate'}
 
 
 class CollectionReview:
@@ -36,53 +38,72 @@ class CollectionReview:
         if self.refresh_historical_duplicates(row) or new:
             self.manager._save(row)
         selected = [task for task in tasks if category == 'all' or
-                    (task['status'] == 'ready' if category == 'ready' else task['status'] != 'ready')]
+                    ((task['status'] in SELECTABLE) == (category == 'ready'))]
         pages = max(1, (len(selected) + 19) // 20)
         page = min(max(1, page), pages)
         visible = copy.deepcopy(selected[(page-1)*20:page*20])
-        job_results = {job['id']: {str(t.get('recordId')): t for t in job['items']}
-                       for job in self.manager.store.list() if job['id'] in row.get('jobIds', [])}
+        jobs = {job['id']: job for job in self.manager.store.list() if job['id'] in row.get('jobIds', [])}
+        job_results = {identity: {str(t.get('recordId')): t for t in job['items']} for identity, job in jobs.items()}
         linked = {}
+        hidden = self.manager.videos.record_visibility.hidden()
         for video in self.manager.videos.store.list():
-            if video.get('duplicateOfVideoId'):
+            if video.get('duplicateOfVideoId') or video['id'] in hidden:
                 continue
             if same_target(target_of(self.manager.store, video), row['target']):
                 linked.setdefault(str(video.get('recordId')), []).append(video['id'])
         for task in visible:
-            actual = job_results.get(task.get('jobId') or row.get('jobId'), {}).get(str(task['recordId']))
-            if actual and actual['status'] in {'submitted', 'duplicate', 'failed', 'uncertain'} and task['status'] != 'ready':
+            job_id = task.get('jobId') or row.get('jobId')
+            actual = job_results.get(job_id, {}).get(str(task['recordId']))
+            if (actual and not actual.get('preflightRejected') and task['status'] != 'ready'
+                    and actual['status'] in {'submitted', 'duplicate', 'failed', 'uncertain'}):
                 task.update(status=actual['status'], reason=actual.get('message', ''))
                 if actual['status'] == 'duplicate':
                     task.update(duplicateSource=actual.get('duplicateSource'), existingTaskId=actual.get('remoteId'))
             matches = linked.get(str(task['recordId']), [])
-            if len(matches) == 1 and task['status'] != 'invalid':
+            bound = self.manager.videos.video_for_job_item(jobs[job_id], actual) if actual else None
+            if task['status'] != 'invalid' and bound and bound['id'] in matches:
+                task['existingVideoId'] = bound['id']
+            elif len(matches) == 1 and task['status'] != 'invalid':
                 task['existingVideoId'] = matches[0]
-                if task['status'] == 'duplicate' and task.get('duplicateSource') == 'local':
-                    task['reason'] = '本条已有采集，可打开已有视频查看或按当前区间重新采集。'
             elif not matches and task['status'] in {'ready', 'duplicate'}:
                 receipts = self.old_receipts(row, task)
                 if len({receipt['videoId'] for receipt in receipts}) == 1:
                     task['canRecaptureArchived'] = True
+            if (task['status'] == 'duplicate' and task.get('duplicateSource') != 'selection'
+                    and not (actual and (actual.get('bindingIssue') or actual.get('preflightRejected')))):
+                task['reason'] = '可勾选确认。同一区间仍在采集时沿用原任务，已结束时可重新采集。'
+        selectable = [task for task in selected if task['status'] in SELECTABLE]
+        one_per_interval = {}
+        for task in selectable:
+            one_per_interval.setdefault(task['key'], task['recordId'])
         return {'runId': identity, 'planRevision': row['planRevision'],
                 'tasks': visible, 'total': len(selected),
                 'page': page, 'pages': pages, 'readyIds': [t['recordId'] for t in tasks if t['status'] == 'ready'],
+                'selectableIds': [t['recordId'] for t in selectable],
+                'selectAllIds': list(one_per_interval.values()),
                 'pendingSubmission': row.get('pendingSubmissionId', ''), 'platformUrl': TARGET_URL}
 
     def refresh_historical_duplicates(self, row):
         if not row.get('reviewTasks') or row.get('pendingSubmissionId'):
             return False
+        removed = {(job_id, str(item['recordId'])) for job_id in row.get('jobIds', [])
+                   for item in (self.manager.store.get(job_id) or {}).get('items', [])
+                   if item['status'] == 'removed'}
         candidates = [task for task in row['reviewTasks']
                       if task['status'] == 'duplicate' and task.get('duplicateSource') == 'local']
-        if not candidates:
+        if not candidates and not removed:
             return False
         keys = self.manager.store.known_keys(include_retired=False)
         records = self.manager.store.known_records(row['target'])
         changed = False
-        for task in candidates:
-            if task['key'] not in keys and str(task['recordId']) not in records:
+        for task in row['reviewTasks']:
+            if ((task['status'] in {'submitted', 'duplicate', 'removed'}
+                 and (task.get('jobId'), str(task['recordId'])) in removed)
+                    or (task['status'] == 'duplicate' and task.get('duplicateSource') == 'local'
+                        and task['key'] not in keys and str(task['recordId']) not in records)):
                 task['status'] = 'ready'
-                task.pop('reason', None)
-                task.pop('duplicateSource', None)
+                for field in ('reason', 'duplicateSource', 'existingTaskId', 'jobId'):
+                    task.pop(field, None)
                 changed = True
         if changed:
             row['planRevision'] += 1
@@ -94,8 +115,23 @@ class CollectionReview:
     def old_receipts(self, row, task):
         return matching_receipts(self.db, task['recordId'], row['target'], task['startTime'], task['endTime'])
 
+    def repeat_bindings(self, row, tasks):
+        intervals = {(str(task['recordId']), task['startTime'], task['endTime']): task for task in tasks}
+        if not intervals:
+            return
+        for video in self.manager.videos.store.list():
+            if not same_target(target_of(self.manager.store, video), row['target']):
+                continue
+            for version in video['versions']:
+                task = intervals.get((str(video.get('recordId')), version.get('startTime'), version.get('endTime')))
+                if task is not None and version.get('taskId') and version.get('name'):
+                    task['repeatBindings'][str(version['taskId'])] = version['name']
+        for task in tasks:
+            for receipt in self.old_receipts(row, task):
+                version = receipt['version']
+                task['repeatBindings'][str(version['taskId'])] = version['name']
+
     async def recapture(self, identity, data):
-        from .domain import approval_issue
         videos = self.manager.videos
         request_id = hashlib.sha256(('archived-recapture:' + identity + ':' + data['requestId']).encode()).hexdigest()
         source = {'runId': identity, 'recordId': data['recordId'], 'planRevision': data['expectedPlanRevision']}
@@ -167,9 +203,9 @@ class CollectionReview:
             'version': existing_video['activeRevision'], 'expectedRevision': existing_video['revision'],
             'requestId': request_id, 'mode': 'force', 'collectionSource': source})
 
-    def edit(self, identity, data):
+    def edit(self, identity, data, *, category='all'):
         row = self.manager.get(identity)
-        if not row or not row.get('queryComplete'):
+        if not row or identity in self.manager.visibility.hidden() or not row.get('queryComplete'):
             raise ValueError('质检查询尚未完成。')
         self.ensure(row)
         prior = row.get('draftRequests', {}).get(data['requestId'])
@@ -177,7 +213,7 @@ class CollectionReview:
         if prior:
             if prior != signature:
                 raise Conflict('请求编号已用于其他修改。')
-            return self.get(identity, data.get('page', 1))
+            return self.get(identity, data.get('page', 1), category)
         if data['expectedPlanRevision'] != row['planRevision']:
             raise Conflict('采集计划已变化，请刷新后重新核对。')
         if row.get('pendingSubmissionId'):
@@ -197,7 +233,7 @@ class CollectionReview:
         row['planRevision'] += 1
         row.setdefault('draftRequests', {})[data['requestId']] = signature
         self.manager._save(row)
-        return self.get(identity, data.get('page', 1))
+        return self.get(identity, data.get('page', 1), category)
 
     def operation(self, identity):
         found = self.db.execute('SELECT payload FROM simple_collection_submissions WHERE id=?', (identity,)).fetchone()
@@ -232,7 +268,7 @@ class CollectionReview:
                 raise Conflict('请求编号已用于其他采集计划。')
             return old
         row = self.manager.get(identity)
-        if not row or not row.get('queryComplete'):
+        if not row or identity in self.manager.visibility.hidden() or not row.get('queryComplete'):
             raise ValueError('请先查询并核对采集计划。')
         self.ensure(row)
         if row.get('pendingSubmissionId'):
@@ -243,12 +279,20 @@ class CollectionReview:
             raise Conflict('准入条件已变化，请重新查询并核对。')
         selected = set(data['recordIds'])
         tasks = [copy.deepcopy(t) for t in row['reviewTasks'] if t['recordId'] in selected]
-        if not tasks or len(tasks) != len(selected) or any(t['status'] != 'ready' for t in tasks):
+        if not tasks or len(tasks) != len(selected) or any(t['status'] not in SELECTABLE for t in tasks):
             raise Conflict('所选记录已有变化，未提交，请重新选择可采集记录。')
+        if len({task['key'] for task in tasks}) != len(tasks):
+            raise ValueError('所选记录包含相同的采集区间，每个区间请选择一条。')
         validator = getattr(self.manager.videos, 'validate_capture_interval', None)
         for task in tasks:
+            if issue := approval_issue(task, row['admissionRule']):
+                raise ValueError('质检实绩未通过采集准入：' + issue)
             if validator:
                 validator(task['startTime'], round(task['durationMinutes']*60))
+            if task['status'] == 'duplicate' and task.get('duplicateSource') != 'selection':
+                task['repeatBindings'] = {}
+            task['status'] = 'ready'
+        self.repeat_bindings(row, [task for task in tasks if 'repeatBindings' in task])
         operation = {'operationId': operation_id, 'runId': identity, 'requestId': data['requestId'],
                      'signature': signature, 'state': 'queued', 'message': '已确认，后台核对后分批采集。',
                      'recordIds': list(data['recordIds']), 'createdAt': now_iso(), 'results': []}
@@ -276,7 +320,11 @@ class CollectionReview:
         for task in row['reviewTasks']:
             if task['recordId'] in results:
                 actual = results[task['recordId']]
-                task.update(status=actual['status'], reason=actual.get('message', ''), jobId=job['id'])
+                status = actual['status']
+                if actual.get('preflightRejected'):
+                    status = 'duplicate' if 'repeatBindings' in actual else 'ready'
+                task.update(status='ready' if status == 'removed' else status,
+                            reason=actual.get('message', ''), jobId=job['id'])
                 if actual['status'] == 'duplicate':
                     task.update(duplicateSource=actual.get('duplicateSource'), existingTaskId=actual.get('remoteId'))
         operation.update(state='attention' if row['status'] == 'attention' else 'complete',

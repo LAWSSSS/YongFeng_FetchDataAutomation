@@ -21,10 +21,11 @@ from uuid import uuid4
 
 import httpx
 
-from .domain import DEFAULT_TARGET, approval_issue, format_time, gather_payload, now_iso, parse_time
+from .capture_history import unconfirmed_capture_keys
+from .domain import DEFAULT_TARGET, approval_issue, format_time, gather_payload, now_iso, parse_time, task_key
 from .download_slots import DownloadSlots
 from .file_leases import FileEnvironmentError
-from .jobs import JobManager
+from .jobs import JobManager, UNCONFIRMED_CAPTURE
 from .media import (DownloadFailure, download_url, file_digest, publish_file,
                     prepare_directory, valid_video_header, video_filename,
                     publish_with_reservation, transfer_reservation_identity)
@@ -348,6 +349,9 @@ class VideoManager:
                     operation.update(state="queued", message="程序已恢复，正在核对操作进度。")
                     self.store.save_operation(operation)
                 self.launch_operation(operation["id"])
+            elif operation.get('kind') == 'terminate-capture' and operation.get('state') in {'attention', 'conflict'}:
+                from .video_termination import release_failed
+                await release_failed(self, operation)
 
     async def shutdown(self):
         self.stopping = True
@@ -367,6 +371,7 @@ class VideoManager:
             await asyncio.gather(*self.operation_tasks.values(), return_exceptions=True)
 
     def state(self, query=None, *, identity=None):
+        from .video_termination import can_terminate, capture_in_flight
         if identity is None:
             self.sync_jobs()
         final_processing = getattr(self, 'final_processing', None)
@@ -378,17 +383,18 @@ class VideoManager:
         active_operations = {}
         for operation in self.store.list_operations():
             if (operation.get('state') in {'queued', 'running', 'waiting_connection', 'reconciling', 'paused'}
-                    or operation.get('kind') in {'withdraw', 'recapture'} and operation.get('state') in {'attention', 'conflict'}):
+                    or operation.get('kind') in {'withdraw', 'recapture', 'terminate-capture'}
+                    and operation.get('state') in {'attention', 'conflict'}):
                 active_operations[(operation.get('videoId'), operation.get('version'),
                                    operation.get('expectedRevision'))] = operation
         rows = []
         source_rows = self.store.list() if identity is None else [self.store.get(identity)]
         for row in source_rows:
             if row and row.get('duplicateOfVideoId'):
-                if identity is None:
+                if identity is None or row['id'] in hidden:
                     continue
                 row = self.store.get(row['duplicateOfVideoId'])
-            if not row or row.get('deletedAt') or (row['id'] in hidden and identity is None):
+            if not row or row.get('deletedAt') or row['id'] in hidden:
                 continue
             active_operation = active_operations.get((row['id'], row.get('activeRevision'), row.get('revision')))
             visible_operation = ({key: active_operation.get(key) for key in
@@ -427,7 +433,9 @@ class VideoManager:
                    'finalProcessing': final_operations.get((row['id'], row.get('activeRevision'), row.get('revision'))),
                    'capabilities': {**(final_processing.capabilities(row) if final_processing else {}),
                                     **self.withdraw_capabilities(row),
-                                    'canForceRecapture': self.can_force_recapture(row, active)},
+                                    'canForceRecapture': self.can_force_recapture(row, active),
+                                    'captureInFlight': capture_in_flight(active),
+                                    'canTerminateCapture': can_terminate(row, active)},
                    'submittedAt': (self.jobs.store.get(row.get('jobId', '')) or {}).get('createdAt') or row.get('submittedAt', '')}
             rows.append(row)
         found = filter_records(rows, query)
@@ -593,6 +601,8 @@ class VideoManager:
             if item['status'] in {'invalid', 'removed'}:
                 continue
             row = self.video_for_job_item(job, item)
+            if row and row.get('deletedAt'):
+                continue
             version = self.version(row, row.get('activeRevision')) if row else None
             counts['submitted'] += item['status'] == 'submitted'
             counts['reused'] += item['status'] == 'duplicate' and bool(item.get('bindingVerified') or item.get('existingVideoId'))
@@ -614,6 +624,8 @@ class VideoManager:
                 row = self.store.get(identity)
                 if row and row.get("deletedAt"):
                     continue
+                if not row and item['status'] == 'pending' and 'repeatBindings' in item:
+                    continue  # A reviewed repeat may resolve to the existing active video.
                 if item['status'] == 'failed' and not row:
                     continue
                 if item['status'] == 'duplicate':
@@ -738,21 +750,26 @@ class VideoManager:
 
     async def results(self, parent_id):
         async with self.result_slots:
-            seen, output = set(), []
+            seen, output, expected_total = set(), [], None
             for page in range(1, 101):
                 data = await self.target.request("/data-acquisition/task-result", method="POST", body={
                     "taskId": parent_id, "cameraId": self.target_config["cameraId"],
                     "currPage": page, "pageSize": 100,
                     "orderList": [{"asc": False, "column": "gmt_modify"}],
                 })
+                if isinstance(data, dict) and type(data.get('total')) not in (int, str):
+                    raise ValueError("视频结果总数格式异常，请在采集平台核对。")
                 rows, total = page_records(data)
-                if total > 10000 or any(not r.get("id") or str(r["id"]) in seen
-                                        or str(r.get("taskId")) != parent_id for r in rows):
+                identities = {str(row.get('id') or '') for row in rows}
+                if (not 0 <= total <= 10000 or (expected_total is not None and total != expected_total)
+                        or len(output) + len(rows) > total or len(identities) != len(rows)
+                        or '' in identities or not identities.isdisjoint(seen)
+                        or any(str(row.get('taskId')) != parent_id for row in rows)):
                     raise ValueError("视频结果身份或分页异常，请在采集平台核对。")
-                for result in rows:
-                    seen.add(str(result["id"]))
-                    output.append(result)
-                if len(seen) >= total:
+                expected_total = total
+                seen.update(identities)
+                output.extend(rows)
+                if len(output) == total:
                     return output
                 if not rows:
                     raise ValueError("视频结果分页不完整，请稍后重试。")
@@ -862,7 +879,7 @@ class VideoManager:
     @staticmethod
     def _merge_check_result(current, checked):
         # Keep concurrent download/correction progress; only merge remote facts.
-        if current.get('state') in TERMINAL | {'withdrawing'}:
+        if current.get('state') in TERMINAL | {'withdrawing', 'terminating'}:
             return
         if current.get("taskId") and checked.get("taskId") and current["taskId"] != checked["taskId"]:
             return
@@ -887,7 +904,7 @@ class VideoManager:
     async def _check_row(self, row, parents, *, active_only=False):
         versions = ([self.version(row, row.get("activeRevision"))] if active_only else row["versions"])
         for version in (item for item in versions if item):
-            if version["state"] in TERMINAL | {'withdrawing'}:
+            if version["state"] in TERMINAL | {'withdrawing', 'terminating'}:
                 continue
             if not version.get("taskId") and version.get("beforeIds") and version.get("writeAttempted"):
                 candidates = [parent for key, parent in parents.items()
@@ -976,7 +993,7 @@ class VideoManager:
 
     def queue_video_operation(self, identity, kind, payload):
         row = self.store.get(identity)
-        if not row or row.get("deletedAt"):
+        if not row:
             raise ValueError("视频记录不存在。")
         request_id = str(payload.get("requestId") or hashlib.sha256(str(time.time_ns()).encode()).hexdigest()[:24])
         expected_revision = payload.get("expectedRevision", row.get("revision"))
@@ -997,6 +1014,8 @@ class VideoManager:
             if not same_request:
                 raise Conflict("请求编号已用于不同的操作内容；请刷新后使用新的请求编号。")
             return {"operationId": existing['id'], "state": existing["state"], "videoId": identity}
+        if row.get('deletedAt'):
+            raise ValueError('视频记录不存在。')
         legacy_restart = row.get('requests', {}).get(request_id)
         if kind == 'restart-download' and legacy_restart:
             if (legacy_restart.get('kind') != kind or legacy_restart.get('version') != version
@@ -1013,6 +1032,21 @@ class VideoManager:
             raise Conflict("记录已变化，请刷新后重新核对。")
         if version != row.get("activeRevision"):
             raise Conflict("当前采集版本已变化，请刷新后重试。")
+        if kind == 'terminate-capture':
+            from .video_termination import can_terminate
+            active = self.version(row, version)
+            operations = self.store.list_operations(identity)
+            pending = next((entry for entry in operations
+                            if entry.get('kind') == kind and entry.get('version') == version
+                            and entry.get('expectedRevision') == expected_revision
+                            and entry.get('state') in {'queued','running','waiting_connection','reconciling'}), None)
+            if pending:
+                return {'operationId': pending['id'], 'state': pending['state'], 'videoId': identity}
+            if (identity in self.record_visibility.hidden() or not can_terminate(row, active)
+                    or any(entry.get('kind') in {'correction', 'recapture', 'withdraw'}
+                           and entry.get('state') in {'queued','running','waiting_connection','reconciling'}
+                           for entry in operations)):
+                raise Conflict('只可终止已核实任务 ID 且仍在采集的当前版本，请刷新后核对。')
         self.require_editable(row)
         if kind == 'withdraw':
             from .video_withdrawal import capability
@@ -1080,7 +1114,17 @@ class VideoManager:
             operation['source'] = {key: current.get(key) for key in ('taskId', 'resultId')}
             control = self.control.get('collection:' + identity) if getattr(self, 'control', None) else {}
             operation['sourceGeneration'] = int((control or {}).get('generation') or 0)
-        if kind in {'withdraw', 'correction', 'recapture'}:
+        if kind == 'terminate-capture':
+            operation.update(taskId=active['taskId'], previousState=active['state'])
+            if any(old.get('kind') == kind and old.get('version') == version
+                   and old.get('expectedRevision') == expected_revision and old.get('taskId') == active['taskId']
+                   and (old.get('deleteRequested') or old.get('previousDeleteRequested')) for old in operations):
+                operation['previousDeleteRequested'] = True
+            active['state'] = 'terminating'
+            with self.store.db:
+                self.store.save(row, commit=False)
+                self.store.save_operation(operation, commit=False)
+        elif kind in {'withdraw', 'correction', 'recapture'}:
             control = getattr(self, 'control', None)
             if control:
                 control.refresh()
@@ -1132,6 +1176,9 @@ class VideoManager:
             elif operation['kind'] == 'withdraw':
                 from .video_withdrawal import execute
                 await execute(self, operation)
+            elif operation['kind'] == 'terminate-capture':
+                from .video_termination import execute
+                await execute(self, operation)
             elif operation["kind"] in {"correction", "recapture"}:
                 await self._execute_correction_operation(operation)
         except asyncio.CancelledError:
@@ -1147,6 +1194,8 @@ class VideoManager:
                 waiting = not self.target.connected or str(code).upper() in {
                     '401', '403', 'NETWORK', '408', '429', '500', '502', '503', '504',
                 }
+                if latest.get('kind') == 'terminate-capture' and getattr(error, 'ambiguous', False):
+                    waiting = True
                 state = 'waiting_connection' if waiting else 'attention'
                 if waiting:
                     message = '平台暂时不可达，操作和媒体均保留；连接恢复后继续。'
@@ -1155,7 +1204,7 @@ class VideoManager:
                 else:
                     message = '平台未接受本次操作，请核对后重试；原视频和进度保留。'
                 latest.update(state=state, stage=state, errorCode=code, message=message)
-                if waiting and latest.get('kind') == 'restart-download':
+                if waiting and latest.get('kind') in {'restart-download', 'terminate-capture'}:
                     latest['nextAttemptAt'] = time.time() + 30
                 self.store.save_operation(latest)
         except (OSError, ValueError, Conflict) as error:
@@ -1204,6 +1253,10 @@ class VideoManager:
                 self.store.save_operation(latest)
         finally:
             latest = self.store.get_operation(operation_id)
+            if (latest and latest.get('kind') == 'terminate-capture'
+                    and latest.get('state') in {'attention', 'conflict'}):
+                from .video_termination import release_failed
+                await release_failed(self, latest)
             if (getattr(self, "control", None) and latest and latest.get("kind") in {"correction", "recapture", "restart-download", "withdraw"}
                     and latest.get("state") in {"complete", "attention", "conflict"}):
                 self.control.release_review(latest["videoId"], operation_id)
@@ -1670,6 +1723,8 @@ class VideoManager:
     def require_editable(row):
         if row.get("deletion", {}).get("state") in ("pending", "error"):
             raise Conflict("本条正在清理；请先完成或停止继续清理，不能覆盖当前操作。")
+        if any(v.get('state') == 'terminating' and v['revision'] == row['activeRevision'] for v in row['versions']):
+            raise Conflict('本条正在终止采集，请等待平台核对结果。')
 
     @staticmethod
     def repairable_media_failure(version):
@@ -1697,6 +1752,11 @@ class VideoManager:
         if original and not self.matches(original, current, camera):
             raise Conflict('原平台任务的相机、名称或区间已变化，请先核对原任务。')
         known = {str(version['taskId']): version for version in snapshot['versions'] if version.get('taskId')}
+        if snapshot.get('recordId') and bound_target:
+            for other in self.store.list():
+                if (other['id'] != snapshot['id'] and other.get('recordId') == snapshot['recordId']
+                        and same_target(target_of(self.jobs.store, other), bound_target)):
+                    known.update((str(v['taskId']), v) for v in other['versions'] if v.get('taskId'))
         for identity, parent in parents.items():
             if (str(parent.get('cameraId', camera)) != camera or parent.get('isRepeat')
                     or str(parent.get('taskType', 'VIDEO')).upper() != 'VIDEO'
@@ -1855,6 +1915,8 @@ class VideoManager:
         async with self.jobs.lock:
             await self.jobs.camera(self.target_config)
             parents = await self.jobs.remote_parents(self.target_config)
+            if task_key(self.target_config, start_text, end_text) in unconfirmed_capture_keys(self.jobs.store, self.target_config):
+                raise Conflict(UNCONFIRMED_CAPTURE)
             current = self.version(snapshot, snapshot["activeRevision"])
             if force:
                 if not self.can_force_recapture(snapshot, current):

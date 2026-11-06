@@ -15,6 +15,7 @@ export default function RecordSelection<T extends BatchVideo>({videos,selectedId
   const selected=videos.filter(v=>selectedIds.has(v.id));
   const count=selected.length;
   const downloadable=selected.some(canDownload);
+  const capturing=selected.some(video=>video.capabilities?.captureInFlight);
   const saveable=selected.some(v=>{const active=v.versions.find(x=>x.revision===v.activeRevision);return active?.state!=='saved'&&!!active?.recovery;});
   if(!videos.length)return null;
   if(!selecting&&!count)return <div className="batch-entry"><button className="secondary" disabled={busy} onClick={()=>onSelectingChange(true)}>批量管理</button></div>;
@@ -25,8 +26,9 @@ export default function RecordSelection<T extends BatchVideo>({videos,selectedId
     </select></label>
     <button className="secondary" disabled={locked||!eligible.length} onClick={()=>onSelect(eligible)}>全选 {eligible.length} 条</button>
     <button className="secondary" disabled={locked} onClick={()=>{onClear();onSelectingChange(false);}}>结束选择</button>
-    <RecordDelete name={`所选 ${count} 条视频记录`} label="批量删除记录" version={selected.map(v=>`${v.id}:${v.revision}`).sort().join("|")} disabled={locked||!count}
+    <RecordDelete name={`所选 ${count} 条视频记录`} label="批量删除记录" version={selected.map(v=>`${v.id}:${v.revision}`).sort().join("|")} disabled={locked||!count||capturing}
       onDelete={async requestId=>{setRemoving(true);try{await onRemove(requestId);}finally{setRemoving(false);}}}/>
+    {capturing&&<span className="subtle">正在采集的项目可在详情中终止并删除。</span>}
     {!!count&&<div className="actions">{downloadable&&<button disabled={locked} onClick={onDownload}>确认所选并处理</button>}
       {saveable&&<button className="secondary" disabled={locked} onClick={onSave}>归类到已保存</button>}</div>}</div>
   </div>;

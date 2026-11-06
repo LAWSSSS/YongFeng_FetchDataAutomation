@@ -8,6 +8,7 @@ import zipfile
 from contextlib import asynccontextmanager
 from contextlib import AsyncExitStack, ExitStack
 from pathlib import Path
+from typing import Literal
 from urllib.parse import quote
 from uuid import uuid4
 
@@ -167,7 +168,7 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
     final_processing = FinalProcessing(store, videos, pipeline, workspace, media_control, slicing)
     collection_runs = CollectionRunManager(store, source, jobs, videos, admission_settings, videos.target_config,
         on_job=lambda job, run: submissions.add('collection', '日期采集', collection_record(job),
-                                                request_id='collection-run:' + run['id']))
+                                                request_id='collection-job:' + job['id'], submitted_at=job['createdAt']))
     slicing.on_recovery_change = videos.reconcile_recovery_results
     gallery = PackageGallery(slicing.packages, leases)
     submission_views = SubmissionViews(store, slicing, submissions)
@@ -446,8 +447,9 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
         return state_response(collection_runs.review.get(identity, page, category), request)
 
     @application.patch('/api/collection-runs/{identity}/plan')
-    async def edit_collection_plan(identity: str, payload: CollectionDraftInput):
-        return collection_runs.review.edit(identity, payload.model_dump())
+    async def edit_collection_plan(identity: str, payload: CollectionDraftInput,
+                                   category: Literal['all', 'ready', 'other'] = 'all'):
+        return collection_runs.review.edit(identity, payload.model_dump(), category=category)
 
     @application.post('/api/collection-runs/{identity}/submit', status_code=202)
     async def confirm_collection_plan(identity: str, payload: CollectionSubmitInput):
@@ -1160,14 +1162,10 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
 
     @application.get('/api/videos/{identity}')
     async def exact_video(identity: str, request: Request):
-        # A user may hide a history card while its approved workflow still
-        # runs. An explicit processing link can inspect that exact record;
-        # it never restores visibility or substitutes a similarly named video.
         rows = videos.state(identity=identity)['videos']
         if not rows:
-            raise HTTPException(404, '这条视频记录不存在或已清除，未打开其他同名视频。')
-        return state_response({'video': compact_video(rows[0]),
-                               'recordHidden': rows[0]['id'] in videos.record_visibility.hidden()}, request)
+            raise HTTPException(404, '这条视频记录不存在或已删除。')
+        return state_response({'video': compact_video(rows[0])}, request)
 
     @application.post("/api/videos/download-limit")
     async def video_download_limit(payload: VideoDownloadLimitInput):
@@ -1244,6 +1242,10 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
     @application.post("/api/videos/{identity}/recapture", status_code=202)
     async def recapture_unavailable(identity: str, payload: RecaptureInput):
         return await videos.recapture_unavailable(identity, payload.model_dump(exclude_defaults=True))
+
+    @application.post('/api/videos/{identity}/terminate-capture', status_code=202)
+    async def terminate_capture(identity: str, payload: VersionActionInput):
+        return videos.queue_video_operation(identity, 'terminate-capture', payload.model_dump())
 
     @application.post("/api/videos/{identity}/remove-uncorrected")
     async def remove_uncorrected(identity: str, payload: HistoryRemoveInput):

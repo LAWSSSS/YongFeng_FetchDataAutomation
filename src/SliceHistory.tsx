@@ -16,7 +16,7 @@ type Day={day:string;total:number;itemCount:number;receiptCount:number;revision:
 export type SliceHistorySummary={recordDays?:Day[];enabled?:boolean;busy?:boolean};
 type Category={state:string;packageId?:string;taskId?:string;actualImages?:number;estimatedImages?:number;
   intervalSeconds?:number|null;intervals?:{start:number;end:number}[];message?:string;errorCode?:string};
-type Item={id:string;name:string;mediaId?:string;mediaGeneration?:number;collectionRevision?:number;collectionVideoId?:string;
+type Item={id:string;name:string;mediaId?:string;mediaGeneration?:number;collectionRevision?:number;collectionVideoId?:string;canOpenVideo?:boolean;
   processing?:{state:string;stageLabel:string;message:string;terminal:boolean;progress?:{done:number;total:number;unit:string}|null};
   terminal?:boolean;displayProgress?:{done:number;total:number;unit:string}|null;revision:number;sourceDatasetId:string;sourceVideoId:string;path?:string;state:string;message?:string;
   superseded?:boolean;coveredByRecovery?:string;categories:Record<string,Category>};
@@ -108,7 +108,7 @@ function HistoryDay({day,query,epoch,selected,busy,onSelect,onSelectMany,onRemov
           </div>;
         })}</div>
         {group.records.some(item=>item.coveredByRecovery)&&<p className="slice-detail">旧尝试已由验证完成的恢复结果覆盖，历史凭证保留。</p>}
-        {effective.some(item=>!processingFinished(item.state)&&!['excluded','superseded'].includes(item.state))&&<button className="secondary"
+        {first.canOpenVideo!==false&&effective.some(item=>!processingFinished(item.state)&&!['excluded','superseded'].includes(item.state))&&<button className="secondary"
           onClick={()=>window.dispatchEvent(new CustomEvent('simple-open-video',{detail:{mediaId:first.mediaId,videoId:first.collectionVideoId}}))}>查看处理详情</button>}
         <details className="slice-file"><summary>文件位置</summary><p className="slice-detail">{first.name}<br/>{first.path||'尚未绑定'}</p></details>
         <RecordDelete name={`${heading.title}${heading.when?` · ${heading.when}`:''}`} version={choices.map(row=>`${row.id}:${row.revision}`).sort().join('|')}

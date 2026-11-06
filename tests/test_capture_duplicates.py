@@ -156,7 +156,8 @@ async def test_duplicate_uses_one_control_record_and_preserves_hidden_state(app_
         videos.record_visibility.hide(videos.store, 'hide-original', [{'id': original['id'], 'expectedRevision': original['revision']}])
         videos.sync_jobs()
         assert not videos.state()['videos']
-        assert videos.state(identity=placeholder)['videos'][0]['id'] == original['id']
+        assert not videos.state(identity=placeholder)['videos']
+        assert not videos.state(identity=original['id'])['videos']
         assert original['id'] in videos.record_visibility.hidden()
         assert platform.batch_sizes == [1]
     finally:

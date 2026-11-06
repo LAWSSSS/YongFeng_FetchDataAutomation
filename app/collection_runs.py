@@ -347,8 +347,8 @@ class CollectionRunManager:
             plan = row.get("plan") or self._plan(row)
             known = self.store.known_records(row["target"])
             for task in plan['tasks']:
-                if task['status']=='ready' and str(task['recordId']) in known:
-                    task.update(status='duplicate', reason='本条实绩已登记，不重复采集。')
+                if task['status']=='ready' and 'repeatBindings' not in task and str(task['recordId']) in known:
+                    task.update(status='duplicate', duplicateSource='local', reason='本条实绩已登记采集。')
             if not any(item["status"] == "ready" for item in plan["tasks"]):
                 row.update(status="complete", stage="complete", message="查询完成，没有需要新建的采集任务。")
                 self._save(row)

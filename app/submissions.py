@@ -26,7 +26,9 @@ class SubmissionLog:
     def add(self, kind, title, detail, request_id="", submitted_at=""):
         if request_id:
             for row in self.list(kind):
-                if row.get("requestId") == request_id:
+                if (row.get("requestId") == request_id or
+                        kind == 'collection' and detail.get('jobId')
+                        and (row.get('detail') or {}).get('jobId') == detail['jobId']):
                     return row
         row = {"id": uuid4().hex, "kind": kind, "title": title, "submittedAt": submitted_at or now_iso(),
                "requestId": request_id, "detail": detail}

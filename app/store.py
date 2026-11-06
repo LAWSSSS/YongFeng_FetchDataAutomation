@@ -26,13 +26,14 @@ class JobStore:
                 job["events"].append({"at": now_iso(), "message": "检测到上次运行中断；待核对的批次不会自动重发。"})
                 self.save(job)
 
-    def save(self, job: dict):
+    def save(self, job: dict, *, commit=True):
         job["updatedAt"] = now_iso()
         self.db.execute(
             "INSERT INTO jobs VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload",
             (job["id"], job["createdAt"], json.dumps(job, ensure_ascii=False)),
         )
-        self.db.commit()
+        if commit:
+            self.db.commit()
 
     def delete(self, job_id: str) -> None:
         self.db.execute("DELETE FROM jobs WHERE id=?", (job_id,))

@@ -1,4 +1,4 @@
-"""Minimal task receipts kept after local capture history is pruned."""
+"""Pending capture identities and receipts retained after local history is pruned."""
 import json
 from contextlib import closing
 
@@ -16,6 +16,32 @@ def same_target(left, right):
 def target_of(store, video):
     job = store.get(video.get('jobId', ''))
     return (job or {}).get('target') or video.get('submissionTarget')
+
+
+def unconfirmed_capture_keys(store, target, *, exclude_job=''):
+    jobs = store.list()
+    keys = {item['key'] for job in jobs if job['id'] != exclude_job and same_target(job.get('target'), target)
+            for item in job['items'] if item['status'] in {'submitting', 'uncertain'}
+            and not (item.get('bindingVerified') and item.get('remoteId'))}
+    if not store.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='simple_videos'").fetchone():
+        return keys
+    targets = {job['id']: job.get('target') for job in jobs}
+    # A correction can have reached the platform before the new task is visible
+    # in its inventory. Local hiding does not resolve that pending write.
+    with closing(store.db.execute("""
+        SELECT json_extract(v.payload,'$.jobId'), json_extract(v.payload,'$.submissionTarget'),
+               json_extract(version.value,'$.startTime'), json_extract(version.value,'$.endTime')
+        FROM simple_videos v, json_each(v.payload,'$.versions') version
+        WHERE json_extract(version.value,'$.writeAttempted')=1
+          AND coalesce(json_extract(version.value,'$.taskId'),'')=''
+          AND coalesce(json_extract(version.value,'$.submissionOutcome'),'')!='rejected'
+          AND coalesce(json_extract(version.value,'$.state'),'') NOT IN ('withdrawn','cloud_deleted')
+    """)) as versions:
+        for job_id, recorded_target, start, end in versions:
+            owner = targets.get(job_id) or (json.loads(recorded_target) if recorded_target else None)
+            if start and end and same_target(owner, target):
+                keys.add(task_key(target, start, end))
+    return keys
 
 
 def keep_receipts(db, video, job):

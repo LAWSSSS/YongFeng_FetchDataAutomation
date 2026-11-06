@@ -4,7 +4,7 @@ export type NextAction={kind:'automatic'|'waiting'|'manual'|'complete';action:'c
   selections:PipelineChoice[];packages:PipelineChoice[];versionSelections?:PipelineChoice[];
   issue?:{code:string;stage?:string;message:string}|null;environmentBlocker?:{code:string;message:string}|null;
   progress?:{done:number;total:number;unit:string}|null};
-export type PipelineVideo={id:string;mediaId:string;generation:number;videoId?:string;name:string;
+export type PipelineVideo={id:string;mediaId:string;generation:number;videoId?:string;name:string;processingEntry?:string|null;
   version?:number;updatedAt?:string;confirmedAt?:string;hasResultRecord?:boolean;
   packages?:{id:string;itemId:string;category:string;state:string;imageCount?:number}[];
   state:string;stage:string;message:string;nextAction:NextAction};
