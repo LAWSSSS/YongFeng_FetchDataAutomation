@@ -424,10 +424,16 @@ class WorkspaceScheduler:
         pipeline = getattr(self, 'pipeline', None)
         if pipeline and not pipeline.active():
             return
-        if not self.enabled or self.maintenance or self._pipeline_request():
+        if not self.enabled or not self.online or self.maintenance:
             return
+        active = self._pipeline_request()
+        if active and not (active.get('continuous') and active.get('pipelineAutoKey')):
+            return
+        selected = set((active or {}).get('pipelineAssetIds') or [])
         candidates = []
         for asset in self._targets():
+            if asset['id'] in selected:
+                continue
             if pipeline and not pipeline.allowed_asset(asset):
                 continue
             if self._asset_manually_paused(asset):
@@ -448,6 +454,12 @@ class WorkspaceScheduler:
                 continue
             candidates.append(asset)
         if not candidates:
+            return
+        if active:
+            added = [asset['id'] for asset in candidates]
+            active['pipelineAssetIds'] = [*(active.get('pipelineAssetIds') or []), *added]
+            active['assetIds'] = list(dict.fromkeys([*active.get('assetIds', []), *added]))
+            self.save('requests', active)
             return
         signature = []
         for asset in candidates:
@@ -481,9 +493,10 @@ class WorkspaceScheduler:
     def _pipeline_snapshot(self, request):
         assets, excluded = [], []
         selected = set(request.get('pipelineAssetIds') or [])
+        automatic = bool(request.get('continuous') and request.get('pipelineAutoKey'))
         collection_rows = self.videos.store.list(include_deleted=True)
         for asset in self._targets():
-            if selected and asset['id'] not in selected:
+            if (selected or automatic) and asset['id'] not in selected:
                 continue
             if self._asset_manually_paused(asset):
                 excluded.append({'id': asset['id'], 'name': asset.get('name', ''), 'reason': '此视频已手动暂停，其他视频继续。'})
@@ -525,6 +538,15 @@ class WorkspaceScheduler:
                            pipelineUploadRequestId=f"ws-upload-{digest}-{request_tag}",
                            pipelineSliceRequestId=f"ws-slice-{digest}-{request_tag}")
             self.save('requests', request)
+        elif automatic:
+            # New approved downloads can join an automatic run. Keep the
+            # original sources bound to their saved file versions.
+            saved = request.get('pipelineSources') or []
+            known = {source['id'] for source in saved}
+            added = [source for source in assets if source['id'] not in known]
+            if added:
+                request['pipelineSources'] = [*saved, *added]
+                self.save('requests', request)
         from . import file_locations
         resolved, saved_sources, exclusions = [], [], list(excluded)
         for saved in request.get('pipelineSources') or []:

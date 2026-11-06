@@ -91,7 +91,8 @@ class SlicingWorkflow:
                 for current in existing:
                     if (source.get('finalProcessingIntent') and current.get('collectionVideoId') == source.get('collectionVideoId')
                             and current.get('collectionRevision') == source.get('collectionRevision')
-                            and current.get('fileVersion') == source.get('fileVersion')):
+                            and current.get('fileVersion') == source.get('fileVersion')
+                            and current.get('finalProcessingIntent') != source['finalProcessingIntent']):
                         current['finalProcessingIntent'] = source['finalProcessingIntent']
                         self.store.save('items', current)
                 present = {name for item in existing for name, category in item.get('categories', {}).items()
@@ -156,16 +157,22 @@ class SlicingWorkflow:
             run['itemCount'] = len(run['items'])
             for identity in actionable:
                 item = self.store.get('items', identity)
-                item['runId'] = run['id']
-                self.store.save('items', item)
+                if item.get('runId') != run['id']:
+                    item['runId'] = run['id']
+                    self.store.save('items', item)
             self.run = run
             self.store.save('runs', run)
             self.store.settings.update(enabled=True, latestRunId=run['id'])
             self.store.save_settings()
             self._wake_scheduler()
-        if not self.store.get('requests', request_id):
+        receipt = self.store.get('requests', request_id)
+        if not receipt:
             self.store.save('requests', {'id': request_id, 'kind': 'workspace-local',
                                          'itemIds': identities, 'state': 'accepted'})
+        elif receipt.get('kind') == 'workspace-local':
+            registered = list(dict.fromkeys([*receipt.get('itemIds', []), *identities]))
+            if registered != receipt.get('itemIds'):
+                self.store.save('requests', {**receipt, 'itemIds': registered})
         return identities
 
     async def execute_all(self, request_id, expected_revision, source_scope=None):

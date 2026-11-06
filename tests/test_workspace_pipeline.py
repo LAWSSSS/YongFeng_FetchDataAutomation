@@ -69,6 +69,39 @@ async def test_local_analysis_does_not_scan_or_queue_original_uploads(local_app,
 
 
 @pytest.mark.asyncio
+async def test_newly_downloaded_video_joins_the_active_automatic_run(local_app):
+    w = local_app.state.workspace
+    await w._auto_start_pipeline()
+    await w._advance_pipeline()
+    request = w._pipeline_request()
+    run_id = w.slicing.run['id']
+    first = w.slicing.store.list('items')[0]
+    first.update(state='platform_processing')
+    first['categories']['bed'].update(state='ready')
+    w.slicing.store.save('items', first)
+
+    next_video = w.root / '采集视频' / 'new.mp4'
+    next_video.write_bytes(b'newly-downloaded-video')
+    collection(local_app, next_video, 'new-video')
+    await w.discover()
+    pipeline = local_app.state.pipeline
+    pipeline.notify_saved('new-video', 0)
+    await pipeline.tick()
+    await w._auto_start_pipeline()
+    await w._advance_pipeline()
+
+    active = w._pipeline_request()
+    assert active['id'] == request['id']
+    assert active['pipelineSources'][0] == request['pipelineSources'][0]
+    assert w.slicing.run['id'] == run_id
+    items = w.slicing.store.list('items')
+    assert {item['collectionVideoId'] for item in items} == {'accepted-video', 'new-video'}
+    assert w.slicing.store.get('items', first['id'])['state'] == 'platform_processing'
+    assert set(w.slicing.run['items']) == {item['id'] for item in items}
+    assert w.slicing.store.get('requests', 'ws-local-' + request['id'])['itemIds'] == w.slicing.run['items']
+
+
+@pytest.mark.asyncio
 async def test_auto_queue_reopens_request_blocked_by_legacy_target_setting(local_app):
     w = local_app.state.workspace
     await w._auto_start_pipeline()

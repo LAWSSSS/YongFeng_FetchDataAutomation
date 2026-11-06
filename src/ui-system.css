@@ -92,9 +92,9 @@
 }
 .app-shell details.panel[open] > summary:not(:has(.batch-title)) { margin-bottom: var(--s-5); }
 .app-shell details.panel > summary:not(:has(.batch-title)):hover { background: var(--line); }
-.app-shell .panel > details > summary:not(:has(.batch-title)) { min-height: 48px; padding: var(--s-3) var(--s-4); margin: 0 calc(var(--s-6) * -1); border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); background: var(--surface-sunken); font-weight: 600; color: var(--ink); cursor: pointer; }
-.app-shell .panel > details > summary:not(:has(.batch-title)) + * { margin-top: var(--s-4); }
-.app-shell .panel > details:first-child > summary:not(:has(.batch-title)) { margin-top: calc(var(--s-6) * -1); }
+.app-shell .panel > details:not(.date-section, .batch-group) > summary { min-height: 48px; padding: var(--s-3) var(--s-4); margin: 0 calc(var(--s-6) * -1); border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); background: var(--surface-sunken); font-weight: 600; color: var(--ink); cursor: pointer; }
+.app-shell .panel > details:not(.date-section, .batch-group) > summary + * { margin-top: var(--s-4); }
+.app-shell .panel > details:not(.date-section, .batch-group):first-child > summary { margin-top: calc(var(--s-6) * -1); }
 .app-shell .date-tools { min-height: 52px; padding: 8px 0; gap: 12px; }
 .app-shell .dated-batch { padding-top: 16px; }
 .app-shell .dated-batch + .dated-batch { margin-top: 20px; }
@@ -195,7 +195,7 @@
   .app-shell .site-header nav button { width: 100%; padding-inline: 8px; white-space: normal; }
   .app-shell .hero.compact h1 { font-size: 24px; }
   .app-shell .panel { padding: 18px 16px; }
-  .app-shell .panel > details > summary:not(:has(.batch-title)) { margin-inline: -16px; padding-inline: 16px; }
+  .app-shell .panel > details:not(.date-section, .batch-group) > summary { margin-inline: -16px; padding-inline: 16px; }
   .app-shell details.panel > summary:not(:has(.batch-title)) { margin: -18px -16px 0; padding-inline: 16px; }
   .app-shell :is(.date-section, .batch-group) > summary { min-height: 76px; padding: 14px 16px; }
   .app-shell .date-content, .app-shell .submission-records .date-content { padding: 0 14px 16px; }

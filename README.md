@@ -8,13 +8,13 @@
 
 适用于 **Apple 芯片 Mac（M 系列）和 macOS 14 或更新版本**。可以在苹果菜单的「关于本机」查看芯片和系统版本。
 
-1. 用有仓库访问权限的 GitHub 账号登录，下载 Mac 完整版。完整包包含运行环境、视频工具和识别模型。 [下载 Mac 完整版 ZIP](https://github.com/zhaochengxiaohao-design/search_download_upload_auto/releases/download/v1.3.6/gather-assistant-1.3.6-macos-arm64.zip)
+1. 用有仓库访问权限的 GitHub 账号登录，下载 Mac 完整版。完整包包含运行环境、视频工具和识别模型。 [下载 Mac 完整版 ZIP](https://github.com/zhaochengxiaohao-design/search_download_upload_auto/releases/download/v1.3.7/gather-assistant-1.3.7-macos-arm64.zip)
 2. 在访达的「下载」文件夹双击 ZIP，把解压出来的 **采集助手-Mac-arm64** 整个文件夹移到「文稿」或其他可写位置。
 3. 双击文件夹里的 **采集助手**。浏览器自动打开后，页面上方会显示 **日期采集、视频确认、处理结果、设置**。以后也可双击应用回到网页。
 
 ### 首次启动遇到 macOS 提示
 
-首次打开时，macOS 可能提示「无法验证开发者」或「Apple 无法检查是否包含恶意软件」。确认 ZIP 来自可信的 GitHub 发布页后，打开 **系统设置 → 隐私与安全性**，找到采集助手，点击 **仍要打开**，按系统提示确认。公司管理的 Mac 若没有该按钮，请联系 IT。 [GitHub 发布页](https://github.com/zhaochengxiaohao-design/search_download_upload_auto/releases/tag/v1.3.6) · [Apple 的打开说明](https://support.apple.com/zh-cn/102445)
+首次打开时，macOS 可能提示「无法验证开发者」或「Apple 无法检查是否包含恶意软件」。确认 ZIP 来自可信的 GitHub 发布页后，打开 **系统设置 → 隐私与安全性**，找到采集助手，点击 **仍要打开**，按系统提示确认。公司管理的 Mac 若没有该按钮，请联系 IT。 [GitHub 发布页](https://github.com/zhaochengxiaohao-design/search_download_upload_auto/releases/tag/v1.3.7) · [Apple 的打开说明](https://support.apple.com/zh-cn/102445)
 
 ## 2. 连接工作平台
 
@@ -82,7 +82,7 @@
 
 | 现象 | 先做什么 |
 | --- | --- |
-| GitHub 下载显示 404 | 登录有此私有仓库访问权限的账号，再从发布页下载。 [GitHub 发布页](https://github.com/zhaochengxiaohao-design/search_download_upload_auto/releases/tag/v1.3.6) |
+| GitHub 下载显示 404 | 登录有此私有仓库访问权限的账号，再从发布页下载。 [GitHub 发布页](https://github.com/zhaochengxiaohao-design/search_download_upload_auto/releases/tag/v1.3.7) |
 | 解压后看到「启动简易版.command」 | 这是源码包。日常使用请下载 **Mac 完整版 ZIP**，解压后双击「采集助手」。 |
 | 浏览器没有打开 | 再双击「采集助手」。若弹窗给出以 `127.0.0.1` 开头的本机地址，把它粘贴到浏览器地址栏。 |
 | 应用提示已损坏 | 从发布页重新下载 ZIP 并完整解压。如果提示仍出现，记录提示文字以便排查。 |
@@ -97,4 +97,4 @@
 
 源码版需要 Python 3.13 和 Node.js 22.13 或更新版本。在源码目录打开终端并运行 `zsh ./启动简易版.command`，停止时运行 `zsh ./启动简易版.command stop`。
 
-源码版的照片识别还需要 Python 3.11、FFmpeg、ffprobe 和模型包。将模型 ZIP 放到源码目录，运行 `zsh ./启动简易版.command setup-models ./models-v1.zip`，再重启应用。 [下载 models-v1.zip](https://github.com/zhaochengxiaohao-design/search_download_upload_auto/releases/download/v1.3.6/models-v1.zip)
+源码版的照片识别还需要 Python 3.11、FFmpeg、ffprobe 和模型包。将模型 ZIP 放到源码目录，运行 `zsh ./启动简易版.command setup-models ./models-v1.zip`，再重启应用。 [下载 models-v1.zip](https://github.com/zhaochengxiaohao-design/search_download_upload_auto/releases/download/v1.3.7/models-v1.zip)

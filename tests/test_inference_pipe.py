@@ -10,6 +10,7 @@ import threading
 
 import pytest
 
+from app.file_leases import finish_io
 from app.inference_pipe import MAX_JPEG_BYTES, abort, read_jpeg_payload, read_reply, send_request
 from app.magnet_export import classify_batch
 from app.main import create_app
@@ -212,10 +213,11 @@ async def test_current_backend_uses_memory_without_touching_working_disk(tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_cancel_finishes_the_current_exchange_before_closing_the_worker(tmp_path, monkeypatch):
+async def test_cancel_finishes_inference_and_prefetch_before_closing_the_worker(tmp_path, monkeypatch):
     app = create_app(data_dir=tmp_path / 'db')
     manager = app.state.slicing
     entered, release = threading.Event(), threading.Event()
+    decoding, decoded = threading.Event(), threading.Event()
     events = []
     def labeler(_):
         entered.set()
@@ -223,22 +225,34 @@ async def test_cancel_finishes_the_current_exchange_before_closing_the_worker(tm
         events.append('classified')
         return 'target'
     labeler.close = lambda: events.append('closed')
-    async def image(*_):
+    def next_image():
+        decoding.set()
+        assert decoded.wait(5)
+        events.append('decoded')
+
+    async def image(_item, stamp):
+        if stamp:
+            await finish_io(next_image)
         return b'\xff\xd8\xff\xd9'
     monkeypatch.setattr(manager, '_open_magnet_labeler', lambda: labeler)
     monkeypatch.setattr(manager, '_read_export_frame', image)
-    task = asyncio.create_task(manager._recognized_magnet_frames({}, [0]))
+    task = asyncio.create_task(manager._recognized_magnet_frames({}, [0, 1]))
     try:
         assert await asyncio.to_thread(entered.wait, 2)
+        assert await asyncio.to_thread(decoding.wait, 2)
         task.cancel()
         await asyncio.sleep(.02)
         assert not task.done() and not events
         release.set()
+        await asyncio.sleep(.02)
+        assert not task.done() and 'closed' not in events
+        decoded.set()
         with pytest.raises(asyncio.CancelledError):
             await task
-        assert events == ['classified', 'closed']
+        assert sorted(events[:2]) == ['classified', 'decoded'] and events[-1] == 'closed'
     finally:
         release.set()
+        decoded.set()
         await asyncio.gather(task, return_exceptions=True)
         await close_app(app)
 

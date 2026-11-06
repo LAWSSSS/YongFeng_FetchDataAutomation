@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import hashlib
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from .media_validation import MediaValidationError, verify_video_tail
@@ -128,16 +129,27 @@ def extract_requested_frames(path, ffmpeg, metadata, points, *, skip_undecodable
         expected = metadata.get("_expectedFileVersion")
         verify_file_version(path, expected)
         details = metadata.setdefault("_decodeObservations", {})
-        for timestamp in all_points:
+
+        def decode(timestamp):
             verify_file_version(path, expected, check_edges=False)
             try:
-                decoded = decode_position(path, ffmpeg, timestamp, metadata, expected=expected,
+                return decode_position(path, ffmpeg, timestamp, metadata, expected=expected,
                     tail=abs(timestamp - max(0, duration - 1 / frame_rate)) < 1e-5)
             except RuntimeError as error:
                 raise FrameExtractionError(str(error), timestamp=timestamp) from None
-            verify_file_version(path, expected, check_edges=False)
-            details[timestamp] = decoded.observation()
-            yield timestamp, decoded.image
+
+        if all_points:
+            # Decode one frame ahead of inference. Keep seek order and bound
+            # each video's lookahead to one additional image in memory.
+            with ThreadPoolExecutor(max_workers=1) as decoder:
+                pending = decoder.submit(decode, all_points[0])
+                for index, timestamp in enumerate(all_points):
+                    decoded = pending.result()
+                    verify_file_version(path, expected, check_edges=False)
+                    if index + 1 < len(all_points):
+                        pending = decoder.submit(decode, all_points[index + 1])
+                    details[timestamp] = decoded.observation()
+                    yield timestamp, decoded.image
         verify_file_version(path, expected)
         return
     regular_by_category = {

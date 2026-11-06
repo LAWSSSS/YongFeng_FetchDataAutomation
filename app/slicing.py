@@ -2952,8 +2952,7 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
             samples = []
             frames = {}
 
-            async def consider(stamp):
-                blob = await self._read_export_frame(item, stamp)
+            async def consider(stamp, blob):
                 if blob is None:
                     samples.append((stamp, "unavailable"))
                     return
@@ -2964,8 +2963,27 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
                 if label == "target":
                     frames[round(float(stamp), 3)] = blob
 
-            for stamp in points:
-                await consider(stamp)
+            async def consider_many(stamps):
+                remaining = iter(stamps)
+                stamp = next(remaining, None)
+                if stamp is None:
+                    return
+                reader = asyncio.create_task(self._read_export_frame(item, stamp))
+                try:
+                    # Keep the model busy without launching multiple seeks
+                    # on the same video. The sampling order remains stable.
+                    for following in remaining:
+                        blob = await reader
+                        reader = asyncio.create_task(self._read_export_frame(item, following))
+                        await consider(stamp, blob)
+                        stamp = following
+                    await consider(stamp, await reader)
+                finally:
+                    if not reader.done():
+                        reader.cancel()
+                    await asyncio.gather(reader, return_exceptions=True)
+
+            await consider_many(points)
             target = category_image_target(self.store.settings, "magnet")
             gap = max((points[index + 1] - points[index] for index in range(len(points) - 1)), default=30)
             for step in (5, 2, 1):
@@ -2973,11 +2991,14 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
                     break
                 if step >= gap:
                     continue
+                seen = [stamp for stamp, _ in samples]
+                refinement = []
                 for start, end in magnet_refine_windows(samples, gap):
                     for stamp in interior_timestamps(start, end, step):
-                        if any(abs(stamp - seen) < 1e-6 for seen, _ in samples):
-                            continue
-                        await consider(stamp)
+                        if all(abs(stamp - previous) >= 1e-6 for previous in seen):
+                            refinement.append(stamp)
+                            seen.append(stamp)
+                await consider_many(refinement)
                 gap = step
             item["lastMagnetExportSamples"] = [{"time": stamp, "label": label, "code": "decode_unavailable" if label == "unavailable" else ""} for stamp, label in samples]
             chosen = select_recognized_frames(samples, target=target, maximum=200)

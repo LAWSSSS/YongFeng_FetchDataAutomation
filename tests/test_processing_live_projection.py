@@ -112,6 +112,26 @@ async def test_one_verified_package_does_not_hide_the_other_category_export(env)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('online,stage', [(False, '等待磁盘'), (True, '等待原片读取')])
+async def test_verified_package_does_not_hide_an_export_wait(env, online, stage):
+    app, row = env
+    _, item, operation = confirmed_photos(app, row, state='complete')
+    item['state'] = 'waiting_connection'
+    item['categories']['bed']['state'] = 'complete'
+    item['categories']['magnet'].update(state='waiting_connection', waitStage='export',
+                                       message='等待原片读取恢复，再继续导出。')
+    app.state.slicing.store.save('items', item)
+    app.state.workspace.online = online
+    await app.state.final_processing.advance(operation)
+
+    result = app.state.pipeline.state()['items'][0]
+    video = app.state.videos.state(identity=row['id'])['videos'][0]['finalProcessing']
+    assert result['stage'] == video['stageLabel'] == stage
+    assert result['state'] == video['state'] == 'waiting'
+    assert result['packages'][0]['state'] == 'complete'
+
+
+@pytest.mark.asyncio
 async def test_wrong_package_or_new_unconfirmed_version_never_acquires_the_old_results(env):
     app, row = env
     current, item, operation = confirmed_photos(app, row)
