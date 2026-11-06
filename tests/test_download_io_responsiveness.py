@@ -91,6 +91,33 @@ def download_environment(tmp_path, monkeypatch, stage, *, timed):
 
 
 @pytest.mark.asyncio
+async def test_restarted_download_discards_weak_prefix_before_persisting_new_etag(tmp_path, monkeypatch):
+    app, _, manager, row, version, media, *_ = download_environment(tmp_path, monkeypatch, 'none', timed=False)
+    part = manager.work / row['id'] / 'v0.part'
+    part.parent.mkdir()
+    with part.open('xb') as output:
+        output.write(b'unrelated weak-version prefix')
+    version['etag'] = 'W/"old-version"'
+    manager.store.save(row)
+    saved = manager.store.save
+    received_checkpoints = []
+
+    def record(value):
+        current = value['versions'][0]
+        if current.get('etag') == '"fixed-version"' and current.get('receivedBytes') == 0:
+            received_checkpoints.append(part.stat().st_size)
+        saved(value)
+
+    monkeypatch.setattr(manager.store, 'save', record)
+    try:
+        _, _, digest, size = await manager.download_bound(row, version)
+        assert received_checkpoints == [0]
+        assert part.read_bytes() == media and size == len(media) and digest == hashlib.sha256(media).hexdigest()
+    finally:
+        await close_app(app)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('stage', ['write', 'fsync'])
 async def test_slow_download_disk_io_keeps_health_responsive(tmp_path, monkeypatch, stage):
     app, target, manager, row, version, media, tracked, entered, released, finished = download_environment(

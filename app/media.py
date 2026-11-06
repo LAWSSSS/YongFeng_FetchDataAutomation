@@ -8,6 +8,7 @@ import stat
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
 from uuid import uuid4
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -61,6 +62,52 @@ def edge_digest(stream, size: int) -> str:
         stream.seek(size - 65536)
         digest.update(stream.read(65536))
     return digest.hexdigest()
+
+
+def fingerprint(info):
+    return {"device": info.st_dev, "inode": info.st_ino, "size": info.st_size, "modifiedNs": info.st_mtime_ns}
+
+
+@contextmanager
+def _bound_media(path):
+    flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0)
+    with os.fdopen(os.open(path, flags), 'rb') as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError(errno.EINVAL, '视频路径不是普通文件。')
+        version = fingerprint(info)
+        yield stream, version
+        after = os.fstat(stream.fileno())
+        if (fingerprint(after) != version or after.st_ctime_ns != info.st_ctime_ns
+                or fingerprint(path.lstat()) != version):
+            raise OSError(errno.ESTALE, '验证期间视频文件发生变化。')
+
+
+def media_version(path):
+    with _bound_media(Path(path)) as (stream, version):
+        return {**version, 'edgeHash': edge_digest(stream, version['size'])}
+
+
+def checked_media_digest(path, synchronize=False):
+    with _bound_media(Path(path)) as (stream, version):
+        if synchronize:
+            os.fsync(stream.fileno())
+        observed = {**version, 'edgeHash': edge_digest(stream, version['size'])}
+        stream.seek(0)
+        return hashlib.file_digest(stream, 'sha256').hexdigest(), observed
+
+
+def verify_publication(path, prepared, receipt_version=None):
+    observed = media_version(path)
+    if observed['size'] != prepared.get('bytes') or (receipt_version and observed != receipt_version):
+        raise OSError(errno.ESTALE, '保存的视频与发布凭证不一致。')
+    if receipt_version or observed == prepared.get('sourceVersion'):
+        return observed
+    # Legacy or cross-volume interruption has no destination inode receipt.
+    digest, verified = checked_media_digest(path)
+    if verified != observed or digest != prepared.get('sha256'):
+        raise OSError(errno.ESTALE, '无法确认目标文件是本次发布的视频。')
+    return verified
 
 
 def copy_exclusive(source: Path, destination: Path, expected_digest: str | None = None):
@@ -124,7 +171,10 @@ def copy_exclusive(source: Path, destination: Path, expected_digest: str | None 
         raise
 
 
-def publish_file(source: Path, destination: Path, expected_digest: str | None = None):
+_RENAME_UNSUPPORTED = {errno.ENOTSUP, errno.EOPNOTSUPP, errno.ENOSYS}
+
+
+def _rename_exclusive(source, destination):
     if sys.platform == "darwin":
         # macOS SDK sys/stdio.h：RENAME_EXCL=4；无需文件系统支持硬链接。
         library = ctypes.CDLL(None, use_errno=True)
@@ -133,19 +183,21 @@ def publish_file(source: Path, destination: Path, expected_digest: str | None = 
         rename.restype = ctypes.c_int
         if rename(os.fsencode(source), os.fsencode(destination), 4):
             code = ctypes.get_errno()
-            if code in (errno.EXDEV, errno.ENOTSUP, errno.EOPNOTSUPP, errno.ENOSYS):
-                return copy_exclusive(source, destination, expected_digest)
             raise OSError(code, os.strerror(code))
     elif sys.platform == "win32":
         os.rename(source, destination)  # Windows 的 rename 不覆盖已有目标。
     else:
-        try:
-            os.link(source, destination)
-        except OSError as error:
-            if error.errno not in (errno.EXDEV, errno.ENOTSUP, errno.EOPNOTSUPP, errno.ENOSYS):
-                raise
-            return copy_exclusive(source, destination, expected_digest)
+        os.link(source, destination)
         source.unlink()
+
+
+def publish_file(source: Path, destination: Path, expected_digest: str | None = None):
+    try:
+        _rename_exclusive(source, destination)
+    except OSError as error:
+        if error.errno not in _RENAME_UNSUPPORTED | {errno.EXDEV}:
+            raise
+        return copy_exclusive(source, destination, expected_digest)
     return expected_digest  # The source was hashed before the same-filesystem atomic move.
 
 
@@ -195,8 +247,8 @@ def publish_with_reservation(temporary: Path, destination: Path, report=None, re
 
 
 def copy_to_destination(source: Path, destination: Path, report=None, partial_path=None, keep_partial=False,
-                        reservation=None):
-    """Copy a completed local download to its final folder without post-copy validation.
+                        reservation=None, verified_source=None, expected_digest=None):
+    """Publish a verified download by an exclusive move when both paths share a volume.
 
     The destination only becomes visible after the write is flushed and atomically
     published. The local source is removed only after that publication succeeds.
@@ -208,10 +260,30 @@ def copy_to_destination(source: Path, destination: Path, report=None, partial_pa
             report({"stage": stage, **details})
     try:
         progress()
+        if verified_source:
+            if media_version(source) != verified_source:
+                raise OSError(errno.ESTALE, '已验证的下载文件发生变化。')
+            if not partial_path and not reservation and destination.parent.stat().st_dev == verified_source['device']:
+                stage = 'publish'
+                progress(total=verified_source['size'])
+                try:
+                    _rename_exclusive(source, destination)
+                except OSError as error:
+                    if error.errno not in _RENAME_UNSUPPORTED | {errno.EXDEV}:
+                        raise
+                else:
+                    version = verify_publication(destination, {'bytes': verified_source['size'],
+                        'sha256': expected_digest, 'sourceVersion': verified_source})
+                    stage = 'source_remove'
+                    progress(bytes=version['size'], total=version['size'], fileVersion=version)
+                    return True
         with os.fdopen(os.open(source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)), "rb") as incoming:
             original = os.fstat(incoming.fileno())
             if not stat.S_ISREG(original.st_mode):
                 raise OSError(errno.EINVAL, "下载源不是普通文件。")
+            source_identity = fingerprint(original)
+            if verified_source and any(verified_source.get(key) != value for key, value in source_identity.items()):
+                raise OSError(errno.ESTALE, '已验证的下载文件发生变化。')
             stage = "temporary_open" if partial_path else "temporary_create"
             candidate = Path(partial_path) if partial_path else destination.with_name(f".{destination.name}.{uuid4().hex}.uploading")
             if (candidate.parent != destination.parent or not candidate.name.startswith("." + destination.name + ".")
@@ -240,35 +312,35 @@ def copy_to_destination(source: Path, destination: Path, report=None, partial_pa
                 progress(bytes=copied, total=original.st_size)
                 outgoing.flush()
                 os.fsync(outgoing.fileno())
+                if copied != original.st_size or fingerprint(os.fstat(incoming.fileno())) != source_identity:
+                    raise OSError(errno.ESTALE, '视频在转移期间发生变化。')
 
         stage = "publish"
         progress()
+        if fingerprint(source.lstat()) != source_identity:
+            raise OSError(errno.ESTALE, '发布源路径发生变化。')
+        if offset and verified_source and checked_media_digest(temporary)[0] != expected_digest:
+            raise OSError(errno.ESTALE, '转移断点的内容与已校验视频不一致。')
         if reservation:
             publish_with_reservation(temporary, destination, progress, reservation)
-        elif sys.platform == "darwin":
-            library = ctypes.CDLL(None, use_errno=True)
-            rename = library.renamex_np
-            rename.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
-            rename.restype = ctypes.c_int
-            if rename(os.fsencode(temporary), os.fsencode(destination), 4):
-                code = ctypes.get_errno()
-                if code not in (errno.ENOTSUP, errno.EOPNOTSUPP, errno.ENOSYS):
-                    raise OSError(code, os.strerror(code))
-                publish_with_reservation(temporary, destination, progress, reservation)
-        elif sys.platform == "win32":
-            os.rename(temporary, destination)  # Does not replace an existing target.
         else:
             try:
-                os.link(temporary, destination)  # Exclusive and atomic; same directory/filesystem.
+                _rename_exclusive(temporary, destination)
             except OSError as error:
-                if error.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP, errno.ENOSYS):
+                if error.errno not in _RENAME_UNSUPPORTED:
                     raise
                 publish_with_reservation(temporary, destination, progress, reservation)
-            else:
-                temporary.unlink()
         temporary = None
         stage = "source_remove"
-        progress()
+        details = {}
+        if verified_source:
+            version = media_version(destination)
+            if any(version[key] != verified_source[key] for key in ('size', 'edgeHash')):
+                raise OSError(errno.ESTALE, '转移后的内容与已校验视频不一致。')
+            details['fileVersion'] = version
+        if fingerprint(source.lstat()) != source_identity:
+            raise OSError(errno.ESTALE, '发布后源路径发生变化，源文件保留。')
+        progress(**details)
         source.unlink()
     except BaseException as error:
         if isinstance(error, OSError):

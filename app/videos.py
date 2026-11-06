@@ -12,6 +12,7 @@ import stat
 import sys
 import tempfile
 import time
+from collections import Counter, defaultdict
 from contextlib import ExitStack, nullcontext
 from datetime import timedelta
 from functools import partial
@@ -26,13 +27,13 @@ from .domain import DEFAULT_TARGET, approval_issue, format_time, gather_payload,
 from .download_slots import DownloadSlots
 from .file_leases import FileEnvironmentError
 from .jobs import JobManager, UNCONFIRMED_CAPTURE
-from .media import (DownloadFailure, download_url, file_digest, publish_file,
+from .media import (DownloadFailure, checked_media_digest, download_url, file_digest, media_version, publish_file,
                     prepare_directory, valid_video_header, video_filename,
-                    publish_with_reservation, transfer_reservation_identity)
+                    publish_with_reservation, transfer_reservation_identity, verify_publication)
 from .remote import RemoteClient, RemoteError
 from .media_validation import MediaValidationError, verify_video_tail
 from .source import page_records
-from .video_filters import filter_records, matches_status, record_status
+from .video_filters import filter_records, record_status
 from . import file_locations
 from .recovery_results import partial_complete, verified_result
 
@@ -372,8 +373,7 @@ class VideoManager:
 
     def state(self, query=None, *, identity=None):
         from .video_termination import can_terminate, capture_in_flight
-        if identity is None:
-            self.sync_jobs()
+        jobs = self.sync_jobs() if identity is None else None
         final_processing = getattr(self, 'final_processing', None)
         final_operations = {(entry['videoId'], entry['version'], entry['expectedRevision']): entry
                             for entry in final_processing.presentations()} if final_processing else {}
@@ -396,6 +396,8 @@ class VideoManager:
                 row = self.store.get(row['duplicateOfVideoId'])
             if not row or row.get('deletedAt') or row['id'] in hidden:
                 continue
+            job_id = row.get('jobId', '')
+            job = jobs.get(job_id) if jobs is not None else self.jobs.store.get(job_id)
             active_operation = active_operations.get((row['id'], row.get('activeRevision'), row.get('revision')))
             visible_operation = ({key: active_operation.get(key) for key in
                 ('id', 'kind', 'state', 'stage', 'message', 'errorCode', 'progress',
@@ -436,13 +438,18 @@ class VideoManager:
                                     'canForceRecapture': self.can_force_recapture(row, active),
                                     'captureInFlight': capture_in_flight(active),
                                     'canTerminateCapture': can_terminate(row, active)},
-                   'submittedAt': (self.jobs.store.get(row.get('jobId', '')) or {}).get('createdAt') or row.get('submittedAt', '')}
+                   'submittedAt': (job or {}).get('createdAt') or row.get('submittedAt', '')}
             rows.append(row)
         found = filter_records(rows, query)
+        counts = Counter()
+        for row in rows:
+            status = record_status(row)
+            counts[status] += 1
+            if status == 'saved' and partial_complete(self.version(row, row['activeRevision'])):
+                counts['complete'] += 1
         return {"videos": found, "directory": self.store.directory(), "workspaceManaged": bool(getattr(self, 'workspace', None) and self.workspace.enabled), "totalCount": len(rows),
-                "filteredCount": len(found), "byJob": {job_id: sum(r["jobId"] == job_id for r in rows)
-                    for job_id in {r["jobId"] for r in rows}},
-                "counts": {kind: sum(matches_status(row, kind) for row in rows)
+                "filteredCount": len(found), "byJob": dict(Counter(row["jobId"] for row in rows)),
+                "counts": {kind: counts[kind]
                            for kind in ("ready", "waiting", "review", "download", "saved", "complete", "deleting", "processing")},
                 "lastCheck": self.last_check, "checkError": self.storage_error or self.check_error,
                 "hiddenRecordCount": len(hidden), "downloadWorkers": self.download_workers()}
@@ -615,30 +622,43 @@ class VideoManager:
         return counts
 
     def sync_jobs(self):
-        from .capture_history import same_target, target_of
-        for job in self.jobs.store.list():
+        from .capture_history import same_target
+        jobs = {job['id']: job for job in self.jobs.store.list()}
+        rows = {row['id']: row for row in self.store.list(include_deleted=True)}
+        by_task, by_record = defaultdict(set), defaultdict(set)
+
+        def index(row):
+            if not row.get('deletedAt') and not row.get('duplicateOfVideoId'):
+                by_record[(row.get('recordId'), row.get('taskKey'))].add(row['id'])
+                for version in row['versions']:
+                    if task_id := version.get('taskId'):
+                        by_task[task_id].add(row['id'])
+
+        for row in rows.values():
+            index(row)
+        for job in jobs.values():
             for item in job["items"]:
                 if item["status"] in ("invalid", "removed"):
                     continue
                 identity = self.job_video_id(job, item)
-                row = self.store.get(identity)
+                row = rows.get(identity)
                 if row and row.get("deletedAt"):
                     continue
                 if not row and item['status'] == 'pending' and 'repeatBindings' in item:
                     continue  # A reviewed repeat may resolve to the existing active video.
                 if item['status'] == 'failed' and not row:
                     continue
-                if item['status'] == 'duplicate':
-                    candidates = [other for other in self.store.list()
-                                  if other['id'] != identity and not other.get('duplicateOfVideoId')
-                                  and same_target(target_of(self.jobs.store, other), job['target'])
-                                  and ((item.get('bindingVerified') and item.get('remoteId') and any(
-                                      v.get('taskId') == item['remoteId'] for v in other['versions']))
-                                       or (item.get('duplicateSource') == 'local'
-                                           and other.get('recordId') == item.get('recordId')
-                                           and other.get('taskKey') == item.get('key')))]
-                    if len(candidates) == 1 and (not row or (row.get('revision') == 0 and not row.get('requests')
-                            and row.get('acceptedRevision') is None and not row['versions'][0].get('taskId'))):
+                if item['status'] == 'duplicate' and (not row or (row.get('revision') == 0 and not row.get('requests')
+                        and row.get('acceptedRevision') is None and not row['versions'][0].get('taskId'))):
+                    identities = set()
+                    if item.get('bindingVerified') and item.get('remoteId'):
+                        identities.update(by_task.get(item['remoteId'], ()))
+                    if item.get('duplicateSource') == 'local':
+                        identities.update(by_record.get((item.get('recordId'), item.get('key')), ()))
+                    candidates = [other for candidate in identities - {identity} if not (other := rows[candidate]).get('duplicateOfVideoId')
+                                  and same_target((jobs.get(other.get('jobId')) or {}).get('target')
+                                                  or other.get('submissionTarget'), job['target'])]
+                    if len(candidates) == 1:
                         canonical = candidates[0]['id']
                         if item.get('existingVideoId') != canonical:
                             item['existingVideoId'] = canonical
@@ -648,7 +668,8 @@ class VideoManager:
                             row['duplicateOfVideoId'] = canonical
                             self.store.save(row)
                         continue
-                if not row:
+                is_new = row is None
+                if is_new:
                     row = {"id": identity, "jobId": job["id"], "taskKey": item["key"],
                            "recordId": item["recordId"], "plate": item["plate"], "name": item["videoName"],
                            "qualityStart": item["checkStartTime"], "qualityEnd": item["checkCompleteTime"],
@@ -701,8 +722,11 @@ class VideoManager:
                         original.update(downloadRequested=True, outputDirectory=job["downloadDirectory"])
                         row["requests"]["batch-download:" + job["id"]] = {"kind": "confirm", "version": 0}
                     changed = True
-                if changed or not self.store.get(identity):
+                if changed or is_new:
                     self.store.save(row)
+                    rows[identity] = row
+                    index(row)
+        return jobs
 
     async def loop(self):
         while True:
@@ -2418,17 +2442,15 @@ class VideoManager:
             raise
 
     async def copy_to_final(self, source, destination, report=None, previous_temporary=None, recover=False,
-                            reservation=None):
+                            reservation=None, prepared=None):
         async with self.publish_slots:
             command = [sys.executable, "-m", "app.transfer", str(source), str(destination)]
-            if recover:
-                command.append("--recover")
-            elif previous_temporary:
-                command.append(previous_temporary)
-            if reservation:
-                if len(command) == 5:
-                    command.append("")
-                command.append(json.dumps(reservation))
+            if recover or previous_temporary or reservation or prepared:
+                command.append('--recover' if recover else previous_temporary or '')
+            if reservation or prepared:
+                command.append(json.dumps(reservation) if reservation else '')
+            if prepared:
+                command.append(json.dumps(prepared))
             process = await asyncio.create_subprocess_exec(*command, cwd=Path(__file__).resolve().parents[1],
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
             stage = "transfer_start"
@@ -2493,6 +2515,8 @@ class VideoManager:
                 version["transferReservation"] = event["reservation"]
             if event.get("stage") == "source_remove":
                 version["transferReceipt"] = {"path": str(destination), "publishedAt": now_iso()}
+                if event.get('fileVersion'):
+                    version['transferReceipt']['fileVersion'] = event['fileVersion']
             self.store.save(row)
         return transferred
 
@@ -2513,6 +2537,30 @@ class VideoManager:
         destination = version.get("publishing", {}).get("path", "")
         return "-m app.transfer " in command and source in command and bool(destination) and destination in command
 
+    @staticmethod
+    def part_size(part):
+        try:
+            info = part.lstat()
+        except FileNotFoundError:
+            return 0
+        if not stat.S_ISREG(info.st_mode):
+            raise DownloadFailure('下载断点不是登记的视频文件，已保留。', 'range_invalid')
+        return info.st_size
+
+    async def validate_downloaded_part(self, part, version, size, synchronize=False):
+        try:
+            before = await self.file_operation(media_version, part)
+            await self.ffprobe(part)
+            digest, actual = await self.file_operation(checked_media_digest, part, synchronize)
+        except OSError as error:
+            if error.errno != errno.ESTALE:
+                raise
+            raise DownloadFailure('下载缓存版本发生变化，已保留。', 'object_changed') from None
+        if actual != before or actual['size'] != size:
+            raise DownloadFailure('下载缓存版本发生变化，已保留。', 'object_changed')
+        version['_downloadVersion'] = actual
+        return digest
+
     async def download_bound(self, row, version):
         folder = self.work / row["id"]
         part = folder / f"v{version['revision']}.part"
@@ -2529,7 +2577,8 @@ class VideoManager:
             try:
                 result = await self.bound_result(version)  # refresh media link for every attempt
                 url = download_url(result["url"])
-                offset = part.stat().st_size if part.is_file() else 0
+                part_size = await self.file_operation(self.part_size, part)
+                offset = part_size
                 if offset and (not version.get("etag") or version["etag"].startswith("W/")):
                     offset = 0  # without a strong version, restart instead of combining two objects
                 headers = {"Accept-Encoding": "identity", **({"Range": f"bytes={offset}-"} if offset else {})}
@@ -2555,8 +2604,8 @@ class VideoManager:
                                 complete = bool(probe.status_code == 206 and bounds and int(bounds[1]) == offset
                                                 and probe.headers.get("etag") == version["etag"])
                         if complete:
-                            await self.ffprobe(part)
-                            return part, result, await asyncio.to_thread(file_digest, part), offset
+                            digest = await self.validate_downloaded_part(part, version, offset, synchronize=True)
+                            return part, result, digest, offset
                         raise DownloadFailure("断点位置与平台文件不一致，已保留断点。", "range_invalid")
                     if response.status_code not in (200, 206):
                         raise DownloadFailure("媒体响应异常，已保留断点。", "media_response")
@@ -2587,10 +2636,8 @@ class VideoManager:
                         raise DownloadFailure("媒体长度发生变化，已停止下载。", "object_changed")
                     if not total:
                         raise DownloadFailure("媒体未提供完整长度，无法校验下载。", "invalid_length")
-                    if shutil.disk_usage(folder).free < total - offset + 16 * 1024 * 1024:
+                    if (await self.file_operation(shutil.disk_usage, folder)).free < total - offset + 16 * 1024 * 1024:
                         raise DownloadFailure("工作磁盘空间不足，旧版已保留。", "disk_full")
-                    version.update(etag=etag, totalBytes=total, receivedBytes=offset)
-                    self.store.save(row)
                     received, saved_at = offset, time.monotonic()
                     mode = "ab" if offset else "wb"
                     if managed:
@@ -2599,6 +2646,12 @@ class VideoManager:
                     else:
                         output = part.open(mode)
                     try:
+                        # Discard and flush bytes from an unproven old object
+                        # before recording the new ETag, even across a restart.
+                        if part_size and not offset:
+                            await self.file_operation(os.fsync, output.fileno())
+                        version.update(etag=etag, totalBytes=total, receivedBytes=offset)
+                        self.store.save(row)
                         async for block in response.aiter_bytes(chunk_size=1024 * 1024):
                             if received == 0 and not valid_video_header(block[:512]):
                                 raise DownloadFailure("下载内容不是视频。", "invalid_content")
@@ -2620,11 +2673,10 @@ class VideoManager:
                         raise DownloadFailure("下载连接中断，将续传。", "incomplete", retryable=True)
                     if received != total:
                         raise DownloadFailure("视频长度不完整，将续传。", "incomplete", retryable=True)
-                await self.ffprobe(part)
-                return part, result, await asyncio.to_thread(file_digest, part), total
+                return part, result, await self.validate_downloaded_part(part, version, total), total
             except (httpx.HTTPError, DownloadFailure, RemoteError) as error:
                 retryable = isinstance(error, httpx.HTTPError) or isinstance(error, RemoteError) or getattr(error, "retryable", False)
-                size = part.stat().st_size if part.is_file() else 0
+                size = await self.file_operation(self.part_size, part)
                 stalled = stalled + 1 if size == progress_before else 1
                 progress_before = size
                 if not retryable or stalled >= 3 or attempt >= len(RETRY_DELAYS):
@@ -2671,18 +2723,22 @@ class VideoManager:
                     version["transferAttempts"] = version.get("transferAttempts", 0) + 1
                     self.store.save(row)
                     transferred = self.transfer_report(row, version, destination)
-                    if version.get("transferReceipt", {}).get("path") == str(destination):
-                        # The worker acknowledged publication before removing the local source.
-                        part.unlink(missing_ok=True)
-                    elif part.is_file():
+                    receipt = version.get('transferReceipt') or {}
+                    part_size = await self.file_operation(self.part_size, part)
+                    if receipt.get('path') == str(destination):
+                        await self.file_operation(verify_publication, destination, prepared, receipt.get('fileVersion'))
+                        if part_size:
+                            await self.file_operation(verify_publication, part, prepared, prepared.get('sourceVersion'))
+                            await self.file_operation(part.unlink)
+                    elif part_size:
                         # Attempt the transfer directly; the exclusive atomic publish handles
                         # name conflicts without a separate removable-volume probe.
                         await self.copy_to_final(part, destination, transferred, version.get("transferTemporaryPath"),
-                                                 reservation=version.get("transferReservation"))
+                                                 reservation=version.get("transferReservation"), prepared=prepared)
                     else:
                         # Reconcile legacy publication in a bounded worker, never in the API thread.
                         await self.copy_to_final(part, destination, transferred, recover=True,
-                                                 reservation=version.get("transferReservation"))
+                                                 reservation=version.get("transferReservation"), prepared=prepared)
                     digest, size = prepared["sha256"], prepared["bytes"]
                 else:
                     async with self.download_slots:
@@ -2693,7 +2749,10 @@ class VideoManager:
                         "startTime": version["startTime"]}, result)
                     if getattr(self, 'workspace', None) and self.workspace.enabled:
                         destination = self.workspace.download_destination(destination.name)
-                    version["publishing"] = {"path": str(destination), "sha256": digest, "bytes": size}
+                    prepared = {"path": str(destination), "sha256": digest, "bytes": size}
+                    if proof := version.pop('_downloadVersion', None):
+                        prepared['sourceVersion'] = proof
+                    version['publishing'] = prepared
                     version["state"] = "publishing"
                     version["message"] = "正在转移到保存目录。"
                     version["transferAttempts"] = version.get("transferAttempts", 0) + 1
@@ -2703,12 +2762,13 @@ class VideoManager:
                         version["errorCode"] = "external_unavailable"
                         self.store.save(row)
                         return
-                    await self.copy_to_final(part, destination, self.transfer_report(row, version, destination))
+                    await self.copy_to_final(part, destination, self.transfer_report(row, version, destination),
+                                             prepared=prepared)
+                receipt_version = (version.get('transferReceipt') or {}).get('fileVersion')
+                if getattr(self, 'workspace', None) and self.workspace.enabled:
+                    version['fileVersion'] = await self.file_operation(verify_publication, destination, prepared, receipt_version)
                 version.update(state="saved", filePath=str(destination), sha256=digest, totalBytes=size,
                                downloadRequested=False, savedAt=now_iso())
-                if getattr(self, 'workspace', None) and self.workspace.enabled:
-                    from .workspace_files import file_version
-                    version['fileVersion'] = await self.file_operation(file_version, destination, True)
                 version.pop("message", None)
                 version.pop("errorCode", None)
                 version.pop("transferError", None)
@@ -2754,6 +2814,9 @@ class VideoManager:
                                    errorCode=getattr(error, 'code', 'disk_offline'), message=self.storage_error)
                     self.store.save(row)
                     return
+                if (isinstance(error, OSError) and version.get('publishing')
+                        and error.errno in {errno.ESTALE, errno.ELOOP}):
+                    error = DownloadFailure('本地文件与发布凭证不符，文件已保留，请核对。', 'transfer_conflict')
                 if isinstance(error, OSError) and version.get("publishing"):
                     version["state"] = "publishing"
                     stage = getattr(error, "transfer_stage", "transfer")

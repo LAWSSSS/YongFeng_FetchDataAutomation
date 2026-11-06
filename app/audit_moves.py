@@ -12,17 +12,13 @@ from pathlib import Path
 from uuid import uuid4
 
 from .domain import now_iso
-from .media import file_digest, publish_with_reservation, transfer_reservation_identity
+from .media import file_digest, fingerprint, publish_with_reservation, transfer_reservation_identity
 from .upload_audit import AUDIT_POLICY_VERSION
 from .videos import Conflict
 from . import file_locations
 from .file_leases import FileEnvironmentError
 
 MOVE_RULE_VERSION = 4
-
-
-def fingerprint(info):
-    return {"device": info.st_dev, "inode": info.st_ino, "size": info.st_size, "modifiedNs": info.st_mtime_ns}
 
 
 def checked_path(value):

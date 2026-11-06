@@ -81,13 +81,24 @@ def decode_exclusions(observations: Iterable[dict], duration: float) -> list[tup
         if 0 <= point <= duration:
             failed = row.get("code") == "decode_unavailable"
             by_time[point] = by_time.get(point, False) or failed
+    if not any(by_time.values()):
+        return []
     rows = sorted(by_time.items())
+    next_good = [None] * len(rows)
+    following = None
+    for index in range(len(rows) - 1, -1, -1):
+        point, failed = rows[index]
+        if failed:
+            next_good[index] = following
+        else:
+            following = point
     windows = []
+    previous = None
     for index, (point, failed) in enumerate(rows):
         if not failed:
+            previous = point
             continue
-        previous = next((time for time, bad in reversed(rows[:index]) if not bad), None)
-        following = next((time for time, bad in rows[index + 1:] if not bad), None)
+        following = next_good[index]
         windows.append((0 if previous is None else min(point, previous + .001),
                         duration if following is None else max(point, following - .001)))
     return merge_intervals(windows)

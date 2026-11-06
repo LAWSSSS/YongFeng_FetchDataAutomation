@@ -3,8 +3,44 @@ from pathlib import Path
 
 import pytest
 
+from app.domain import DEFAULT_TARGET
 from app.main import create_app
 from tests.test_slicing_performance import close_app
+
+
+@pytest.mark.asyncio
+async def test_video_status_indexes_reuse_receipts_without_per_row_database_queries(tmp_path):
+    app = create_app(data_dir=tmp_path / 'db')
+    videos = app.state.videos
+    store = videos.jobs.store
+    original = dict(key='interval', recordId='inspection', plate='TEST', videoName='TEST', status='submitted',
+        checkStartTime='2026-01-01 00:00:00', checkCompleteTime='2026-01-01 00:20:00', photoCount=1,
+        inspectionDurationSeconds=1200, startTime='2026-01-01 00:05:00', endTime='2026-01-01 01:05:00',
+        remoteId='one-task', bindingVerified=True)
+    job = dict(id='original-job', createdAt='2026-01-01T00:00:00', target=DEFAULT_TARGET,
+               status='complete', items=[original])
+    try:
+        store.save(job)
+        videos.sync_jobs()
+        with store.db:
+            for index in range(60):
+                store.save({**job, 'id': f'duplicate-{index}', 'createdAt': '2026-01-02T00:00:00',
+                    'items': [{**original, 'status': 'duplicate'}]}, commit=False)
+        videos.sync_jobs()
+        owner, = videos.store.list()
+        assert all(item['existingVideoId'] == owner['id'] for capture in store.list() for item in capture['items']
+                   if capture['id'] != job['id'])
+        statements = []
+        store.db.set_trace_callback(statements.append)
+        try:
+            result = videos.state()
+        finally:
+            store.db.set_trace_callback(None)
+        assert result['totalCount'] == result['counts']['waiting'] == 1
+        assert result['byJob'] == {job['id']: 1}
+        assert sum(sql.startswith('SELECT') for sql in statements) < 30
+    finally:
+        await close_app(app)
 
 
 @pytest.mark.asyncio

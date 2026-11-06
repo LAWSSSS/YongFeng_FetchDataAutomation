@@ -3,6 +3,7 @@ import asyncio
 import copy
 from contextlib import ExitStack
 
+from .file_leases import finish_io
 from .slicing_core import (build_category_result, category_image_target, sample_points,
                            record_decode_coverage, processing_conclusion, position_excluded)
 
@@ -173,7 +174,7 @@ class SharedSlicingAnalysis:
                 fingerprints = {}
                 for name in active:
                     try:
-                        fingerprints[name] = self._model_fingerprint(name)
+                        fingerprints[name] = await finish_io(self._model_fingerprint, name)
                     except (OSError, ValueError) as error:
                         code = str(error) if str(error) in ERROR_TEXT else 'model_load_failed'
                         work['categories'][name].update(state='attention', errorCode=code, message=ERROR_TEXT[code])

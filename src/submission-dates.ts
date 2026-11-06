@@ -1,4 +1,8 @@
 /** Submission dates are Beijing calendar days; media/capture dates never substitute. */
+const beijingTime = new Intl.DateTimeFormat('zh-CN', {
+  timeZone:'Asia/Shanghai',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false,
+});
+
 export function submissionInstant(value?: string | null) {
   if (!value) return null;
   const text = value.trim();
@@ -15,7 +19,7 @@ export function submissionDay(value?: string | null) {
 
 export function submissionTime(value?: string | null) {
   const date = submissionInstant(value);
-  return date ? new Intl.DateTimeFormat('zh-CN', {timeZone:'Asia/Shanghai',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}).format(date) : '时间未记录';
+  return date ? beijingTime.format(date) : '时间未记录';
 }
 
 export function groupSubmissionDays<T>(items: T[], dateOf: (item:T)=>string | null | undefined) {

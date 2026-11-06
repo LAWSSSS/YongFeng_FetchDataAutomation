@@ -1458,6 +1458,7 @@ async def test_transfer_error_details_persist_without_changing_revision(app_fact
 
 @pytest.mark.asyncio
 async def test_transfer_receipt_recovers_publication_without_recopy(app_factory, tmp_path, monkeypatch):
+    from app.media import file_digest
     app = app_factory()
     manager = app.state.videos
     identity = "e" * 24
@@ -1469,7 +1470,7 @@ async def test_transfer_receipt_recovers_publication_without_recopy(app_factory,
     row = {"id": identity, "jobId": "test", "revision": 0, "activeRevision": 0,
            "acceptedRevision": None, "requests": {}, "versions": [{"revision": 0, "state": "publishing",
            "downloadRequested": True, "outputDirectory": str(tmp_path),
-           "publishing": {"path": str(destination), "bytes": 15, "sha256": "known"},
+           "publishing": {"path": str(destination), "bytes": destination.stat().st_size, "sha256": file_digest(destination)},
            "transferReceipt": {"path": str(destination), "publishedAt": "confirmed-before-restart"}}]}
     manager.store.save(row)
     async def must_not_recopy(*args, **kwargs): pytest.fail("acknowledged publication must not copy again")
@@ -1478,6 +1479,57 @@ async def test_transfer_receipt_recovers_publication_without_recopy(app_factory,
     saved = manager.store.get(identity)["versions"][0]
     assert saved["state"] == "saved" and not saved["downloadRequested"]
     assert destination.read_bytes() == b"completed-video" and not part.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('replaced', [False, True])
+async def test_interrupted_fast_publication_checks_the_destination_content(app_factory, tmp_path, replaced):
+    from app.media import checked_media_digest
+    from tests.test_slicing_performance import close_app
+
+    app = app_factory()
+    manager = app.state.videos
+    identity = 'a' * 24
+    part = manager.work / identity / 'v0.part'
+    part.parent.mkdir(parents=True)
+    original = b'verified-video-data'
+    part.write_bytes(original)
+    digest, proof = checked_media_digest(part)
+    destination = tmp_path / 'finished.mp4'
+    part.rename(destination)  # The process exited after rename and before saving a receipt.
+    if replaced:
+        other = tmp_path / 'other.mp4'
+        other.write_bytes(b'Z' * len(original))
+        other.replace(destination)
+    manager.store.save({'id': identity, 'jobId': 'test', 'revision': 0, 'activeRevision': 0,
+        'acceptedRevision': None, 'requests': {}, 'versions': [{'revision': 0, 'state': 'publishing',
+        'downloadRequested': True, 'outputDirectory': str(tmp_path), 'publishing': {
+            'path': str(destination), 'bytes': len(original), 'sha256': digest, 'sourceVersion': proof}}]})
+    try:
+        await manager.publish(identity, 0)
+        row = manager.store.get(identity)
+        version = row['versions'][0]
+        if replaced:
+            assert version['state'] == 'failed' and version['errorCode'] == 'transfer_conflict'
+            assert row['acceptedRevision'] is None and destination.read_bytes() == b'Z' * len(original)
+        else:
+            assert version['state'] == 'saved' and row['acceptedRevision'] == 0
+            assert version['transferReceipt']['fileVersion'] == proof and destination.read_bytes() == original
+    finally:
+        await close_app(app)
+
+
+def test_verified_same_volume_transfer_keeps_the_original_inode(tmp_path):
+    from app.media import checked_media_digest, copy_to_destination, media_version
+
+    source, destination = tmp_path / 'verified.part', tmp_path / 'final.mp4'
+    source.write_bytes(b'verified-video-data')
+    digest, proof = checked_media_digest(source)
+    events = []
+    copy_to_destination(source, destination, events.append, verified_source=proof, expected_digest=digest)
+    assert not source.exists() and media_version(destination) == proof
+    assert 'copy' not in [event['stage'] for event in events]
+    assert events[-1]['fileVersion'] == proof
 
 
 def test_transfer_resumes_owned_partial_without_hash_or_readback(tmp_path, monkeypatch):

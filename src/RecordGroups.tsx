@@ -29,7 +29,7 @@ export function VideoBatches<T extends BatchVideo>({videos, visibleIds, jobs, se
   const datesByJob = useMemo(() => new Map(jobs.map(job=>[job.id,job.createdAt])), [jobs]);
   return <div className="date-list" aria-label="按提交日期归类的采集记录">{dates.map(date=>{
     const records=date.records;
-    const selectable=records.filter(record=>visibleIds.has(record.id));
+    const selectable=selecting?records.filter(record=>visibleIds.has(record.id)):[];
     return <DateSection key={date.day} day={date.day} rememberKey={`video-records:${date.day}`} expandedKey={records.some(r=>r.id===focusedVideoId)?focusKey:undefined} summary={`${records.length} 条视频 · ${date.submissionCount} 次提交`}>
       {selecting&&<div className="date-tools">
         <button className="secondary" disabled={disabled||!selectable.length} onClick={()=>onSelectBatch(selectable,true)}>选择当天记录</button>

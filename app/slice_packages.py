@@ -33,6 +33,8 @@ class SlicePackageStore:
         file_locations.initialize(db)
         for name in ("items", "batches"):
             db.execute(f"CREATE TABLE IF NOT EXISTS simple_slice_package_{name} (id TEXT PRIMARY KEY, payload TEXT NOT NULL)")
+        db.execute("""CREATE INDEX IF NOT EXISTS slice_package_video_category ON simple_slice_package_items(
+            json_extract(payload,'$.videoPath'), json_extract(payload,'$.category'))""")
         db.commit()
 
     def save(self, kind, value):
@@ -75,9 +77,20 @@ class SlicePackageStore:
         return None
 
     def find_video(self, path, version, category):
-        matches = [item for item in self.list("items") if item.get("videoPath") == path
-                   and item.get("videoFileVersion") == version and item.get("category") == category
-                   and item.get("state") != "dismissed" and not item.get("superseded")]
+        if not path or not version:
+            return None
+        rows = self.db.execute("""SELECT payload FROM simple_slice_package_items
+            WHERE json_extract(payload,'$.videoPath')=? AND json_extract(payload,'$.category')=? ORDER BY rowid""",
+            (path, category))
+        matches = []
+        for raw, in rows:
+            item = json.loads(raw)
+            expected = item.get('videoFileVersion') or {}
+            keys = ('device', 'inode', 'size', 'modifiedNs', 'edgeHash') if expected.get('edgeHash') else (
+                'device', 'inode', 'size', 'modifiedNs')
+            if (item.get('state') != 'dismissed' and not item.get('superseded')
+                    and all(key in expected and expected[key] == version.get(key) for key in keys)):
+                matches.append(item)
         if len(matches) > 1:
             raise ValueError("同一视频存在多个切片包，请先核对已有记录。")
         return matches[0] if matches else None

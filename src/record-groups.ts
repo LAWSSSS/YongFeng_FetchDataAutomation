@@ -55,10 +55,11 @@ export function syncVideoSelection<T extends {id: string; revision: number; acti
   selection: Map<string, VideoSelection>, videos: T[],
 ) {
   if (!selection.size) return selection;
+  const visible = new Map(videos.map(video => [video.id, video]));
   let changed = false;
   const next = new Map(selection);
   for (const [id, chosen] of selection) {
-    const video = videos.find(row => row.id === id);
+    const video = visible.get(id);
     if (!video || video.activeRevision !== chosen.version || video.revision !== chosen.expectedRevision) {
       next.delete(id);
       changed = true;
@@ -79,6 +80,7 @@ export function splitInspections(records: InspectionRecord[]) {
 export function videoCategory(video: BatchVideo): VideoCategory {
   if (['pending', 'error'].includes(video.deletion?.state || '')) return 'deleting';
   const active = video.versions.find(version => version.revision === video.activeRevision);
+  if (active?.state === 'terminating') return 'deleting';
   if (active?.state === 'withdrawing') return ['attention','conflict'].includes(video.operation?.state || '') ? 'review' : 'deleting';
   if(active&&partialComplete(active))return 'saved';
   if(recoveryInProgress(video))return 'processing';

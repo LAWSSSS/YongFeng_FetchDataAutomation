@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import errno
 import hashlib
 import json
 import math
@@ -73,6 +74,9 @@ ERROR_TEXT = {
     "frame_tool_error": "抽帧工具运行异常，未把该位置当作坏帧；请检查工具后重试。",
     "frame_io_error": "读取原片时发生磁盘或文件错误，未把该位置当作坏帧；请检查磁盘后重试。",
     "output_conflict": "输出位置已有同名照片或压缩包，文件保留；请换目录后重试。",
+    "output_disk_full": "保存切片照片的磁盘空间不足；已保留原视频，释放空间后可重试。",
+    "package_source_mismatch": "已有照片包属于不同文件版本，已保留，请核对后再处理。",
+    "model_changed": "识别期间模型文件发生变化，已保留进度，请核对后重试。",
     "no_decodable_samples": "没有找到可解码画面；未提交切片任务，原视频保留。",
     "no_cuttable_fragments": "识别到了目标，但区间均跨越无法解码的位置；已跳过且未提交切片。",
     "observations_incomplete": "部分抽样位置尚未识别，已保留有效判断，重试只补齐缺失位置。",
@@ -153,15 +157,9 @@ def _hash_file(path):
 
 
 def source_version(path):
-    from .media import edge_digest
+    from .media import media_version
     path = safe_path(path, must_exist=True, kind="file")
-    info = path.lstat()
-    if not stat.S_ISREG(info.st_mode):
-        raise ValueError("绑定文件不是普通视频文件。")
-    with path.open("rb") as stream:
-        edge = edge_digest(stream, info.st_size)
-    return {"device": info.st_dev, "inode": info.st_ino, "size": info.st_size,
-            "modifiedNs": info.st_mtime_ns, "edgeHash": edge}
+    return media_version(path)
 
 
 def ffprobe_file(path, ffmpeg_path):
@@ -1333,10 +1331,13 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
             if not path.is_file():
                 return "missing"
             info = path.stat()
-            key = (str(path), info.st_size, info.st_mtime_ns)
+            key = (str(path), info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
             digest = self.fingerprint_cache.get(key)
             if digest is None:
                 digest = _hash_file(path)
+                after = path.stat()
+                if fingerprint(after) != fingerprint(info) or after.st_ctime_ns != info.st_ctime_ns:
+                    raise ValueError('model_changed')
                 self.fingerprint_cache[key] = digest
             parts.append(digest)
         config = {"policy": POLICY_VERSION, "sampling": SAMPLING_VERSION, "files": parts,
@@ -1446,7 +1447,7 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
             if slot.get("state") in {"attention", "complete", "waiting", "submitting", "review", "queued", "uploading", "uploaded", "importing"}:
                 continue
             intervals[category] = int(settings[f"{category}IntervalSeconds"] if not settings.get("sharedSampling", True) else settings["sampleIntervalSeconds"])
-            fingerprints[category] = self._model_fingerprint(category)
+            fingerprints[category] = await finish_io(self._model_fingerprint, category)
         if '_analysisOwned' in item:
             stored = self.store.get('items', item['id']) or {}
             for category in intervals:
@@ -1579,6 +1580,16 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
             verified_media = bool(version and version.get('state') == 'saved' and version.get('sha256')
                                   and version.get('fileVersion') == item.get('fileVersion') and self.control.allowed(item))
         request['verifiedMedia'] = verified_media
+        fingerprints = {}
+        for category, positions in points.items():
+            if not positions:
+                continue
+            fingerprints[category] = await finish_io(self._model_fingerprint, category)
+            point = positions[0]
+            key = keys.get(category, {}).get(point)
+            if key and key != self._observation_key(item, category, point, fingerprints[category]):
+                raise ValueError('model_changed')
+        total = sum(len(values) for values in points.values())
         with self._read_lease(item["path"]):
             process = await asyncio.create_subprocess_exec(python, "-B", "-m", "app.slicing_worker",
                 stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
@@ -1587,7 +1598,7 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
             self.worker_process = process
             observations = 0
             failed = []
-            fingerprints = {category: self._model_fingerprint(category) for category in points}
+            saved_at = time.monotonic()
             try:
                 process.stdin.write((json.dumps(request, separators=(",", ":")) + "\n").encode())
                 await process.stdin.drain()
@@ -1610,9 +1621,10 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
                         item["analysisStage"] = event.get("stage")
                         if event.get('stage') == 'loading_model' and request.get('verifiedMedia'):
                             item['mediaVerifiedFileVersion'] = item.get('fileVersion')
-                        item["analysisTotal"] = sum(len(values) for values in points.values())
+                        item["analysisTotal"] = total
                         item["analysisDone"] = 0
                         self._save_analysis_item(item)
+                        saved_at = time.monotonic()
                     elif kind == "observation":
                         category = event.get("category")
                         timestamp = round(float(event.get("time")), 6)
@@ -1629,9 +1641,12 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
                         self.store.save("observations", value)
                         record_decode_coverage(item, [value], metadata["duration"])
                         observations += 1
-                        item["progress"] = min(90, int(10 + 80 * observations / max(1, sum(len(v) for v in points.values()))))
+                        item["progress"] = min(90, int(10 + 80 * observations / max(1, total)))
                         item.update(analysisDone=observations, analysisPosition=timestamp)
-                        self._save_analysis_item(item)
+                        now = time.monotonic()
+                        if observations == total or value['code'] == 'decode_unavailable' or now - saved_at >= .5:
+                            self._save_analysis_item(item)
+                            saved_at = now
                     elif kind == "error":
                         failed.append({"category": event.get("category", "both"), "code": event.get("code", "inference_failed"),
                                        "stage": event.get("stage", "sampling"), "time": event.get("time")})
@@ -3020,7 +3035,7 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
             current = self.store.get("items", item["id"]) or item
             if getattr(self, "control", None) and not self.control.allowed(current):
                 return
-            await self._export_category(item, category_name)
+            await self._export_category(current, category_name)
 
     async def _export_category(self, item, category_name):
         key = (item["id"], category_name)
@@ -3041,18 +3056,34 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
         self._checked_output_directory(image_dir)
         if any(os.path.lexists(image_dir / name) for name in names) or os.path.lexists(archive):
             raise ValueError("output_conflict")
-        image_dir.mkdir(parents=True, exist_ok=True)
+        folder.mkdir(parents=True, exist_ok=True)
         versions = {}
-        for name, blob in zip(names, frames):
-            with (image_dir / name).open("xb") as output:
-                output.write(blob)
-                output.flush()
-                versions[name] = fingerprint(os.fstat(output.fileno()))
         from .media import publish_file
         with tempfile.TemporaryDirectory(dir=folder, prefix=".simple-export-") as temporary:
             prepared = Path(temporary) / archive.name
+            # Build the complete archive before creating visible photos. On a
+            # later failure only roll back files that this attempt created.
             write_image_archive(prepared, names, frames)
-            publish_file(prepared, archive)
+            image_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                for name, blob in zip(names, frames, strict=True):
+                    with (image_dir / name).open("xb") as output:
+                        try:
+                            output.write(blob)
+                            output.flush()
+                        finally:
+                            versions[name] = fingerprint(os.fstat(output.fileno()))
+                publish_file(prepared, archive)
+            except BaseException:
+                for name, version in versions.items():
+                    path = image_dir / name
+                    try:
+                        info = path.lstat()
+                        if stat.S_ISREG(info.st_mode) and fingerprint(info) == version:
+                            path.unlink()
+                    except OSError:
+                        pass
+                raise
         archive_version = source_fingerprint(archive)
         return {"imageVersions": versions, "fileVersion": archive_version, "size": archive_version["size"]}
 
@@ -3074,18 +3105,6 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
         category = item["categories"].get(category_name, {})
         if category.get("state") not in {"ready", "waiting_slot"} or category.get("packageId"):
             return
-        existing = None if item.get("collectionRecovery") or item.get('localWorkspace') else self.packages.store.find(
-            str(item["sourceDatasetId"]), item.get("sourceVideoId"), category_name)
-        if not existing and item.get("path"):
-            version = await asyncio.to_thread(source_fingerprint, Path(item["path"]))
-            existing = self.packages.store.find_video(item["path"], version, category_name)
-        if existing:
-            category.update(packageId=existing["id"], imageCount=existing.get("imageCount"),
-                            state=existing.get("state", "queued"), actualImages=existing.get("actualImages"),
-                            errorCode=existing.get("errorCode", ""),
-                            message=existing.get("message") or "已有这个视频的切片压缩包，未重复导出。")
-            self._save_export_progress(item, category_name)
-            return
         intervals, seconds = category.get("intervals") or [], category.get("intervalSeconds")
         if not intervals or not seconds:
             category.update(state="no_target", message="未检出目标")
@@ -3097,15 +3116,28 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
             return
         try:
             cancelled_after_publish = False
-            source_before = await asyncio.to_thread(source_version, item["path"])
+            source_before = await finish_io(source_version, item["path"])
             if source_before != item.get("fileVersion"):
-                raise ValueError("local_video_changed")
+                raise ValueError('source_changed')
+            file_identity = {key: source_before[key] for key in ('device', 'inode', 'size', 'modifiedNs')}
+            existing = self.packages.store.find_video(item['path'], source_before, category_name)
+            if not existing and not (item.get('collectionRecovery') or item.get('localWorkspace')):
+                existing = self.packages.store.find(str(item['sourceDatasetId']), item.get('sourceVideoId'), category_name)
+                if existing:
+                    raise ValueError('package_source_mismatch')
+            if existing:
+                category.update(packageId=existing['id'], imageCount=existing.get('imageCount'),
+                    state=existing.get('state', 'queued'), actualImages=existing.get('actualImages'),
+                    errorCode=existing.get('errorCode', ''),
+                    message=existing.get('message') or '已有这个视频的切片压缩包，未重复导出。')
+                self._save_export_progress(item, category_name)
+                return
             points = slice_timestamps(intervals, seconds)
             if category_name == "magnet":
                 recognized = await self._recognized_magnet_frames(item, points)
                 if not recognized:
                     if await asyncio.to_thread(source_version, item["path"]) != source_before:
-                        raise ValueError("local_video_changed")
+                        raise ValueError('source_changed')
                     samples = item.get("lastMagnetExportSamples") or []
                     usable = any(row.get("code") != "decode_unavailable" for row in samples)
                     outcome = "no_target" if usable else "no_usable_frames"
@@ -3132,7 +3164,7 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
                         export_points.append(stamp)
                 if not frames:
                     if await asyncio.to_thread(source_version, item["path"]) != source_before:
-                        raise ValueError("local_video_changed")
+                        raise ValueError('source_changed')
                     evidence = [{"time": stamp, "code": "decode_unavailable"} for stamp in points]
                     category.update(state="uncuttable", errorCode="", endReason="no_usable_frames",
                         processingConclusion=processing_conclusion(item, evidence, "no_usable_frames"),
@@ -3152,7 +3184,7 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
             if managed:
                 archive = folder / '压缩包.zip'
             if await asyncio.to_thread(source_version, item["path"]) != source_before:
-                raise ValueError("local_video_changed")
+                raise ValueError('source_changed')
             publishing = asyncio.create_task(asyncio.to_thread(
                 self._publish_export_files, folder, image_dir, archive, names, frames))
             try:
@@ -3163,7 +3195,10 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
                 output_receipts = await publishing
                 cancelled_after_publish = True
         except (OSError, RuntimeError, ValueError) as error:
-            code = str(error) if str(error) in ERROR_TEXT else "frame_extract_failed"
+            code = ('output_conflict' if isinstance(error, FileExistsError) else
+                    'output_disk_full' if getattr(error, 'errno', None) == errno.ENOSPC else
+                    'source_changed' if getattr(error, 'errno', None) == errno.ESTALE else
+                    str(error) if str(error) in ERROR_TEXT else 'frame_extract_failed')
             if code == 'frame_io_error':
                 category.update(state='waiting_connection', errorCode='', waitCode=code,
                     waitStage='export', retryNotBefore=self.clock() + 30,
@@ -3182,7 +3217,7 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
                   "sourceIdentity": item.get("sourceIdentity", ""),
                   "itemId": item["id"], "videoPath": item.get("path", ""), "name": archive.name,
                   "path": str(archive), "imageDir": str(image_dir),
-                  "videoFileVersion": {key: source_before[key] for key in ("device", "inode", "size", "modifiedNs")},
+                  "videoFileVersion": file_identity,
                   **output_receipts, "images": names, "exportIdentity": export_identity,
                   "imageCount": len(names), "bytes": 0, "retries": 0,
                   "state": "review" if review else "queued",

@@ -95,6 +95,70 @@ def manager(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_photo_write_failure_rolls_back_only_owned_files_and_allows_retry(manager, tmp_path, monkeypatch):
+    import errno
+    from tests.test_slicing_performance import close_app
+
+    app, slicing = manager
+    item = ready_item(tmp_path)
+    slicing.store.save('items', item)
+    folder = package_directory(item['path'], 'bed', output_root=slicing.slice_output_directory(),
+                               video_id=item['sourceVideoId'])
+    photo_dir = folder / 'image'
+    photo_dir.mkdir(parents=True)
+    unrelated = photo_dir / 'unregistered.jpg'
+    unrelated.write_bytes(b'user-photo')
+    native_open = Path.open
+    attempts = []
+
+    def interrupted_open(path, mode='r', *args, **kwargs):
+        if mode == 'xb' and path.parent == photo_dir:
+            attempts.append(path)
+            if len(attempts) == 2:
+                raise OSError(errno.ENOSPC, 'test disk full')
+        return native_open(path, mode, *args, **kwargs)
+
+    try:
+        with monkeypatch.context() as scoped:
+            scoped.setattr(Path, 'open', interrupted_open)
+            await slicing._export_category(slicing.store.get('items', item['id']), 'bed')
+        current = slicing.store.get('items', item['id'])
+        assert current['categories']['bed']['errorCode'] == 'output_disk_full'
+        assert list(photo_dir.iterdir()) == [unrelated] and unrelated.read_bytes() == b'user-photo'
+        assert not list(folder.glob('*.zip')) and not slicing.packages.store.list('items')
+        current['categories']['bed'].update(state='ready', errorCode='')
+        slicing.store.save('items', current)
+        await slicing._export_category(current, 'bed')
+        package, = slicing.packages.store.list('items')
+        assert package['imageCount'] == 3 and Path(package['path']).is_file()
+    finally:
+        await close_app(app)
+
+
+@pytest.mark.asyncio
+async def test_export_does_not_reuse_package_for_replaced_file_at_same_path(manager, tmp_path):
+    from app.audit_moves import source_fingerprint
+    from tests.test_slicing_performance import close_app
+
+    app, slicing = manager
+    item = ready_item(tmp_path)
+    item['collectionRecovery'] = True
+    slicing.store.save('items', item)
+    path = Path(item['path'])
+    path.write_bytes(b'new video now at the same path')
+    slicing.packages.store.save('items', {'id': 'another-version', 'videoPath': str(path),
+        'videoFileVersion': source_fingerprint(path), 'category': 'bed', 'state': 'complete', 'imageCount': 12})
+    try:
+        await slicing._export_category(item, 'bed')
+        slot = slicing.store.get('items', item['id'])['categories']['bed']
+        assert slot['state'] == 'attention' and slot['errorCode'] == 'source_changed'
+        assert not slot.get('packageId')
+        assert slicing.packages.store.get('items', 'another-version')['state'] == 'complete'
+    finally:
+        await close_app(app)
+
+
+@pytest.mark.asyncio
 async def test_export_shutdown_registers_finished_output_before_releasing_the_source(manager, tmp_path, monkeypatch):
     import asyncio
     import threading

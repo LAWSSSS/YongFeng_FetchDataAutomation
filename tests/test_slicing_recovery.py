@@ -149,6 +149,28 @@ async def test_a_worker_failure_only_changes_the_requested_category_and_keeps_po
 
 
 @pytest.mark.asyncio
+async def test_changed_model_cache_key_does_not_launch_a_worker(tmp_path, monkeypatch):
+    app = create_app(data_dir=tmp_path / 'data')
+    manager = app.state.slicing
+    item = item_fixture(tmp_path, state='pending')
+    manager.store.save('items', item)
+    manager.store.settings['workerPythonPath'] = sys.executable
+    monkeypatch.setattr(manager, '_model_fingerprint', lambda _: 'changed-model')
+    key = manager._observation_key(item, 'bed', 0, 'original-model')
+
+    async def unexpected_spawn(*args, **kwargs):
+        pytest.fail('a changed model must not write to the original model cache')
+
+    monkeypatch.setattr(asyncio, 'create_subprocess_exec', unexpected_spawn)
+    try:
+        with pytest.raises(ValueError, match='model_changed'):
+            await manager._run_worker(item, item['metadata'], {'bed': [0]}, {'bed': {0: key}}, 'initial')
+        assert not manager.worker_processes and not manager.store.list('observations')
+    finally:
+        await close_app(app)
+
+
+@pytest.mark.asyncio
 async def test_silent_incomplete_worker_output_is_not_approved_or_no_target(tmp_path, monkeypatch):
     app = create_app(data_dir=tmp_path / "data"); manager = app.state.slicing
     item = item_fixture(tmp_path, state="pending"); manager.store.save("items", item)

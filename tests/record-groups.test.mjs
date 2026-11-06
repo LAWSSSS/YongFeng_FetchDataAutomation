@@ -14,6 +14,12 @@ test('withdrawal never appears as a waiting platform download', () => {
   assert.equal(videoCategory(row), 'review');
 });
 
+test('terminating a capture belongs to cleanup, without a download action', () => {
+  const row = video('stopping', 'j', 'terminating');
+  assert.equal(videoCategory(row), 'deleting');
+  assert.equal(canDownload(row), false);
+});
+
 test('independent same-day submissions share one grid; cross-midnight items keep their real day',()=>{
   const records=[video('a','one','ready',{submittedAt:'2026-11-03T02:00:00Z'}),
     video('b','two','ready'),video('c','three','ready'),
