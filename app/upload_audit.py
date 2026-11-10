@@ -211,6 +211,15 @@ class AthenaClient:
             self.availability.unavailable()
             raise AuditError("无法连接视觉AI平台，请检查网络。", "network") from None
         self.availability.received()
+        if path == "auth/token/refresh/" and response.status_code == 400:
+            try:
+                data = response.json()
+            except ValueError:
+                data = None
+            # Athena reports an invalid or expired refresh token as HTTP 400
+            # with code 10002, rather than the usual HTTP 401.
+            if isinstance(data, dict) and str(data.get("code")) == "10002":
+                raise AuditError("视觉AI平台登录已失效，请重新连接。", "auth", 401)
         return self.unpack(response)
 
     async def login(self, account, password):
@@ -355,6 +364,8 @@ class AthenaClient:
         if not self.connected:
             raise AuditError("请先连接视觉AI平台。", "auth", 401)
         for attempt in range(3):
+            if not self.connected:
+                raise AuditError("视觉AI平台登录已失效，请重新连接。", "auth", 401)
             token = self.access
             generation = self.session_generation
             try:

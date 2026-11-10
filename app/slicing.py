@@ -2210,6 +2210,8 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
 
     async def connection_restored(self):
         """Resume an enabled queue once the shared platform client reconnects."""
+        if self.auth.connected:
+            self.packages.connection_restored()
         if self.store.settings.get("enabled") and self.auth.connected:
             if self.run and self.run.get("state") in {"waiting_connection", "interrupted"}:
                 self.run.update(state="running", message="平台已连接，先核对任务状态再继续切片队列。")

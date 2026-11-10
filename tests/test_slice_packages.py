@@ -1,3 +1,4 @@
+import sqlite3
 import zipfile
 from pathlib import Path
 
@@ -5,6 +6,7 @@ import pytest
 
 from app.main import create_app
 from app.slice_export import package_directory, photo_names, slice_timestamps
+from app.slice_packages import SlicePackageManager
 from app.upload_audit import name_key
 
 
@@ -69,6 +71,17 @@ class Remote:
 class ImmediateWorker:
     async def run(self, item, credentials, callback, operation="upload"):
         await callback({"event": "complete", "size": item["size"], "etag": "etag"})
+
+
+@pytest.mark.parametrize('field', ['localCleanupState', 'cleanupState'])
+def test_legacy_cleanup_message_matches_completed_status(field):
+    with sqlite3.connect(':memory:') as db:
+        manager = SlicePackageManager(db, Remote())
+        original = {'id': 'cleaned', 'dataset': '27892', 'category': 'bed', 'state': 'complete',
+                    field: 'complete', 'cleanupMessage': '照片已导入，等待手动清理。'}
+        manager.store.save('items', original)
+        assert manager.state()['items'][0]['cleanupMessage'] == '本地照片和压缩包已清理。'
+        assert manager.store.get('items', 'cleaned')['cleanupMessage'] == original['cleanupMessage']
 
 
 def ready_item(tmp_path, identity="1"):

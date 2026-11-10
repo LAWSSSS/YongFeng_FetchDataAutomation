@@ -9,7 +9,7 @@ from app.upload_audit import AthenaClient, AuditError
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('old_status', [200, 401])
+@pytest.mark.parametrize('old_status', [200, 400, 401])
 async def test_late_saved_restore_cannot_overwrite_manual_login_or_delete_new_credentials(monkeypatch, old_status):
     entered, release = asyncio.Event(), asyncio.Event()
     saved = {'refresh': 'fixture-stored', 'user': 'previous'}
@@ -19,6 +19,8 @@ async def test_late_saved_restore_cannot_overwrite_manual_login_or_delete_new_cr
         if request.url.path.endswith('/token/refresh/'):
             entered.set()
             await release.wait()
+            if old_status == 400:
+                return httpx.Response(400, json={'code': 10002, 'message': 'Token is invalid', 'data': None})
             return httpx.Response(old_status, json={'data': {'access': 'fixture-old', 'refresh': 'fixture-old-rotated'}})
         return httpx.Response(200, json={'data': {'access': 'fixture-new', 'refresh': 'fixture-new-refresh'}})
 
@@ -37,6 +39,65 @@ async def test_late_saved_restore_cannot_overwrite_manual_login_or_delete_new_cr
         assert not deleted and client.saved_connection
     finally:
         release.set()
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_expired_saved_refresh_reported_as_disconnected(monkeypatch):
+    saved = {'refresh': 'expired-fixture', 'user': 'fixture'}
+    monkeypatch.setattr('app.upload_audit.secure_store.load_connection', lambda: dict(saved) if saved else None)
+    monkeypatch.setattr('app.upload_audit.secure_store.delete_connection', saved.clear)
+    client = AthenaClient(httpx.MockTransport(lambda request: httpx.Response(
+        400, json={'code': 10002, 'message': 'Token is invalid', 'data': None})), persist_connection=True)
+    try:
+        assert not await client.restore_saved_connection()
+        assert not client.connected and not client.saved_connection and not saved
+        assert '过期' in client.connection_warning
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_other_refresh_400_preserves_saved_session_for_later_recovery(monkeypatch):
+    saved = {'refresh': 'fixture-refresh', 'user': 'fixture'}
+    monkeypatch.setattr('app.upload_audit.secure_store.load_connection', lambda: dict(saved))
+    monkeypatch.setattr('app.upload_audit.secure_store.delete_connection', saved.clear)
+    client = AthenaClient(httpx.MockTransport(lambda request: httpx.Response(
+        400, json={'code': 10003, 'message': 'other rejection', 'data': None})), persist_connection=True)
+    try:
+        assert not await client.restore_saved_connection()
+        assert not client.connected and client.saved_connection
+        assert saved['refresh'] == 'fixture-refresh'
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_expired_requests_both_wait_for_login_without_empty_bearer():
+    reads = 0
+    both_started = asyncio.Event()
+    headers = []
+
+    async def handler(request):
+        nonlocal reads
+        if request.method == 'GET':
+            headers.append(request.headers.get('authorization'))
+            reads += 1
+            if reads == 2:
+                both_started.set()
+            await both_started.wait()
+            return httpx.Response(401)
+        return httpx.Response(400, json={'code': 10002, 'message': 'Token is invalid', 'data': None})
+
+    client = AthenaClient(httpx.MockTransport(handler), persist_connection=False)
+    client.access, client.refresh = 'fixture-access', 'fixture-expired-refresh'
+    try:
+        outcomes = await asyncio.gather(client.get_slicing('devel/datasets/'),
+                                        client.get_slicing('devel/datasets/'), return_exceptions=True)
+        assert all(isinstance(error, AuditError) and error.code == 'auth' for error in outcomes)
+        assert headers == ['Bearer fixture-access', 'Bearer fixture-access']
+        assert not client.connected
+    finally:
         await client.close()
 
 

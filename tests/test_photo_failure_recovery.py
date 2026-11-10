@@ -3,6 +3,7 @@ import asyncio
 import copy
 import sqlite3
 
+import httpx
 import pytest
 
 from app.audit_moves import source_fingerprint
@@ -29,6 +30,61 @@ def bound_job():
 def valid_rows():
     return [{'id': '1', 'name': 'sample_001.jpg', 'taskId': '701'},
             {'id': '2', 'name': 'sample_002.jpg', 'taskId': '701'}]
+
+
+@pytest.mark.asyncio
+async def test_expired_refresh_keeps_photo_upload_queued_without_using_retry_budget(tmp_path):
+    from app.upload_audit import AthenaClient
+    from app.upload_remote import UploadRemote
+
+    calls = []
+    def handler(request):
+        calls.append((request.method, request.url.path))
+        if request.url.path.endswith('/token/refresh/'):
+            return httpx.Response(400, json={'code': 10002, 'message': 'Token is invalid', 'data': None})
+        return httpx.Response(401)
+
+    client = AthenaClient(httpx.MockTransport(handler), persist_connection=False)
+    client.access, client.refresh = 'expired-access', 'expired-refresh'
+    with sqlite3.connect(':memory:') as db:
+        manager = SlicePackageManager(db, UploadRemote(client))
+        item = package(tmp_path, state='queued')
+        for key in ('jobId', 'keys', 'object'):
+            item.pop(key)
+        item['retries'] = 2
+        manager.store.save('items', item)
+        try:
+            await manager.upload_one(item['id'])
+            current = manager.store.get('items', item['id'])
+            assert current['state'] == 'queued' and current['errorCode'] == 'auth'
+            assert current['retries'] == 2 and not current.get('object')
+            assert not client.connected
+            assert [method for method, _ in calls] == ['GET', 'GET', 'POST']
+        finally:
+            await manager.shutdown()
+            await client.close()
+
+
+def test_photo_reconnect_wakes_only_auth_waiters_without_overriding_pause(tmp_path):
+    with sqlite3.connect(':memory:') as db:
+        manager = SlicePackageManager(db, Remote(), clock=lambda: 100)
+        waiting = package(tmp_path, state='queued')
+        waiting.update(errorCode='auth', nextAttempt=130, retries=2)
+        manager.store.save('items', waiting)
+        other = {**waiting, 'id': 'other', 'errorCode': 'network', 'nextAttempt': 130}
+        manager.store.save('items', other)
+        attention = {**waiting, 'id': 'attention', 'state': 'attention', 'errorCode': 'file_changed'}
+        manager.store.save('items', attention)
+        manager.pause()
+        manager.wake.clear()
+        manager.target_next_check['27892'] = 130
+        manager.connection_restored()
+        current = manager.store.get('items', waiting['id'])
+        assert current['state'] == 'queued' and current['nextAttempt'] == 0 and current['retries'] == 2
+        assert not current['errorCode'] and manager.wake.is_set() and manager.paused
+        assert manager.store.get('items', other['id'])['nextAttempt'] == 130
+        assert manager.store.get('items', attention['id'])['state'] == 'attention'
+        assert not manager.target_next_check
 
 
 @pytest.mark.asyncio

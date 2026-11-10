@@ -185,6 +185,14 @@ class SlicePackageManager:
         self.wake.set()
         self.target_next_check.clear()
 
+    def connection_restored(self):
+        for item in self.store.list('items'):
+            if item.get('state') == 'queued' and item.get('errorCode') == 'auth':
+                item.update(nextAttempt=0, errorCode='', reasonCode='', message='平台已连接，等待上传。')
+                self._save(item)
+        self.target_next_check.clear()
+        self.wake.set()
+
     def state(self, summary=False, item_ids=None):
         # Summary polling never deserializes image inventories or submission
         # snapshots. Detail callers can request only their visible source IDs.
@@ -223,6 +231,9 @@ class SlicePackageManager:
         if summary:
             fields = {'id', 'itemId', 'category', 'state'}
         public = [{key: value for key, value in item.items() if key in fields} for item in items]
+        for item in public:
+            if item.get('localCleanupState') == 'complete' or item.get('cleanupState') == 'complete':
+                item['cleanupMessage'] = '本地照片和压缩包已清理。'
         if not summary:
             for target in targets:
                 target["items"] = [item for item in public if item.get("dataset") == target["id"]]

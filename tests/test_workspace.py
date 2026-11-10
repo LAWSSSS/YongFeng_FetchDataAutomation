@@ -303,6 +303,8 @@ async def test_verified_cleanup_exact_manifest_and_tombstones(env, tmp_path):
     assert w.rows('assets')[0]['cleanup']['state'] == 'complete'
     assert all(i.get('localCleanupState') == 'complete' for i in w.slicing.store.list('items'))
     assert all(p.get('localCleanupState') == 'complete' for p in w.slicing.packages.store.list('items'))
+    assert all(p.get('cleanupMessage') == '本地照片和压缩包已清理。'
+               for p in w.slicing.packages.store.list('items'))
     await w.reconcile()
     assert len(w.rows('assets')) == 1
     assert not list(w.root.rglob('*.jpg')) and not list(w.root.rglob('*.zip'))

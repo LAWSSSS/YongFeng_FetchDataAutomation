@@ -114,10 +114,11 @@ export function VisualConnection() {
   const refresh=useCallback(async()=>{await reads.current.run('visual-connection',async context=>{try {const value=await request<State>('?summary=true',undefined,context.signal);if(context.current()){setStatus(value);setError('');}}
     catch(failure){if(context.current()&&!cancelledRead(failure))setError((failure as Error).message);}});},[]);
   useEffect(()=>{void refresh();return()=>reads.current.cancel();},[refresh]);
+  usePolling(refresh,15000,{immediate:false});
   const connection=platformStatus(status?.availability,status?.connected);
   return <div className="login-card"><div className="login-title"><strong>视觉AI平台</strong>
     <span className={connection.connected?'dot connected':'dot'}/>{!status?'读取连接中':connection.label}{connection.authenticated&&status?.user?` · ${status.user}`:''}</div>
-    {status&&!connection.authenticated&&<SliceLogin onConnected={value=>setStatus(value)}/>}
+    {status&&!connection.authenticated&&<SliceLogin onConnected={value=>{reads.current.cancel();setStatus(value);setError('');}}/>}
     {error&&<p className="error" role="alert">{error} <button className="link" onClick={()=>void refresh()}>重新读取</button></p>}</div>;
 }
 

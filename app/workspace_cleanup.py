@@ -183,6 +183,7 @@ def public_operation(request, assets=()):
     for row in request.get('assets', []):
         progress = file_progress(row.get('manifest', []))
         journal = (indexed.get(row['id']) or {}).get('cleanup') or {}
+        deleted_archives = None
         if journal.get('requestId') == request['id']:
             # Older requests stored a count, while their per-file deletion
             # receipts live in the asset journal. Project those exact receipts
@@ -194,13 +195,23 @@ def public_operation(request, assets=()):
                 deleted = receipt.get('state') == 'deleted' and receipt.get('expected') == entry.get('expected')
                 manifest.append({**entry, 'state': 'deleted' if deleted else entry.get('state')})
             progress = file_progress(manifest)
+            deleted_archives = sum(entry.get('kind') == 'archive' and entry.get('state') == 'deleted'
+                                   for entry in manifest)
         else:
+            manifest_deleted = progress['deletedFiles']
             progress = {key: row.get(key, value) for key, value in progress.items()}
+            if row.get('state') == 'complete':
+                deleted_archives = sum(entry.get('kind') == 'archive' for entry in row.get('manifest', []))
+            elif progress['deletedFiles'] == manifest_deleted:
+                deleted_archives = sum(entry.get('kind') == 'archive' and entry.get('state') == 'deleted'
+                                       for entry in row.get('manifest', []))
         result['assets'].append({key: row.get(key) for key in (
             'id', 'name', 'state', 'message', 'reasonCode', 'currentName')} |
-            progress)
+            progress | {'deletedArchives': deleted_archives})
     for key in ('totalFiles', 'deletedFiles', 'deletedBytes', 'remainingBytes'):
         result[key] = sum(row[key] for row in result['assets'])
+    if all(row['deletedArchives'] is not None for row in result['assets']):
+        result['deletedArchives'] = sum(row['deletedArchives'] for row in result['assets'])
     waiting = next((row for row in result['assets'] if row.get('reasonCode') and row['state'] != 'complete'), {})
     result['reasonCode'] = waiting.get('reasonCode', '')
     current = next((row for row in result['assets'] if row.get('currentName') and row['state'] in {'running', 'deleting'}), waiting)
@@ -635,7 +646,8 @@ async def cleanup(manager, asset):
             item.update(localCleanupState='complete', localCleanupAt=journal['completedAt'])
             manager.slicing.store.save('items', item)
         for package in manager.packages(asset):
-            package.update(localCleanupState='complete', localCleanupAt=journal['completedAt'], cleanupState='complete')
+            package.update(localCleanupState='complete', localCleanupAt=journal['completedAt'],
+                           cleanupState='complete', cleanupMessage='本地照片和压缩包已清理。')
             manager.slicing.packages.store.save('items', package)
         for item in manager.uploads.store.list('items'):
             if item.get('path') == asset['path'] and compatible(asset['fileVersion'], item.get('fileVersion')):

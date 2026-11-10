@@ -222,8 +222,8 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
         async def restore_visual():
             restored = await upload_audit.client.restore_saved_connection()
             if restored:
+                await slicing.connection_restored()
                 slicing.wake.set()
-                slicing.packages.wake.set()
             return not restored and connection_waiting(upload_audit.client)
         for service, client in (("source", source), ("target", target)):
             connection_restorer.start(service, lambda service=service, client=client: restore_one(service, client))
