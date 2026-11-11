@@ -13,6 +13,9 @@ import time
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from app.local_instance import InstanceBusy, check_available
+
 DATA = ROOT / "数据" / "系统"
 DEFAULT_PORT = 8786
 
@@ -58,6 +61,10 @@ def run(action, preferred, explicit_port):
     if active:
         port, existing_output = active
     else:
+        try:
+            check_available()
+        except InstanceBusy as error:
+            raise SystemExit(str(error)) from None
         choices = (preferred,) if explicit_port else range(DEFAULT_PORT, DEFAULT_PORT + 20)
         port = next((candidate for candidate in choices if can_bind(candidate)), None)
         if port is None:

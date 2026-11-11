@@ -92,7 +92,7 @@ async def test_fresh_portable_workspace_keeps_derived_directories_and_can_save_s
 
 
 def test_launcher_never_reuses_another_program_even_on_same_port(monkeypatch):
-    monkeypatch.setattr(launcher.urllib.request, "build_opener", lambda *_: pytest.fail("must reject before network"))
+    monkeypatch.setattr(launcher.local_instance, "health_at", lambda *_: pytest.fail("must reject before network"))
     assert not launcher.verified_server({"pid": 8090, "port": 8786}, "isolated-profile")
     assert not launcher.verified_server({"bundleId": runtime.BUNDLE_ID, "profileId": "other",
         "instanceId": "x", "pid": 8090, "port": 8786}, "isolated-profile")
@@ -125,6 +125,7 @@ def test_source_launcher_skips_other_checkout_and_finds_its_own_nondefault_port(
     monkeypatch.setattr(local_service, "DATA", data)
     owned = set()
     monkeypatch.setattr(local_service, "can_bind", lambda port: port == 8787)
+    monkeypatch.setattr(local_service, "check_available", lambda: None)
 
     def launchctl(argv, **_):
         if argv[1] == "bootstrap":

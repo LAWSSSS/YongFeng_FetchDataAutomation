@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from functools import partial
 import hashlib
 import json
 import os
@@ -30,10 +31,11 @@ def verify_files(folder):
     print(f'Verified {len(manifest["files"])} packaged file checksums.')
 
 
-def invoke(folder, profile, *arguments):
+def invoke(folder, profile, *arguments, instance_dir):
     resources = folder / "采集助手.app/Contents/Resources"
     env = {key: value for key, value in os.environ.items() if not key.startswith(("PYTHON", "DYLD_", "LD_", "IVG_"))}
-    env.update(IVG_PROFILE_DIR=str(profile), PATH="/usr/bin:/bin", PYTHONNOUSERSITE="1")
+    env.update(IVG_PROFILE_DIR=str(profile), IVG_TEST_INSTANCE_DIR=str(instance_dir),
+               IVG_SKIP_SAVED_CONNECTIONS="1", PATH="/usr/bin:/bin", PYTHONNOUSERSITE="1")
     result = subprocess.run([str(resources / "runtime/backend/bin/python3.13"), "-I", "-B",
                              str(resources / "application/launcher.py"), *arguments],
                             env=env, cwd=folder, capture_output=True, text=True, timeout=100)
@@ -45,6 +47,7 @@ def invoke(folder, profile, *arguments):
 def smoke(folder):
     with tempfile.TemporaryDirectory(prefix="ivg-isolated-") as temporary:
         work = Path(temporary).resolve()
+        run = partial(invoke, instance_dir=work / "instance")
         profile = work / "独立数据 中文 空格"
         # An unrelated program already owning 8786 must survive launch and stop.
         blocker = socket.socket()
@@ -55,7 +58,7 @@ def smoke(folder):
             owns_blocker = True
         except OSError:
             blocker.close()  # The user's existing server already provides the conflict.
-        first = invoke(folder, profile, "launch", "--no-browser")
+        first = run(folder, profile, "launch", "--no-browser")
         try:
             assert first["port"] != 8786
             base = f'http://127.0.0.1:{first["port"]}'
@@ -64,15 +67,24 @@ def smoke(folder):
             assert Path(read(base + "/api/videos")["directory"]).is_relative_to(work / "数据")
             for endpoint in ("/api/session", "/api/uploads", "/api/slicing", "/api/workspace"):
                 assert isinstance(read(base + endpoint), dict), endpoint
-            second = invoke(folder, profile, "launch", "--no-browser")
+            second = run(folder, profile, "launch", "--no-browser")
             assert second["pid"] == first["pid"]
-            assert invoke(folder, profile, "stop")["stopped"]
+            other_profile = work / "另一个数据目录"
+            try:
+                run(folder, other_profile, "launch", "--no-browser")
+            except RuntimeError as error:
+                assert "另一份采集助手" in str(error)
+            else:
+                run(folder, other_profile, "stop")
+                raise AssertionError("A second profile started a duplicate backend.")
+            assert read(base + "/api/health")["pid"] == first["pid"]
+            assert run(folder, profile, "stop")["stopped"]
             assert not (profile / "server.json").exists()
-            assert not invoke(folder, profile, "stop")["stopped"]
+            assert not run(folder, profile, "stop")["stopped"]
             assert not (profile / "credentials/credentials.json").exists()
             print("Port conflict, empty profile, all API entries, repeat launch and safe stop passed.")
         finally:
-            invoke(folder, profile, "stop")
+            run(folder, profile, "stop")
             if owns_blocker:
                 assert blocker.getsockname()[1] == 8786
                 blocker.close()
@@ -80,7 +92,7 @@ def smoke(folder):
         moved = work / "改名后的应用 空格 中文"
         shutil.copytree(folder, moved, symlinks=True)
         moved = moved.resolve()
-        state = invoke(moved, profile, "launch", "--no-browser")
+        state = run(moved, profile, "launch", "--no-browser")
         try:
             base = f'http://127.0.0.1:{state["port"]}'
             data = read(base + "/api/slicing")
@@ -92,22 +104,22 @@ def smoke(folder):
             assert state["instanceId"] != first["instanceId"]
             print("Moved/renamed Chinese and space paths, retained profile and bundled path repair passed.")
         finally:
-            invoke(moved, profile, "stop")
+            run(moved, profile, "stop")
 
         # Moving the live application and its default profile preserves the
         # writer's lock inode. Reopening the moved bundle must replace that writer.
         live_profile = moved / '数据/系统'
-        live = invoke(moved, live_profile, 'launch', '--no-browser')
+        live = run(moved, live_profile, 'launch', '--no-browser')
         renamed = work / '运行中改名 中文'
         moved.rename(renamed)
         try:
-            reopened = invoke(renamed, renamed / '数据/系统', 'launch', '--no-browser')
+            reopened = run(renamed, renamed / '数据/系统', 'launch', '--no-browser')
             assert reopened['profileId'] == live['profileId']
             assert reopened['instanceId'] != live['instanceId']
             assert read(f'http://127.0.0.1:{reopened["port"]}/api/health')['pid'] == reopened['pid']
             print('Live folder rename restarts the same profile from its new path.')
         finally:
-            invoke(renamed, renamed / '数据/系统', 'stop')
+            run(renamed, renamed / '数据/系统', 'stop')
 
 
 PARITY_SCRIPT = '''

@@ -12,8 +12,6 @@ import socket
 import subprocess
 import sys
 import time
-import urllib.error
-import urllib.request
 from pathlib import Path
 from uuid import uuid4
 
@@ -21,6 +19,8 @@ BUNDLE_ID = "cn.yongfeng.video-gather.standalone"
 PROFILE_NAME = "InspectionVideoGatherStandalone"
 APP_ROOT = Path(__file__).resolve().parent
 RESOURCES = APP_ROOT.parent
+sys.path.insert(0, str(APP_ROOT if (APP_ROOT / "app").is_dir() else APP_ROOT.parent))
+from app import local_instance
 
 
 def private_json(path, value):
@@ -73,6 +73,8 @@ def environment(home, manifest, profile_id, instance_id):
                IVG_PACKAGE_ID=manifest["packageId"], PYTHONNOUSERSITE="1",
                PYTHONDONTWRITEBYTECODE="1",
                PATH=str(RESOURCES / "tools" / "bin") + ":/usr/bin:/bin:/usr/sbin:/sbin")
+    if isolated := local_instance.isolated_directory():
+        env.update(IVG_TEST_INSTANCE_DIR=str(isolated), IVG_SKIP_SAVED_CONNECTIONS="1")
     return env
 
 
@@ -83,17 +85,9 @@ def verified_server(state, profile_id, package_id=None):
             or not isinstance(state.get("port"), int) or not 1 <= state["port"] <= 65535
             or not state.get("instanceId") or (package_id and state.get("packageId") != package_id)):
         return False
-    try:
-        # A local request must never follow a proxy or redirect to another host.
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        with opener.open(f'http://127.0.0.1:{state["port"]}/api/health', timeout=1) as response:
-            if response.geturl() != f'http://127.0.0.1:{state["port"]}/api/health':
-                return False
-            actual = json.load(response)
-        return actual.get("ok") is True and all(actual.get(key) == state.get(key) for key in
-                   ("bundleId", "profileId", "instanceId", "packageId", "pid"))
-    except (OSError, ValueError, urllib.error.URLError):
-        return False
+    actual = local_instance.health_at(state["port"])
+    return bool(actual) and all(actual.get(key) == state.get(key) for key in
+                               ("bundleId", "profileId", "instanceId", "packageId", "pid"))
 
 
 def open_browser(port, disabled=False):
@@ -152,7 +146,7 @@ def launch(no_browser=False):
     home, profile_id = prepare_profile()
     with lock(home / "launch.lock"):
         state = read_json(home / "server.json")
-        if verified_server(state, profile_id):
+        if verified_server(state, profile_id) and server_locked(home):
             # Updates must be explicitly restarted, not started over an old writer.
             if state.get("packageId") != manifest["packageId"]:
                 raise RuntimeError("旧版采集助手仍在运行，请先使用旧版的停止入口，再打开新版。进度会保留。")
@@ -167,6 +161,7 @@ def launch(no_browser=False):
                 raise RuntimeError("正在停止移动前的后台，请稍后再次打开。")
         if server_locked(home):
             raise RuntimeError("采集助手正在启动、忙碌或安全停止中，请稍后再打开；未创建第二个后台实例。")
+        local_instance.check_available()
         instance_id = uuid4().hex
         executable = RESOURCES / "runtime" / "backend" / "bin" / "python3.13"
         logs = home / "logs"
@@ -187,6 +182,7 @@ def launch(no_browser=False):
                 open_browser(state["port"], no_browser)
                 return state
             if child.poll() is not None:
+                local_instance.check_available()
                 raise RuntimeError("采集助手启动失败。请在应用旁打开“数据 → 系统 → logs”，查看 service.log。")
             time.sleep(0.25)
         raise RuntimeError("采集助手仍在启动，请稍后再次打开。原程序不会被停止。")
@@ -195,8 +191,7 @@ def launch(no_browser=False):
 def serve(instance_id):
     home = profile()
     # The parent holds launch.lock until health is ready; do not take it here.
-    with lock(home / "server.lock", blocking=False):
-        sys.path.insert(0, str(APP_ROOT))
+    with local_instance.backend_instance(), lock(home / "server.lock", blocking=False):
         import uvicorn
         from app.main import create_app
         from app.runtime import identity
@@ -229,6 +224,8 @@ def stop():
                 return {"stopped": False, "retry": True,
                         "message": "已有实例运行但无法核实为本包，请稍后重试或使用运行版本的停止入口。"}
             return {"stopped": False, "message": "本包没有正在运行的实例。"}
+        if not server_locked(home):
+            return {"stopped": False, "message": "这个数据目录没有运行中的后台。"}
         if stop_server(home, state):
             return {"stopped": True}
         return {"stopped": False, "retry": True, "message": "正在等待当前写入安全结束，请稍后重试停止。"}

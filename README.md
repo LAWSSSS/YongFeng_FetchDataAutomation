@@ -8,13 +8,13 @@
 
 适用于 **Apple 芯片 Mac（M 系列）和 macOS 14 或更新版本**。可以在苹果菜单的「关于本机」查看芯片和系统版本。
 
-1. 下载 Mac 完整版。完整包包含运行环境、视频工具和识别模型。 [下载 Mac 完整版 ZIP](https://github.com/LAWSSSS/YongFeng_FetchDataAutomation/releases/download/v1.3.9/gather-assistant-1.3.9-macos-arm64.zip)
+1. 下载 Mac 完整版。完整包包含运行环境、视频工具和识别模型。 [下载 Mac 完整版 ZIP](https://github.com/LAWSSSS/YongFeng_FetchDataAutomation/releases/download/v1.3.10/gather-assistant-1.3.10-macos-arm64.zip)
 2. 在访达的「下载」文件夹双击 ZIP，把解压出来的 **采集助手-Mac-arm64** 整个文件夹移到「文稿」或其他可写位置。
 3. 双击文件夹里的 **采集助手**。浏览器自动打开后，页面上方会显示 **日期采集、视频确认、处理结果、设置**。以后也可双击应用回到网页。
 
 ### 首次启动遇到 macOS 提示
 
-首次打开时，macOS 可能提示「无法验证开发者」或「Apple 无法检查是否包含恶意软件」。确认 ZIP 来自可信的 GitHub 发布页后，打开 **系统设置 → 隐私与安全性**，找到采集助手，点击 **仍要打开**，按系统提示确认。公司管理的 Mac 若没有该按钮，请联系 IT。 [GitHub 发布页](https://github.com/LAWSSSS/YongFeng_FetchDataAutomation/releases/tag/v1.3.9) · [Apple 的打开说明](https://support.apple.com/zh-cn/102445)
+首次打开时，macOS 可能提示「无法验证开发者」或「Apple 无法检查是否包含恶意软件」。确认 ZIP 来自可信的 GitHub 发布页后，打开 **系统设置 → 隐私与安全性**，找到采集助手，点击 **仍要打开**，按系统提示确认。公司管理的 Mac 若没有该按钮，请联系 IT。 [GitHub 发布页](https://github.com/LAWSSSS/YongFeng_FetchDataAutomation/releases/tag/v1.3.10) · [Apple 的打开说明](https://support.apple.com/zh-cn/102445)
 
 ## 2. 连接工作平台
 
@@ -82,11 +82,13 @@
 - **停止**。在程序文件夹里双击 **停止采集助手**。准备拔下外置盘或移动程序时，先停止后台。
 - **升级**。先停止旧版并备份旁边的 **数据** 文件夹。把新版解压到一个新文件夹，将备份的 **数据** 复制到新版应用旁，然后打开新版。继续使用外置盘时，启动前先接上原盘。
 
+同一个 macOS 账户一次运行一份采集助手。再次打开同一安装会回到当前网页。切换安装目录、版本或源码版前，先停止原后台。仅关闭浏览器、移走应用或把应用放进废纸篓，后台仍可能继续运行。
+
 ## 5. 遇到问题时
 
 | 现象 | 先做什么 |
 | --- | --- |
-| GitHub 下载显示 404 | 请从发布页重新下载，或检查网络连接。 [GitHub 发布页](https://github.com/LAWSSSS/YongFeng_FetchDataAutomation/releases/tag/v1.3.9) |
+| GitHub 下载显示 404 | 请从发布页重新下载，或检查网络连接。 [GitHub 发布页](https://github.com/LAWSSSS/YongFeng_FetchDataAutomation/releases/tag/v1.3.10) |
 | 解压后看到「启动简易版.command」 | 这是源码包。日常使用请下载 **Mac 完整版 ZIP**，解压后双击「采集助手」。 |
 | 浏览器没有打开 | 再双击「采集助手」。若弹窗给出以 `127.0.0.1` 开头的本机地址，把它粘贴到浏览器地址栏。 |
 | 应用提示已损坏 | 从发布页重新下载 ZIP 并完整解压。如果提示仍出现，记录提示文字以便排查。 |
@@ -104,4 +106,4 @@
 
 源码版需要 Python 3.13 和 Node.js 22.13 或更新版本。在源码目录打开终端并运行 `zsh ./启动简易版.command`，停止时运行 `zsh ./启动简易版.command stop`。
 
-源码版的照片识别还需要 Python 3.11、FFmpeg、ffprobe 和模型包。将模型 ZIP 放到源码目录，运行 `zsh ./启动简易版.command setup-models ./models-v1.zip`，再重启应用。 [下载 models-v1.zip](https://github.com/LAWSSSS/YongFeng_FetchDataAutomation/releases/download/v1.3.9/models-v1.zip)
+源码版的照片识别还需要 Python 3.11、FFmpeg、ffprobe 和模型包。将模型 ZIP 放到源码目录，运行 `zsh ./启动简易版.command setup-models ./models-v1.zip`，再重启应用。 [下载 models-v1.zip](https://github.com/LAWSSSS/YongFeng_FetchDataAutomation/releases/download/v1.3.10/models-v1.zip)

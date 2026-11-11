@@ -4,6 +4,7 @@ import hashlib
 import mimetypes
 import os
 import re
+import sys
 import zipfile
 from contextlib import asynccontextmanager
 from contextlib import AsyncExitStack, ExitStack
@@ -1468,5 +1469,11 @@ def create_app(source: RemoteClient | None = None, target: RemoteClient | None =
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(create_app(), host="127.0.0.1", port=int(os.environ.get("PORT", "8786")),
-                access_log=False, timeout_graceful_shutdown=15)
+    from .local_instance import InstanceBusy, backend_instance
+    try:
+        with backend_instance():
+            uvicorn.run(create_app(), host="127.0.0.1", port=int(os.environ.get("PORT", "8786")),
+                        access_log=False, timeout_graceful_shutdown=15)
+    except InstanceBusy as error:
+        # The LaunchAgent must not respawn repeatedly after a refused start.
+        print(str(error), file=sys.stderr)
