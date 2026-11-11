@@ -1,9 +1,18 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { batchDate, canDownload, captureStatusLabel, completedPartialVideo, groupVideos, groupVideoDays, splitInspections, syncVideoSelection, videoCategory, videoStatusOptions, selectVideoScope, visibleVideoSelections } from '../src/record-groups.ts';
+import { batchDate, canDownload, captureStatusLabel, completedPartialVideo, groupVideos, groupVideoDays, mergeOpenVideoRows, splitInspections, syncVideoSelection, videoCategory, videoStatusOptions, selectVideoScope, visibleVideoSelections } from '../src/record-groups.ts';
 
 const video = (id, jobId, state, extra = {}) => ({id, jobId, activeRevision: 0, revision: 0,
   versions: [{revision: 0, state}], capabilities:{version:0,expectedRevision:0,canConfirmFinal:state==='ready'}, ...extra});
+
+test('an open confirmation stays in its slot after leaving the ready filter',()=>{
+  const first=video('first','j','ready'), current=video('current','j','downloading'), last=video('last','j','ready');
+  const order=['first','current','last'];
+  const remaining=[first,last];
+  assert.deepEqual(mergeOpenVideoRows(remaining,[current],order),[first,current,last]);
+  assert.deepEqual(mergeOpenVideoRows(remaining,[first,current],order),[first,current,last]);
+  assert.strictEqual(mergeOpenVideoRows(remaining,[],order),remaining);
+});
 
 test('withdrawal never appears as a waiting platform download', () => {
   const row = video('withdrawing', 'j', 'withdrawing', {operation:{kind:'withdraw',state:'reconciling'}});

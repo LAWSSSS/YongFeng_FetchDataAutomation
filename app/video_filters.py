@@ -14,6 +14,9 @@ def record_status(row):
         return 'deleting'
     if active['state'] == 'withdrawing':
         return 'review' if operation.get('state') in {'attention', 'conflict'} else 'deleting'
+    if (operation.get('kind') in {'correction', 'recapture'}
+            and operation.get('state') in {'queued', 'running', 'reconciling', 'waiting_connection'}):
+        return 'waiting'
     if (operation.get('kind') == 'recover-decodable'
             and operation.get('version') == row['activeRevision']
             and operation.get('expectedRevision') == row['revision']
@@ -23,7 +26,9 @@ def record_status(row):
         return "review"
     if active["state"] == "saved":
         return "saved"
-    if active["state"] in ("downloading", "publishing") or active.get("downloadRequested"):
+    approved = row.get('finalProcessing') or {}
+    if (active["state"] in ("downloading", "publishing") or active.get("downloadRequested")
+            or active['state'] == 'ready' and approved.get('state') in {'queued', 'running', 'waiting'}):
         return "download"
     return "ready" if active["state"] == "ready" else "waiting"
 

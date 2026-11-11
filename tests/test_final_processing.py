@@ -153,9 +153,29 @@ async def test_disk_disconnection_retains_confirmation_without_scheduling(env):
     manager = app.state.final_processing
     result = manager.confirm(row['id'], payload(row))
     app.state.workspace.online = False
+    assert manager.operation(result['operationId'])['stage'] == 'waiting_disk'
     await manager.tick()
     assert manager.operation(result['operationId'])['stage'] == 'waiting_disk'
     assert not app.state.videos.store.get(row['id'])['versions'][0].get('downloadRequested')
     app.state.workspace.online = True
+    await manager.tick()
+    assert app.state.videos.store.get(row['id'])['versions'][0]['downloadRequested']
+
+
+@pytest.mark.asyncio
+async def test_busy_video_does_not_delay_another_confirmed_download(env, tmp_path):
+    app, row = env
+    manager = app.state.final_processing
+    path = tmp_path / 'other.mp4'
+    path.write_bytes(b'other-media')
+    other = collection(app, path, 'b' * 24, accepted=False)
+    other['versions'][0].update(taskId='other-task', resultId='other-result')
+    app.state.videos.store.save(other)
+    manager.confirm(row['id'], payload(row, 'busy'))
+    manager.confirm(other['id'], payload(other, 'other'))
+    async with app.state.videos.row_lock(row['id']):
+        await asyncio.wait_for(manager.tick(), timeout=1)
+        assert not app.state.videos.store.get(row['id'])['versions'][0].get('downloadRequested')
+        assert app.state.videos.store.get(other['id'])['versions'][0]['downloadRequested']
     await manager.tick()
     assert app.state.videos.store.get(row['id'])['versions'][0]['downloadRequested']

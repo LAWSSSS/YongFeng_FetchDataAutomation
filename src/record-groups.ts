@@ -17,7 +17,11 @@ export type BatchVideo = {
   versions: {revision: number; state: string; downloadRequested?: boolean;recovery?:{state:string;resultVerified?:boolean}}[];
   deletion?: {state: string};
   operation?:{kind:string;state:string;version?:number;expectedRevision?:number};
+  finalProcessing?:{state:string};
 };
+
+export const correctionPending = (operation:BatchVideo['operation']) => !!operation &&
+  ['correction','recapture'].includes(operation.kind) && ['queued','running','reconciling','waiting_connection'].includes(operation.state);
 
 export const categoryLabels = {
   ready: '可查看', waiting: '等待平台结果', download: '下载中', saved: '已保存', complete:'已完成', review: '待核对', deleting: '清理中',
@@ -82,11 +86,13 @@ export function videoCategory(video: BatchVideo): VideoCategory {
   const active = video.versions.find(version => version.revision === video.activeRevision);
   if (active?.state === 'terminating') return 'deleting';
   if (active?.state === 'withdrawing') return ['attention','conflict'].includes(video.operation?.state || '') ? 'review' : 'deleting';
+  if (correctionPending(video.operation)) return 'waiting';
   if(active&&partialComplete(active))return 'saved';
   if(recoveryInProgress(video))return 'processing';
   if (!active || ['attention', 'failed', 'uncertain'].includes(active.state)) return 'review';
   if (active.state === 'saved') return 'saved';
-  if (active.downloadRequested || ['downloading', 'publishing'].includes(active.state)) return 'download';
+  if (active.downloadRequested || ['downloading', 'publishing'].includes(active.state) ||
+    active.state==='ready' && ['queued','running','waiting'].includes(video.finalProcessing?.state||'')) return 'download';
   return active.state === 'ready' ? 'ready' : 'waiting';
 }
 
@@ -146,4 +152,14 @@ export function groupVideoDays<T extends BatchVideo>(videos:T[],jobs:CollectionJ
     ...date,
     submissionCount:new Set(date.records.map(video=>video.jobId)).size,
   }));
+}
+
+/** An open card keeps its place when its new status no longer matches the filter. */
+export function mergeOpenVideoRows<T extends BatchVideo>(visible:T[], open:Iterable<T>, order:readonly string[]) {
+  const visibleIds=new Set(visible.map(video=>video.id));
+  const retained=[...open].filter(video=>!visibleIds.has(video.id));
+  if(!retained.length)return visible;
+  const positions=new Map(order.map((id,index)=>[id,index]));
+  return [...visible,...retained].sort((left,right)=>
+    (positions.get(left.id)??Infinity)-(positions.get(right.id)??Infinity));
 }

@@ -113,6 +113,17 @@ def server_locked(home):
         return True
 
 
+def stop_server(home, state):
+    with contextlib.suppress(ProcessLookupError):
+        os.kill(state["pid"], signal.SIGTERM)
+    for _ in range(160):
+        if not server_locked(home):
+            clear_server_state(home, state["instanceId"])
+            return True
+        time.sleep(0.25)
+    return False
+
+
 def release_manifest():
     manifest = read_json(RESOURCES / "release.json")
     if manifest.get("bundleId") != BUNDLE_ID or not manifest.get("packageId"):
@@ -145,8 +156,15 @@ def launch(no_browser=False):
             # Updates must be explicitly restarted, not started over an old writer.
             if state.get("packageId") != manifest["packageId"]:
                 raise RuntimeError("旧版采集助手仍在运行，请先使用旧版的停止入口，再打开新版。进度会保留。")
-            open_browser(state["port"], no_browser)
-            return state
+            previous = state.get("profilePath")
+            moved = (isinstance(previous, str) and Path(previous).is_absolute()
+                     and Path(previous) != home and not Path(previous).exists()
+                     and server_locked(home))
+            if not moved:
+                open_browser(state["port"], no_browser)
+                return state
+            if not stop_server(home, state):
+                raise RuntimeError("正在停止移动前的后台，请稍后再次打开。")
         if server_locked(home):
             raise RuntimeError("采集助手正在启动、忙碌或安全停止中，请稍后再打开；未创建第二个后台实例。")
         instance_id = uuid4().hex
@@ -191,7 +209,7 @@ def serve(instance_id):
             sock.bind(("127.0.0.1", 0))
         sock.listen(128)
         sock.set_inheritable(True)
-        state = {**identity(), "port": sock.getsockname()[1]}
+        state = {**identity(), "port": sock.getsockname()[1], "profilePath": str(home)}
         private_json(home / "server.json", state)
         try:
             uvicorn.Server(uvicorn.Config(create_app(), host="127.0.0.1", access_log=False,
@@ -211,15 +229,8 @@ def stop():
                 return {"stopped": False, "retry": True,
                         "message": "已有实例运行但无法核实为本包，请稍后重试或使用运行版本的停止入口。"}
             return {"stopped": False, "message": "本包没有正在运行的实例。"}
-        with contextlib.suppress(ProcessLookupError):
-            os.kill(state["pid"], signal.SIGTERM)
-        for _ in range(160):
-            # Shutdown can outlast the listening socket. Keep the launch lock
-            # until the writer releases its lock, then remove its receipt.
-            if not server_locked(home):
-                clear_server_state(home, state["instanceId"])
-                return {"stopped": True}
-            time.sleep(0.25)
+        if stop_server(home, state):
+            return {"stopped": True}
         return {"stopped": False, "retry": True, "message": "正在等待当前写入安全结束，请稍后重试停止。"}
 
 

@@ -14,7 +14,7 @@ import DateCollection,{CollectionSettings} from './DateCollection';
 import { correctionInterval, correctionReviewCurrent, prepareCorrection } from './corrections';
 import type { PreparedCorrection } from './corrections';
 import { VideoBatches, VideoStatusFilters } from './RecordGroups';
-import { canDownload as canConfirmFinal, captureStatusLabel, syncVideoSelection, visibleVideoSelections } from './record-groups';
+import { canDownload as canConfirmFinal, captureStatusLabel, correctionPending, mergeOpenVideoRows, syncVideoSelection, visibleVideoSelections } from './record-groups';
 import RecordSelection from './RecordSelection';
 import './compact-controls.css';
 import SubmissionRecords from './SubmissionRecords';
@@ -60,7 +60,9 @@ type VideoState = {videos: Video[]; directory: string; lastCheck: string; checkE
   hiddenRecordCount?:number; downloadWorkers?:DownloadWorkers;
   totalCount: number; filteredCount: number; byJob: Record<string,number>; counts: Record<string,number>};
 type VideoSelection = {id: string; version: number; expectedRevision: number};
-type BulkResult = {outcomes: {id: string; ok: boolean; message?: string}[]};
+type FinalReceipt = NonNullable<Video['finalProcessing']> & {videoId:string;version:number;expectedRevision:number};
+type VideoReceipt = Partial<FinalReceipt> & {recordRemoval?:{removalId:string}};
+type BulkResult = {outcomes: (VideoReceipt & {id: string; ok: boolean})[]};
 const blankVideoFilters = {plate: '', dateFrom: '', dateTo: '', timeBasis: 'quality', status: 'all', correction: 'all'};
 
 async function api<T>(path: string, data?: unknown, signal?:AbortSignal): Promise<T> {
@@ -106,7 +108,8 @@ function VideoCard({video,onSelect,selected,onOpen,children}:{
   const expanded=!!children;
   const active=video.versions.find(v=>v.revision===video.activeRevision)!;
   const clearing=['pending','error'].includes(video.deletion?.state||'');
-  const label=video.finalProcessing?.stageLabel||(partialComplete(active)?'可用部分已保存':video.finalProcessing?.state==='complete'?'处理完成':captureStatusLabel(active));
+  const label=correctionPending(video.operation)?'更正处理中':video.finalProcessing?.stageLabel||
+    (video.finalProcessing?.stage==='queued'?'下载已登记':partialComplete(active)?'可用部分已保存':video.finalProcessing?.state==='complete'?'处理完成':captureStatusLabel(active));
   const progress=video.finalProcessing?.terminal?null:video.finalProcessing?.progress;
   return <article className={`video-card${expanded?' is-expanded':''}`} id={`video-${video.id}`}>
     <div className="video-head"><label className="record-pick">{onSelect&&<input type="checkbox" aria-label={`选择采集记录 ${video.name} ${video.qualityStart}`} checked={selected} disabled={clearing} onChange={onSelect}/>}<h3>{video.name}</h3></label><span className={`badge ${video.finalProcessing?.state||active.state}`}>{label}</span></div>
@@ -133,8 +136,9 @@ function VideoPreview({ src, onPlay }: { src: string; onPlay: () => void }) {
   return <video ref={ref} controls playsInline preload="metadata" src={src} onPlay={onPlay} />;
 }
 
-function VideoDetails({video,onRefresh,onRemoved,processing}:{
+function VideoDetails({video,onRefresh,onRemoved,onAccepted,processing}:{
   video:Video;onRefresh:()=>Promise<void>;onRemoved:(id:string)=>void;processing:ProcessingGroup[];
+  onAccepted:(video:Video,path:string,result:VideoReceipt)=>void;
 }){
   const active = video.versions.find(version => version.revision === video.activeRevision)!;
   const draftKey = `correction-draft:${video.id}`;
@@ -155,6 +159,7 @@ function VideoDetails({video,onRefresh,onRemoved,processing}:{
   const [prepared, setPrepared] = useState<PreparedCorrection | null>(null);
   const restartRequest = useRef<{version:number;expectedRevision:number;requestId:string}|null>(null);
   const recaptureIntent = useRef(requestIntents());
+  const confirmIntent = useRef(requestIntents());
   const operationLocked = useRef(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
@@ -192,12 +197,13 @@ function VideoDetails({video,onRefresh,onRemoved,processing}:{
   const canPartialRecover = recoveryOptions.failedMedia && ['invalid_video','media_incomplete'].includes(active.errorCode || '')
     && recoveryProofReady && !recoveryRunning && !recoveryPaused && !clearing
     && (!recovery || recovery.state === 'attention');
+  const changingCapture = correctionPending(video.operation);
   const canCorrect = (['ready','saved','waiting','submitted','attention','failed'].includes(active.state)
       || (!!video.finalProcessing&&['downloading','publishing'].includes(active.state)))
     && (!active.downloadRequested || active.state === 'failed' || !!video.finalProcessing) && (!active.writeAttempted || !!active.taskId || active.submissionOutcome==='rejected') && !clearing && (!recoveryRunning || !!video.finalProcessing);
   const withdrawing=video.operation?.kind==='withdraw'&&['queued','running','reconciling','waiting_connection'].includes(video.operation.state);
   const canWithdraw=video.capabilities?.canWithdraw===true&&!withdrawing;
-  const recapturing=video.operation?.kind==='recapture'&&['queued','running','reconciling','waiting_connection'].includes(video.operation.state);
+  const recapturing=changingCapture;
   const canRecapture=video.capabilities?.canForceRecapture||recoveryOptions.canRecapture;
   const hasMoreActions=['attention','uncertain','waiting','failed'].includes(active.state)||canWithdraw||recoveryOptions.canRestartDownload||active.downloadRequested||canRecapture;
   const staleDraft = draftRevision !== video.revision;
@@ -207,22 +213,29 @@ function VideoDetails({video,onRefresh,onRemoved,processing}:{
   async function act(path: string, body: object) {
     if(operationLocked.current)return false;
     operationLocked.current=true;
-    setBusy(true); setError('');setOperationNotice('');
+    setBusy(true); setError('');setOperationNotice(path==='confirm-and-process'?'正在登记下载…':
+      ['corrections','recapture'].includes(path)?'正在登记采集更正…':'');
     try {
-      const result = await api<Partial<Video>&{recordRemoval?:{removalId:string};operationId?:string}>(`/videos/${video.id}/${path}`, body);
+      const result = await api<VideoReceipt>(`/videos/${video.id}/${path}`, body);
+      if(result.operationId) onAccepted(video,path,result);
       if(!mounted.current)return true;
-      setOperationNotice(result.operationId?'操作已登记，后台继续处理。':'操作已完成，正在更新状态。');
+      setOperationNotice(result.operationId && ['corrections','recapture','confirm-and-process'].includes(path)?'':
+        result.operationId?'操作已登记，后台继续处理。':'操作已完成，正在更新状态。');
       if (path === 'corrections' || path === 'recapture') {setDirty(false);setPrepared(null);setDraftRevision(video.revision);}
       if (path === 'withdraw') setPlaying(current => current === active.revision ? null : current);
       if (path === 'hide-record' && result.recordRemoval) {
         onRemoved(video.id);
         return true; // The parent clears the focus and refreshes the remaining records.
       }
-      void onRefresh().catch(()=>{if(mounted.current)setOperationNotice('操作已登记，等待状态更新。');});
       return true;
     }
-    catch (failure) {if(mounted.current)setError((failure as Error).message);return false; }
+    catch (failure) {if(mounted.current){setOperationNotice('');setError((failure as Error).message);}return false; }
     finally {operationLocked.current=false;if(mounted.current)setBusy(false); }
+  }
+  async function confirmFinal() {
+    if (changingCapture || video.finalProcessing || !reviewed || !canConfirmFinal(video)) return;
+    const payload = confirmIntent.current.payload('confirm', {version:active.revision,expectedRevision:video.revision});
+    if (await act('confirm-and-process',payload)) confirmIntent.current.complete('confirm');
   }
   function prepare(event: FormEvent) {
     event.preventDefault();
@@ -236,6 +249,7 @@ function VideoDetails({video,onRefresh,onRemoved,processing}:{
     catch (failure) { setError((failure as Error).message); }
   }
   function confirmCorrection() {
+    if (changingCapture) return;
     if (!prepared || !correctionReviewCurrent(prepared,video.revision)) {
       setPrepared(null);setError('记录已有新操作，你填写的时间已保留，请再次点击“核对修改”。');return;
     }
@@ -274,7 +288,7 @@ function VideoDetails({video,onRefresh,onRemoved,processing}:{
     </div>}</div>;
   return <section className="video-details-body">
     <p className="subtle">原始质检：{video.qualityStart} 至 {video.qualityEnd}</p>
-    {video.operation&&['withdraw','recapture','terminate-capture'].includes(video.operation.kind)&&
+    {video.operation&&['withdraw','correction','recapture','terminate-capture'].includes(video.operation.kind)&&
       <p className={['attention','conflict'].includes(video.operation.state)?'notice':'subtle'} role="status">{video.operation.message}</p>}
     <div className="video-versions">{renderVersion(active)}
       {!!historical.length && <details className="version-history"><summary>历史版本（{historical.length}）</summary>
@@ -327,7 +341,7 @@ function VideoDetails({video,onRefresh,onRemoved,processing}:{
       <p className="subtle">正在查看第{playingVersion.revision+1}版：{playingVersion.startTime} → {playingVersion.endTime}</p>
       {playingVersion.state === 'attention' && <p className="notice">此视频仅供核对，异常解除后才能确认下载。</p>}
       {playing !== active.revision && versionDownloadable(playingVersion) && <p><button className="secondary" disabled={busy} onClick={()=>void act('history-download',{version:playingVersion.revision,expectedRevision:video.revision,requestId:uid()})}>保存第 {playingVersion.revision + 1} 版</button></p>}
-      {playing === active.revision && !video.finalProcessing && <><label className="review-check"><input type="checkbox" checked={reviewed} onChange={e => setReviewed(e.target.checked)} />我已查看并确认这一版视频</label><button disabled={!reviewed || !canConfirmFinal(video) || busy} title={video.capabilities?.confirmFinalReason} onClick={() => {void act('confirm-and-process', {version: active.revision, expectedRevision: video.revision, requestId: uid()});}}>确认最终区间并处理</button>{!canConfirmFinal(video)&&<p className="notice">{video.capabilities?.confirmFinalReason||'正在核对本版是否可以确认。'}</p>}</>}</div>}
+      {playing === active.revision && !video.finalProcessing && <><label className="review-check"><input type="checkbox" checked={reviewed} disabled={busy||changingCapture} onChange={e => setReviewed(e.target.checked)} />我已查看并确认这一版视频</label><button disabled={!reviewed || !canConfirmFinal(video) || busy || changingCapture} title={video.capabilities?.confirmFinalReason} onClick={()=>void confirmFinal()}>确认最终区间并处理</button>{!canConfirmFinal(video)&&<p className="notice">{video.capabilities?.confirmFinalReason||'正在核对本版是否可以确认。'}</p>}</>}</div>}
     <VideoProcessing groups={processing} onRefresh={onRefresh}/>
     {canCorrect && <details className="correction"><summary>更正采集时间</summary>
       <form onSubmit={prepare}><p>当前采集：{active.startTime} → {active.endTime} · {duration(active.durationSeconds)}</p>
@@ -338,8 +352,8 @@ function VideoDetails({video,onRefresh,onRemoved,processing}:{
         {staleDraft && <p className="notice" role="status">本条已有新操作，你填写的时间已保留。请先查看上方最新采集区间，再点击“核对修改”，即可基于当前记录确认重新采集。</p>}
         <p className="subtle">草稿结束时间：{draftEnd || '请填写有效时间'}</p>
         {prepared && <p className="confirm-text" role="status">已按当前记录核对：将采集 {prepared.startTime} → {prepared.endTime}，时长 {duration(prepared.durationSeconds)}。</p>}
-        <div className="actions"><button type="submit" disabled={busy}>核对修改</button>
-          {prepared && <button type="button" disabled={busy || !correctionReviewCurrent(prepared,video.revision)} onClick={confirmCorrection}>确认重新采集</button>}
+        <div className="actions"><button type="submit" disabled={busy || changingCapture}>核对修改</button>
+          {prepared && <button type="button" disabled={busy || changingCapture || !correctionReviewCurrent(prepared,video.revision)} onClick={confirmCorrection}>确认重新采集</button>}
           {(dirty||prepared)&&<button type="button" className="secondary" disabled={busy} onClick={()=>{
             setDate(active.startTime.slice(0,10));setClock(active.startTime.slice(11,19));setMinutes(String(active.durationSeconds/60));
             setDirty(false);setPrepared(null);setDraftRevision(video.revision);setError('');
@@ -403,6 +417,7 @@ export default function App() {
   const actionLocked = useRef(false);
   const refreshSequence = useRef(0);
   const reads=useRef(createReadCycle());
+  const videoOrder=useRef<string[]>([]);
   const tabRef=useRef<Page>(tab),viewVisit=useRef(0);
   const navigate=useCallback((next:Page)=>{
     if(next===tabRef.current)return;
@@ -411,6 +426,7 @@ export default function App() {
     if(tabRef.current==='videos'){
       detailReads.current.cancel();
       setOpenDetails(new Map());
+      videoOrder.current=[];
       clearFocus();
     }
     reads.current.cancel();
@@ -433,6 +449,8 @@ export default function App() {
       if(tab==='settings'||tab==='videos'){
         sections.push(stateSection('视频记录',()=>api<VideoState>(`/videos?${query}`,undefined,context.signal),value=>{
           if(page==='videos'){
+            const known=new Set(videoOrder.current);
+            videoOrder.current=[...value.videos.filter(video=>!known.has(video.id)).map(video=>video.id),...videoOrder.current];
             setState(value);setLoaded(true);setVideoSelection(before=>syncVideoSelection(before,value.videos));
           }else{
             // Collection summaries carry no video rows; keep the last full view.
@@ -491,7 +509,7 @@ export default function App() {
   const focusedActive=!!externalFocus&&(['queued','running'].includes(externalFocus.video.finalProcessing?.state||'')
     ||['downloading','publishing','submitting','terminating'].includes(externalFocus.video.versions.find(version=>version.revision===externalFocus.video.activeRevision)?.state||''));
   useRecordChanges(refresh);
-  useMediaChanges(()=>{reads.current.cancel();void refresh();});
+  useMediaChanges(()=>{reads.current.cancel();void refresh();focusReads.current.cancel();void refreshFocused();});
   usePolling(refreshFocused,externalFocus?readInterval(focusedActive,externalFocus.video.finalProcessing?.environmentBlocker?.code==='disk'):null,{immediate:false});
   useEffect(()=>{
     if(tab!=='videos'||!focus||focusError)return;
@@ -559,7 +577,7 @@ export default function App() {
       }));
     });
   },tab==='videos'&&retainedDetails.length?4000:null,{immediate:false});
-  const displayVideos=retainedDetails.length?[...state.videos,...retainedDetails]:state.videos;
+  const displayVideos=mergeOpenVideoRows(state.videos,retainedDetails,videoOrder.current);
   function closeDetail(id:string){
     setOpenDetails(before=>{const next=new Map(before);next.delete(id);return next;});
   }
@@ -577,9 +595,39 @@ export default function App() {
       return next;
     });
   }
-  const videoActive=!!(state.downloadWorkers?.active||state.counts.download||state.counts.processing||state.counts.deleting);
+  function applyVideoReceipt(video:Video,path:string,result:VideoReceipt){
+    const operationId=result.operationId;
+    if(!operationId)return;
+    const patch=(current:Video):Video=>{
+      if(current.id!==video.id||current.revision!==video.revision||current.activeRevision!==video.activeRevision)return current;
+      if(path==='confirm-and-process' && result.videoId===current.id && result.version===current.activeRevision &&
+         result.expectedRevision===current.revision && !current.finalProcessing && result.state && result.stage){
+        return {...current,finalProcessing:{...result,operationId,state:result.state,stage:result.stage,
+          message:result.message||'已确认，等待自动下载。',stageLabel:result.stageLabel||'下载已登记'},
+          capabilities:current.capabilities&&{...current.capabilities,canConfirmFinal:false}};
+      }
+      if((path==='corrections'||path==='recapture') && current.operation?.id!==operationId && result.state &&
+         ['queued','running','reconciling','waiting_connection'].includes(result.state)){
+        return {...current,operation:{id:operationId,kind:path==='corrections'?'correction':'recapture',state:result.state,
+          version:video.activeRevision,expectedRevision:video.revision,message:'采集更正已登记，后台正在提交。'},
+          capabilities:current.capabilities&&{...current.capabilities,canConfirmFinal:false}};
+      }
+      return current;
+    };
+    setState(before=>({...before,videos:before.videos.map(patch)}));
+    setFocusedRecord(before=>before&&{...before,video:patch(before.video)});
+    setOpenDetails(before=>{
+      const current=before.get(video.id);
+      return current?new Map(before).set(video.id,patch(current)):before;
+    });
+    setVideoSelection(before=>{const next=new Map(before);next.delete(video.id);return next;});
+  }
+  const captureChanging=displayVideos.some(video=>correctionPending(video.operation)&&video.operation?.state!=='waiting_connection');
+  const videoActive=!!(state.downloadWorkers?.active||state.counts.download||state.counts.processing||state.counts.deleting||
+    displayVideos.some(video=>['queued','running'].includes(video.finalProcessing?.state||'')));
   const offlineWait=!videoActive&&session.target.availability?.reachability==='offline'&&!!state.counts.waiting;
-  usePolling(async()=>{if(!actionLocked.current)await refresh();},tab==='slicing'?null:readInterval(tab==='videos'&&videoActive,tab==='videos'&&offlineWait),{immediate:false});
+  usePolling(async()=>{if(!actionLocked.current)await refresh();},tab==='slicing'?null:
+    tab==='videos'&&captureChanging?2000:readInterval(tab==='videos'&&videoActive,tab==='videos'&&offlineWait),{immediate:false});
   async function run(action: string, fn: () => Promise<void>) {
     if(actionLocked.current)return;
     const actionVisit=viewVisit.current;
@@ -588,7 +636,7 @@ export default function App() {
     ++refreshSequence.current;
     setBusy(action); setError(''); setMessage('');
     try { await fn(); } catch (failure) { if(viewVisit.current===actionVisit)setError((failure as Error).message); }
-    finally { ++refreshSequence.current;actionLocked.current=false;setBusy(''); }
+    finally { actionLocked.current=false;setBusy(''); }
   }
   function pickVideo(video: Video) {
 
@@ -597,10 +645,12 @@ export default function App() {
   }
   function applyVideoFilters(value: typeof blankVideoFilters) {
     detailReads.current.cancel();
+    videoOrder.current=[];
     setOpenDetails(new Map());
     setLoaded(false);setAppliedVideoFilters({...value});setVideoSelection(new Map());setBulkErrors([]);
   }
   function filterVideoStatus(status: string) {
+    if(status===appliedVideoFilters.status)return;
     const next={...videoFilters,status};
     setVideoFilters(next);applyVideoFilters(next);
   }
@@ -631,12 +681,15 @@ export default function App() {
       const result = await api<BulkResult>(`/videos/bulk-${action==='confirm'?'confirm-and-process':action}`, bulkIntents.current.payload(action,{selections,deleteCloud:false,deleteLocalFiles:false}));
       bulkIntents.current.complete(action);
       const good = result.outcomes.filter(o => o.ok);
+      if(action==='confirm')for(const receipt of good){
+        const video=state.videos.find(row=>row.id===receipt.id);
+        if(video)applyVideoReceipt(video,'confirm-and-process',receipt);
+      }
       if(tabRef.current==='videos'&&viewVisit.current===actionVisit){
         setMessage(`${good.length} 条${action==='classify-saved'?'已归入“已保存”':`已加入${action === 'confirm' ? '全流程处理' : '清理'}队列`}${result.outcomes.length > good.length ? `，${result.outcomes.length - good.length} 条保持原状，原因见下方` : ''}。`);
         setBulkErrors(result.outcomes.filter(o => !o.ok).map(o => `${state.videos.find(v => v.id === o.id)?.name || o.id}：${o.message}`));
       }
       if(viewVisit.current===actionVisit)setVideoSelection(before => {const next = new Map(before);good.forEach(o => next.delete(o.id));return next;});
-      void refresh().catch(()=>{});
     });
   }
   return <div className="app-shell"><header className="site-header"><div className="brand"><span className="brand-symbol">映</span><div><strong>采集助手</strong><small>采集 · 更正 · 切片</small></div></div>
@@ -692,7 +745,7 @@ export default function App() {
         {openDetails.has(externalFocus.video.id)&&<VideoDetails video={externalFocus.video}
           processing={processing.filter(group=>group.videoId===externalFocus.video.id)}
           onRefresh={async()=>{await Promise.all([refreshAfterChange(),refreshFocused()]);}}
-          onRemoved={removeVideoFromView}/>}
+          onRemoved={removeVideoFromView} onAccepted={applyVideoReceipt}/>}
       </VideoCard>
     </section>}
     {!!localGroups.length&&<section data-selection-scope="local-videos" aria-label="本地视频记录">
@@ -713,7 +766,7 @@ export default function App() {
         {openDetails.has(video.id)&&<>
           {!visibleIds.has(video.id)&&<p className="subtle">本条状态已更新；关闭详情后按当前筛选隐藏。</p>}
           <VideoDetails video={video} processing={processing.filter(g=>g.videoId===video.id)}
-            onRefresh={refreshAfterChange} onRemoved={removeVideoFromView}/>
+            onRefresh={refreshAfterChange} onRemoved={removeVideoFromView} onAccepted={applyVideoReceipt}/>
         </>}
       </VideoCard>}
     </VideoBatches> : <section className="panel empty"><h2>{state.totalCount ? '没有符合条件的记录' : state.hiddenRecordCount ? '当前没有可显示的记录' : '还没有采集记录'}</h2><p>{state.totalCount ? '可以调整日期、车牌和状态，或重置筛选。' : state.hiddenRecordCount ? '已删除记录的文件、更正和后台进度保留。' : '在“日期采集”中核对并提交后，这里会显示每辆车的采集进度。'}</p></section>}</div></>}

@@ -206,7 +206,10 @@ class WorkspaceManager(WorkspaceScheduler):
         except FileEnvironmentError as error:
             if root != self.root or identity != self.config['workspaceId']:
                 raise Conflict('工作区配置已变化，稍后重新检查。') from None
-            self._availability(False, error.code, str(error))
+            message = str(error)
+            if error.code == 'disk_offline' and self.config.get('locationMode') == 'default':
+                message = '默认工作区不可用。若刚移动或改名，请从新位置重新打开采集助手；若磁盘已断开，请重新连接。'
+            self._availability(False, error.code, message)
             raise
         except ValueError:
             if root != self.root or identity != self.config['workspaceId']:

@@ -65,11 +65,13 @@ class FinalProcessing:
         version = self.videos.version(row, row.get('activeRevision')) or {}
         blocked = bool(row.get('deletedAt') or row.get('deletion', {}).get('state') in {'pending', 'error'})
         current = self.current_operation(row, version) if version else None
+        media = self.control.get('collection:' + row['id']) or {}
         reason = ('记录正在清理。' if blocked else
                   '本版正在撤回，上一有效版本保留。' if version.get('state') == 'withdrawing' else
                   '本版已清理，保留历史。' if version.get('localCleanupState') == 'complete' else
                   '请先启用视频工作区。' if not self.workspace.enabled else
                   '本版已确认；后台继续处理，暂停后请使用继续入口。' if current else
+                  '本条正在更正或核对，请等待操作完成。' if media.get('blocked') else
                   '请等待本版采集完成。' if version.get('state') != 'ready' else
                   '本版任务或视频结果尚未唯一绑定。' if not version.get('taskId') or not version.get('resultId') else '')
         restart = (not blocked and version.get('state') in {'failed', 'ready'} and version.get('taskId')
@@ -132,6 +134,8 @@ class FinalProcessing:
         if not legacy and not self.workspace.enabled:
             raise ValueError('请先在设置与文件中启用视频工作区。')
         media = self.control.get('collection:' + identity) or {}
+        if not legacy and media.get('blocked'):
+            raise Conflict('本条正在更正或核对，请等待操作完成。')
         generation = int(media.get('generation') or 0)
         operation_id = hashlib.sha256(f'final:{identity}:{data["version"]}:{generation}'.encode()).hexdigest()[:40]
         operation = self.get(operation_id)
@@ -416,9 +420,12 @@ class FinalProcessing:
         else:
             operation.update(state='running', stage='download', message='正在下载已确认的最终版本。')
             if version.get('state') == 'ready' and not version.get('downloadRequested'):
-                await self.videos.confirm(row['id'], {'version': operation['version'],
-                    'expectedRevision': operation['expectedRevision'], 'requestId': 'final-download-' + operation['id'] +
-                    '-r' + str(operation.get('resumeRevision', 0))})
+                if self.videos.row_lock(row['id']).locked():
+                    operation.update(state='queued', stage='queued', message='已确认，等待本条正在进行的操作结束后下载。')
+                else:
+                    await self.videos.confirm(row['id'], {'version': operation['version'],
+                        'expectedRevision': operation['expectedRevision'], 'requestId': 'final-download-' + operation['id'] +
+                        '-r' + str(operation.get('resumeRevision', 0))})
             elif version.get('state') == 'failed' and version.get('downloadRequested'):
                 from .final_downloads import continue_download
                 if not await continue_download(self, operation, row, version):

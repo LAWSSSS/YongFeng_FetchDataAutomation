@@ -218,6 +218,32 @@ async def test_last_confirmed_command_wins_before_any_old_submission(app, tmp_pa
     assert manager.store.get_operation(second["operationId"])["state"] == "complete"
 
 
+@pytest.mark.asyncio
+async def test_identical_correction_clicks_share_one_pending_operation(app, tmp_path, monkeypatch):
+    path = tmp_path / 'source.mp4'
+    path.write_bytes(b'source')
+    collection(app, path)
+    manager = app.state.videos
+    entered, finish = asyncio.Event(), asyncio.Event()
+
+    async def perform(_identity, _payload):
+        entered.set()
+        await finish.wait()
+        return {'revision': 1}
+
+    monkeypatch.setattr(manager, '_perform_correction', perform)
+    payload = {'expectedRevision': 0, 'startTime': '2026-10-01 02:00:00', 'durationSeconds': 600}
+    first = manager.queue_video_operation('collection', 'correction', {**payload, 'requestId': 'first'})
+    await asyncio.wait_for(entered.wait(), 1)
+    second = manager.queue_video_operation('collection', 'correction', {**payload, 'requestId': 'second'})
+    finish.set()
+    await asyncio.gather(*list(manager.operation_tasks.values()))
+    replay = manager.queue_video_operation('collection', 'correction', {**payload, 'requestId': 'second'})
+    assert second['operationId'] == first['operationId'] == replay['operationId']
+    assert replay['state'] == 'complete'
+    assert len(manager.store.list_operations('collection')) == 1
+
+
 def package(app, tmp_path, identity="one", zip_only=False, color="green"):
     root = tmp_path / identity; root.mkdir()
     stream = io.BytesIO(); Image.new("RGB", (800, 450), color=color).save(stream, format="JPEG")

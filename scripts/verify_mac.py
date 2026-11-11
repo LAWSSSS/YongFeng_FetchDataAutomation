@@ -94,6 +94,21 @@ def smoke(folder):
         finally:
             invoke(moved, profile, "stop")
 
+        # Moving the live application and its default profile preserves the
+        # writer's lock inode. Reopening the moved bundle must replace that writer.
+        live_profile = moved / '数据/系统'
+        live = invoke(moved, live_profile, 'launch', '--no-browser')
+        renamed = work / '运行中改名 中文'
+        moved.rename(renamed)
+        try:
+            reopened = invoke(renamed, renamed / '数据/系统', 'launch', '--no-browser')
+            assert reopened['profileId'] == live['profileId']
+            assert reopened['instanceId'] != live['instanceId']
+            assert read(f'http://127.0.0.1:{reopened["port"]}/api/health')['pid'] == reopened['pid']
+            print('Live folder rename restarts the same profile from its new path.')
+        finally:
+            invoke(renamed, renamed / '数据/系统', 'stop')
+
 
 PARITY_SCRIPT = '''
 import json, sys

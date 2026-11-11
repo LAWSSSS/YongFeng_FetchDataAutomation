@@ -109,6 +109,10 @@ def current_presentations(flow):
             wait = flow.wait_reason(row['id'])
             if wait and not value.get('issue'):
                 value.update(state='waiting', stage='paused', message=wait, progress=None)
+            elif not flow.workspace.online and not value.get('issue'):
+                message = flow.workspace.availability.get('message') or '等待工作区恢复，已确认的下载会自动继续。'
+                value.update(state='waiting', stage='waiting_disk', message=message, progress=None,
+                             environmentBlocker={'code': 'disk', 'message': message})
         value.update(terminal=terminal, stageLabel=STAGES.get(value.get('stage'), value.get('stage') or '处理中'))
         if terminal:
             value['progress'] = None

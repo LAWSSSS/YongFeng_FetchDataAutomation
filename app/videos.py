@@ -200,6 +200,13 @@ class VideoStore:
         self.db.commit()
 
     def save_operation(self, operation, *, commit=True):
+        # An in-flight worker may hold a copy from before a second click was
+        # linked to its request. Preserve aliases when writing the result.
+        if operation.get('kind') in {'correction', 'recapture', 'restart-download'}:
+            previous = self.get_operation(operation['id']) or {}
+            if previous.get('requestAliases'):
+                operation['requestAliases'] = list(dict.fromkeys([
+                    *previous['requestAliases'], *operation.get('requestAliases', [])]))
         operation["updatedAt"] = now_iso()
         self.db.execute("INSERT INTO simple_video_operations VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload",
                         (operation["id"], operation["videoId"], json.dumps(operation, ensure_ascii=False)))
@@ -383,10 +390,10 @@ class VideoManager:
         active_operations = {}
         for operation in self.store.list_operations():
             if (operation.get('state') in {'queued', 'running', 'waiting_connection', 'reconciling', 'paused'}
-                    or operation.get('kind') in {'withdraw', 'recapture', 'terminate-capture'}
+                    or operation.get('kind') in {'withdraw', 'correction', 'recapture', 'terminate-capture'}
                     and operation.get('state') in {'attention', 'conflict'}):
-                active_operations[(operation.get('videoId'), operation.get('version'),
-                                   operation.get('expectedRevision'))] = operation
+                active_operations.setdefault((operation.get('videoId'), operation.get('version'),
+                                              operation.get('expectedRevision')), operation)
         rows = []
         source_rows = self.store.list() if identity is None else [self.store.get(identity)]
         for row in source_rows:
@@ -991,6 +998,13 @@ class VideoManager:
     def operation_identity(video_id, kind, request_id):
         return hashlib.sha256(f"{video_id}:{kind}:{request_id}".encode()).hexdigest()[:32]
 
+    def operation_for_request(self, video_id, kind, request_id):
+        operation = self.store.get_operation(self.operation_identity(video_id, kind, request_id))
+        if not operation and kind in {'restart-download', 'correction', 'recapture'}:
+            operation = next((saved for saved in self.store.list_operations(video_id)
+                if saved.get('kind') == kind and request_id in saved.get('requestAliases', [])), None)
+        return operation
+
     @staticmethod
     def public_operation(operation):
         if not operation:
@@ -1024,10 +1038,7 @@ class VideoManager:
         operation_payload = {key: value for key, value in payload.items()
                              if key in {"startTime", "durationSeconds", "repair", "mode", "collectionSource"}}
         operation_id = self.operation_identity(identity, kind, request_id)
-        existing = self.store.get_operation(operation_id)
-        if kind == 'restart-download' and not existing:
-            existing = next((saved for saved in self.store.list_operations(identity)
-                if saved.get('kind') == kind and request_id in saved.get('requestAliases', [])), None)
+        existing = self.operation_for_request(identity, kind, request_id)
         version = payload.get("version", existing.get("version") if existing else row.get("activeRevision"))
         if existing:
             same_request = (
@@ -1086,13 +1097,22 @@ class VideoManager:
             current = self.version(row, version)
             if current.get('state') == 'withdrawing':
                 raise Conflict('本版正在撤回，请等待撤回完成后再更正。')
+            operations = self.store.list_operations(identity)
+            duplicate = next((entry for entry in operations if entry.get('kind') == kind
+                and entry.get('version') == version and entry.get('expectedRevision') == expected_revision
+                and entry.get('payload') == operation_payload
+                and entry.get('state') in {'queued', 'running', 'waiting_connection', 'reconciling'}), None)
+            if duplicate:
+                duplicate['requestAliases'] = list(dict.fromkeys([*duplicate.get('requestAliases', []), request_id]))
+                self.store.save_operation(duplicate)
+                return {'operationId': duplicate['id'], 'state': duplicate['state'], 'videoId': identity}
             if kind == 'recapture' and operation_payload.get('mode') == 'force':
                 if not self.can_force_recapture(row, current):
                     raise Conflict('本版没有可核对的原任务，或仍在处理，请先核对或等待完成。')
             if any(entry.get('kind') in {'correction', 'recapture', 'withdraw'}
                    and (operation_payload.get('mode') == 'force' or entry.get('payload', {}).get('mode') == 'force')
                    and entry.get('state') in {'queued', 'running', 'waiting_connection', 'reconciling'}
-                   for entry in self.store.list_operations(identity)):
+                   for entry in operations):
                 raise Conflict('该视频已有采集或撤回操作正在进行，请等待核对结果。')
             if kind == 'correction':
                 start = parse_time(payload.get('startTime'))
@@ -1796,8 +1816,7 @@ class VideoManager:
         return self.queue_video_operation(identity, "correction", payload)
 
     async def recapture_unavailable(self, identity, payload):
-        operation_id = self.operation_identity(identity, "recapture", payload.get("requestId", ""))
-        if payload.get("requestId") and self.store.get_operation(operation_id):
+        if payload.get("requestId") and self.operation_for_request(identity, 'recapture', payload['requestId']):
             return self.queue_video_operation(identity, "recapture", payload)
         row = self.store.get(identity)
         if not row or row.get("deletedAt"):
