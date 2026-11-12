@@ -17,7 +17,7 @@ case "$action" in
 esac
 
 folder=${0:A:h}
-resources="$folder/运行组件/采集助手.app/Contents/Resources"
+resources="$folder/运行组件"
 python="$resources/runtime/backend/bin/python3.13"
 launcher="$resources/application/launcher.py"
 

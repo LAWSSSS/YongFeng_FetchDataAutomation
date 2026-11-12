@@ -1,4 +1,4 @@
-"""Assemble an allowlisted, self-contained macOS arm64 application.
+"""Assemble an allowlisted, self-contained macOS arm64 command package.
 
 The base interpreters must be python-build-standalone install_only distributions,
 not virtual environments. Dependencies are installed anew from locked wheels.
@@ -10,7 +10,6 @@ import ctypes
 import hashlib
 import json
 import os
-import plistlib
 import shutil
 import subprocess
 import sys
@@ -23,7 +22,7 @@ sys.path.insert(0, str(ROOT))
 from app.runtime import BUNDLE_ID, VERSION
 from scripts.fetch_models import verify as verify_models
 from scripts.package_safety import (
-    PORTABLE_APP, PORTABLE_COMMAND, inventory_digest, inventory_tree, relative_name,
+    PORTABLE_COMMAND, PORTABLE_RESOURCES, inventory_digest, inventory_tree, relative_name,
     source_inventory, verify_requirement_wheels,
 )
 from scripts.scan_secrets import issues
@@ -130,17 +129,17 @@ def collect_licenses(resources, wheels):
     (resources / "dependencies.json").write_text(json.dumps(inventory, indent=2) + "\n")
 
 
-def audit_binaries(app):
+def audit_binaries(resources):
     # Strip resource-fork/Finder metadata from newly assembled copies only.
     # Never clear quarantine on a user's downloaded application or alter Gatekeeper.
     libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
     libc.removexattr.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]
-    for path in (app, *app.rglob("*")):
+    for path in (resources, *resources.rglob("*")):
         if path.is_symlink():
             continue
         for name in ("com.apple.FinderInfo", "com.apple.ResourceFork"):
             libc.removexattr(os.fsencode(path), name.encode(), 0)
-    binaries = [path for path in app.rglob("*") if is_macho(path)]
+    binaries = [path for path in resources.rglob("*") if is_macho(path)]
     for path in binaries:
         if path.suffix == ".dylib":
             identifiers = subprocess.check_output(["/usr/bin/otool", "-arch", "arm64", "-D", str(path)], text=True).splitlines()[1:]
@@ -153,25 +152,17 @@ def audit_binaries(app):
             if link.startswith("/") and not link.startswith(("/usr/lib/", "/System/Library/")):
                 # Dylib self identifiers may be absolute in upstream Python wheels;
                 # require them to be relocatable too.
-                raise ValueError(f"Nonportable binary dependency: {path.relative_to(app)}")
+                raise ValueError(f"Nonportable binary dependency: {path.relative_to(resources)}")
         commands = subprocess.check_output(["/usr/bin/otool", "-arch", "arm64", "-l", str(path)], text=True)
         lines = commands.splitlines()
         for index, line in enumerate(lines):
             if line.strip().startswith("minos ") or (index and "LC_VERSION_MIN_MACOSX" in lines[index-1] and line.strip().startswith("version ")):
                 version = line.split()[-1]
                 if tuple(map(int, version.split(".")[:2])) > (14, 0):
-                    raise ValueError(f"Requires macOS newer than 14: {path.relative_to(app)}")
-        if path != app / "Contents/MacOS/Launcher":
-            run("/usr/bin/codesign", "--force", "--sign", "-", "--timestamp=none", path,
-                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    try:
-        run("/usr/bin/codesign", "--force", "--sign", "-", "--timestamp=none", app,
+                    raise ValueError(f"Requires macOS newer than 14: {path.relative_to(resources)}")
+        run("/usr/bin/codesign", "--force", "--sign", "-", "--timestamp=none", path,
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    except subprocess.CalledProcessError as error:
-        if b"resource fork" in (error.stderr or b"") or b"Finder information" in (error.stderr or b""):
-            raise ValueError("The output directory adds Finder/sync metadata. Build in the default local Library/Caches directory, then distribute the ZIP.") from None
-        raise
-    run("/usr/bin/codesign", "--verify", "--deep", "--strict", app)
+        run("/usr/bin/codesign", "--verify", "--strict", path)
     return len(binaries)
 
 
@@ -187,12 +178,9 @@ def assemble(args):
     if output.exists():
         raise ValueError("Output already exists. Choose a fresh staging directory.")
     output.mkdir(parents=True)
-    app = output / PORTABLE_APP
-    contents = app / "Contents"
-    resources = contents / "Resources"
+    resources = output / PORTABLE_RESOURCES
     application = resources / "application"
     application.mkdir(parents=True)
-    (contents / "MacOS").mkdir()
     # Only source modules, fresh web build and explicit resource lists enter the app.
     for entry in sources:
         if not entry["path"].startswith("app/"):
@@ -226,24 +214,6 @@ def assemble(args):
     web_licenses.mkdir()
     for name in ("react", "react-dom", "scheduler", "@phosphor-icons/react"):
         shutil.copy2(ROOT / "node_modules" / name / "LICENSE", web_licenses / (name.replace("/", "-") + ".txt"))
-    env = {**os.environ, "MACOSX_DEPLOYMENT_TARGET": "14.0"}
-    launcher = contents / "MacOS/Launcher"
-    run("/usr/bin/clang", "-arch", "arm64", "-mmacosx-version-min=14.0", "-fobjc-arc",
-        "-framework", "Cocoa", ROOT / "scripts/mac_launcher.m", "-o", launcher, env=env)
-    info = {"CFBundleExecutable": "Launcher", "CFBundleIdentifier": BUNDLE_ID,
-            "CFBundleName": "采集助手", "CFBundleDisplayName": "采集助手",
-            "CFBundleShortVersionString": VERSION, "CFBundleVersion": VERSION,
-            "CFBundlePackageType": "APPL", "LSMinimumSystemVersion": "14.0",
-            "LSArchitecturePriority": ["arm64"], "NSHighResolutionCapable": True,
-            "NSLocalNetworkUsageDescription": "连接用户指定的质检、采集和视觉AI平台。"}
-    (contents / "Info.plist").write_bytes(plistlib.dumps(info))
-    stop_app = app.with_name("停止采集助手.app")
-    stop_contents = stop_app / "Contents"
-    (stop_contents / "MacOS").mkdir(parents=True)
-    shutil.copy2(launcher, stop_contents / "MacOS/Launcher")
-    stop_info = {**info, "CFBundleIdentifier": BUNDLE_ID + ".stop", "IVGStopOnly": True,
-                 "CFBundleName": "停止采集助手", "CFBundleDisplayName": "停止采集助手"}
-    (stop_contents / "Info.plist").write_bytes(plistlib.dumps(stop_info))
     package = {"bundleId": BUNDLE_ID, "version": VERSION, "packageId": uuid4().hex,
                "platform": "macos-arm64", "minimumMacOS": "14.0", "runtimes": runtimes,
                "sourceCommit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
@@ -258,7 +228,7 @@ def assemble(args):
     command = output / PORTABLE_COMMAND
     shutil.copy2(ROOT / "scripts/portable_command.sh", command)
     command.chmod(0o755)
-    binaries = audit_binaries(app) + audit_binaries(stop_app)
+    binaries = audit_binaries(resources)
     # Export the actual working tree, including reviewed new modules. HEAD alone
     # cannot reproduce an uncommitted pre-release; never label it as that commit.
     if sources != source_inventory(ROOT):

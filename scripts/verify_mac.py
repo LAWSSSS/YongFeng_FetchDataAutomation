@@ -16,7 +16,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from scripts.package_safety import PORTABLE_APP, PORTABLE_COMMAND, verify_tree
+from scripts.package_safety import PORTABLE_COMMAND, PORTABLE_RESOURCES, verify_tree
 
 
 def read(url):
@@ -26,6 +26,10 @@ def read(url):
 
 
 def verify_files(folder):
+    if any(folder.rglob("*.app")):
+        raise ValueError("The command-only package must not contain macOS application bundles.")
+    if not os.access(folder / PORTABLE_COMMAND, os.X_OK):
+        raise ValueError("The startup command must be executable after extraction.")
     manifest = json.loads((folder / "文件校验.json").read_text())
     verify_tree(folder, manifest)
     print(f'Verified {len(manifest["files"])} packaged file checksums.')
@@ -36,7 +40,7 @@ def invoke(folder, profile, *arguments, instance_dir):
     env.update(IVG_TEST_INSTANCE_DIR=str(instance_dir), IVG_SKIP_SAVED_CONNECTIONS="1", PATH="/usr/bin:/bin")
     if profile is not None:
         env["IVG_PROFILE_DIR"] = str(profile)
-    result = subprocess.run(["/bin/zsh", str(folder / PORTABLE_COMMAND), *arguments, "--output", "json"],
+    result = subprocess.run([str(folder / PORTABLE_COMMAND), *arguments, "--output", "json"],
                             env=env, cwd=instance_dir.parent, capture_output=True, text=True, timeout=100)
     if result.returncode:
         raise RuntimeError(result.stderr.strip() or "Portable launch failed.")
@@ -61,7 +65,8 @@ def smoke(folder):
         assert not profile.exists()
         first = run(folder, profile, "start", "--no-browser")
         try:
-            assert first["port"] != 8786
+            if owns_blocker:
+                assert first["port"] != 8786
             base = f'http://127.0.0.1:{first["port"]}'
             assert read(base + "/api/health")["instanceId"] == first["instanceId"]
             assert not read(base + "/api/videos")["videos"]
@@ -140,7 +145,7 @@ print(json.dumps(outputs))
 
 
 def parity(folder, reference_python, samples, reference_models):
-    resources = folder / PORTABLE_APP / "Contents/Resources"
+    resources = folder / PORTABLE_RESOURCES
     def settings(models):
         return {"magnetDeployDirectory": str(models / "magnet"), "magnetModelPath": str(models / "magnet/best.onnx"),
                 "bedDeployDirectory": str(models / "bed"), "bedModelPath": str(models / "bed/model.pt"),

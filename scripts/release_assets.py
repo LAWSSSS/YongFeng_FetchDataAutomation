@@ -12,7 +12,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from app.runtime import VERSION
-from scripts.package_safety import PORTABLE_APP, inventory_tree, verify_tree
+from scripts.package_safety import PORTABLE_RESOURCES, inventory_tree, verify_tree
 
 
 def sha(path):
@@ -33,7 +33,7 @@ def main():
     if manifest.get("version") != VERSION:
         raise ValueError("Package version does not match the current source.")
     destination = args.output / f"gather-assistant-{VERSION}-macos-arm64.zip"
-    # App signatures and executable modes survive Archive Utility extraction.
+    # Runtime signatures and executable modes survive Archive Utility extraction.
     # Source files have no resource forks; exclude incidental build metadata.
     with tempfile.TemporaryDirectory(prefix=".package-", dir=args.output) as staging:
         package = Path(staging) / args.folder.name
@@ -45,7 +45,7 @@ def main():
         (package / "文件校验.json").write_text(json.dumps(delivered, ensure_ascii=False, indent=2) + "\n")
         subprocess.run(["/usr/bin/ditto", "-c", "-k", "--norsrc", "--keepParent", str(package),
                         str(destination.resolve())], check=True)
-    resources = args.folder / PORTABLE_APP / "Contents/Resources"
+    resources = args.folder / PORTABLE_RESOURCES
     shutil.copy2(args.folder / "源码与模型.zip", args.output / f"source-and-models-{VERSION}.zip")
     model_manifest = json.loads((ROOT / "assets/models/manifest.json").read_text())
     with zipfile.ZipFile(args.output / "models-v1.zip", "w", compression=zipfile.ZIP_DEFLATED) as archive:

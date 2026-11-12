@@ -21,6 +21,7 @@ APP_ROOT = Path(__file__).resolve().parent
 RESOURCES = APP_ROOT.parent
 sys.path.insert(0, str(APP_ROOT if (APP_ROOT / "app").is_dir() else APP_ROOT.parent))
 from app import local_instance
+from app.runtime import portable_package_directory
 
 
 def private_json(path, value):
@@ -48,9 +49,7 @@ def clear_server_state(home, instance_id):
 
 
 def profile():
-    folder = RESOURCES.parents[2]
-    if folder.name == "运行组件":
-        folder = folder.parent
+    folder = portable_package_directory(RESOURCES)
     return Path(os.environ.get("IVG_PROFILE_DIR") or folder / "数据" / "系统").expanduser().resolve()
 
 

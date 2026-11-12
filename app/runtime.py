@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 import shutil
 
-VERSION = "1.3.11"
+VERSION = "1.3.12"
 BUNDLE_ID = "cn.yongfeng.video-gather.standalone"
 PROFILE_NAME = "InspectionVideoGatherStandalone"
 
@@ -22,9 +22,16 @@ def profile_directory() -> Path:
     return Path(os.environ.get("IVG_PROFILE_DIR") or data_directory() / "系统").expanduser().resolve()
 
 
+def portable_package_directory(resource_directory: Path) -> Path:
+    if resource_directory.name == "运行组件":
+        return resource_directory.parent
+    # Older packages put the runtime inside an application bundle.
+    folder = resource_directory.parents[2]
+    return folder.parent if folder.name == "运行组件" else folder
+
+
 def application_directory() -> Path:
-    # Resources is inside X.app/Contents. Mutable files belong beside X.app.
-    return resources().parents[2] if portable() else Path(__file__).resolve().parents[1]
+    return portable_package_directory(resources()) if portable() else Path(__file__).resolve().parents[1]
 
 
 def data_directory() -> Path:
