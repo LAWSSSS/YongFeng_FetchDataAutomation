@@ -16,7 +16,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from scripts.package_safety import verify_tree
+from scripts.package_safety import PORTABLE_APP, PORTABLE_COMMAND, verify_tree
 
 
 def read(url):
@@ -32,13 +32,12 @@ def verify_files(folder):
 
 
 def invoke(folder, profile, *arguments, instance_dir):
-    resources = folder / "采集助手.app/Contents/Resources"
     env = {key: value for key, value in os.environ.items() if not key.startswith(("PYTHON", "DYLD_", "LD_", "IVG_"))}
-    env.update(IVG_PROFILE_DIR=str(profile), IVG_TEST_INSTANCE_DIR=str(instance_dir),
-               IVG_SKIP_SAVED_CONNECTIONS="1", PATH="/usr/bin:/bin", PYTHONNOUSERSITE="1")
-    result = subprocess.run([str(resources / "runtime/backend/bin/python3.13"), "-I", "-B",
-                             str(resources / "application/launcher.py"), *arguments],
-                            env=env, cwd=folder, capture_output=True, text=True, timeout=100)
+    env.update(IVG_TEST_INSTANCE_DIR=str(instance_dir), IVG_SKIP_SAVED_CONNECTIONS="1", PATH="/usr/bin:/bin")
+    if profile is not None:
+        env["IVG_PROFILE_DIR"] = str(profile)
+    result = subprocess.run(["/bin/zsh", str(folder / PORTABLE_COMMAND), *arguments, "--output", "json"],
+                            env=env, cwd=instance_dir.parent, capture_output=True, text=True, timeout=100)
     if result.returncode:
         raise RuntimeError(result.stderr.strip() or "Portable launch failed.")
     return json.loads(result.stdout)
@@ -58,7 +57,9 @@ def smoke(folder):
             owns_blocker = True
         except OSError:
             blocker.close()  # The user's existing server already provides the conflict.
-        first = run(folder, profile, "launch", "--no-browser")
+        assert not run(folder, profile, "status")["running"]
+        assert not profile.exists()
+        first = run(folder, profile, "start", "--no-browser")
         try:
             assert first["port"] != 8786
             base = f'http://127.0.0.1:{first["port"]}'
@@ -69,6 +70,7 @@ def smoke(folder):
                 assert isinstance(read(base + endpoint), dict), endpoint
             second = run(folder, profile, "launch", "--no-browser")
             assert second["pid"] == first["pid"]
+            assert run(folder, profile, "status")["pid"] == first["pid"]
             other_profile = work / "另一个数据目录"
             try:
                 run(folder, other_profile, "launch", "--no-browser")
@@ -108,18 +110,17 @@ def smoke(folder):
 
         # Moving the live application and its default profile preserves the
         # writer's lock inode. Reopening the moved bundle must replace that writer.
-        live_profile = moved / '数据/系统'
-        live = run(moved, live_profile, 'launch', '--no-browser')
+        live = run(moved, None, 'start', '--no-browser')
         renamed = work / '运行中改名 中文'
         moved.rename(renamed)
         try:
-            reopened = run(renamed, renamed / '数据/系统', 'launch', '--no-browser')
+            reopened = run(renamed, None, 'start', '--no-browser')
             assert reopened['profileId'] == live['profileId']
             assert reopened['instanceId'] != live['instanceId']
             assert read(f'http://127.0.0.1:{reopened["port"]}/api/health')['pid'] == reopened['pid']
             print('Live folder rename restarts the same profile from its new path.')
         finally:
-            run(renamed, renamed / '数据/系统', 'stop')
+            run(renamed, None, 'stop')
 
 
 PARITY_SCRIPT = '''
@@ -139,7 +140,7 @@ print(json.dumps(outputs))
 
 
 def parity(folder, reference_python, samples, reference_models):
-    resources = folder / "采集助手.app/Contents/Resources"
+    resources = folder / PORTABLE_APP / "Contents/Resources"
     def settings(models):
         return {"magnetDeployDirectory": str(models / "magnet"), "magnetModelPath": str(models / "magnet/best.onnx"),
                 "bedDeployDirectory": str(models / "bed"), "bedModelPath": str(models / "bed/model.pt"),

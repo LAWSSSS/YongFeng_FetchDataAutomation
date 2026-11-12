@@ -8,13 +8,15 @@
 
 适用于 **Apple 芯片 Mac（M 系列）和 macOS 14 或更新版本**。可以在苹果菜单的「关于本机」查看芯片和系统版本。
 
-1. 下载 Mac 完整版。完整包包含运行环境、视频工具和识别模型。 [下载 Mac 完整版 ZIP](https://github.com/LAWSSSS/YongFeng_FetchDataAutomation/releases/download/v1.3.10/gather-assistant-1.3.10-macos-arm64.zip)
+1. 下载 **Mac 终端版 ZIP**。完整包包含运行环境、视频工具和识别模型。 [下载 v1.3.11](https://github.com/LAWSSSS/YongFeng_FetchDataAutomation/releases/download/v1.3.11/gather-assistant-1.3.11-macos-arm64.zip)
 2. 在访达的「下载」文件夹双击 ZIP，把解压出来的 **采集助手-Mac-arm64** 整个文件夹移到「文稿」或其他可写位置。
-3. 双击文件夹里的 **采集助手**。浏览器自动打开后，页面上方会显示 **日期采集、视频确认、处理结果、设置**。以后也可双击应用回到网页。
+3. 打开「终端」，运行下面的命令。这个例子假设你把文件夹放在了「文稿」。
 
-### 首次启动遇到 macOS 提示
+```sh
+zsh "$HOME/Documents/采集助手-Mac-arm64/启动采集助手.command"
+```
 
-首次打开时，macOS 可能提示「无法验证开发者」或「Apple 无法检查是否包含恶意软件」。确认 ZIP 来自可信的 GitHub 发布页后，打开 **系统设置 → 隐私与安全性**，找到采集助手，点击 **仍要打开**，按系统提示确认。公司管理的 Mac 若没有该按钮，请联系 IT。 [GitHub 发布页](https://github.com/LAWSSSS/YongFeng_FetchDataAutomation/releases/tag/v1.3.10) · [Apple 的打开说明](https://support.apple.com/zh-cn/102445)
+文件夹放在其他位置时，在终端输入 `zsh` 和一个空格，把「启动采集助手.command」从访达拖进终端，再按回车。命令会自动打开网页，并在终端显示实际网址。保留「启动采集助手.command」「运行组件」和「数据」在同一文件夹，路径可以含中文和空格。
 
 ## 2. 连接工作平台
 
@@ -79,8 +81,14 @@
 
 ### 停止或升级应用
 
-- **停止**。在程序文件夹里双击 **停止采集助手**。准备拔下外置盘或移动程序时，先停止后台。
-- **升级**。先停止旧版并备份旁边的 **数据** 文件夹。把新版解压到一个新文件夹，将备份的 **数据** 复制到新版应用旁，然后打开新版。继续使用外置盘时，启动前先接上原盘。
+在启动命令末尾加 `status` 可查看运行状态和网址，加 `stop` 可停止后台。以下仍以「文稿」下的安装为例。
+
+```sh
+zsh "$HOME/Documents/采集助手-Mac-arm64/启动采集助手.command" status
+zsh "$HOME/Documents/采集助手-Mac-arm64/启动采集助手.command" stop
+```
+
+升级时先停止旧版。旧安装有「停止采集助手.app」时，可用它停止。备份 **数据** 文件夹，再把它复制到解压后的新版文件夹，放在「启动采集助手.command」旁。若工作区在外置盘，启动前请接上原盘。
 
 同一个 macOS 账户一次运行一份采集助手。再次打开同一安装会回到当前网页。切换安装目录、版本或源码版前，先停止原后台。仅关闭浏览器、移走应用或把应用放进废纸篓，后台仍可能继续运行。
 
@@ -88,10 +96,10 @@
 
 | 现象 | 先做什么 |
 | --- | --- |
-| GitHub 下载显示 404 | 请从发布页重新下载，或检查网络连接。 [GitHub 发布页](https://github.com/LAWSSSS/YongFeng_FetchDataAutomation/releases/tag/v1.3.10) |
-| 解压后看到「启动简易版.command」 | 这是源码包。日常使用请下载 **Mac 完整版 ZIP**，解压后双击「采集助手」。 |
-| 浏览器没有打开 | 再双击「采集助手」。若弹窗给出以 `127.0.0.1` 开头的本机地址，把它粘贴到浏览器地址栏。 |
-| 应用提示已损坏 | 从发布页重新下载 ZIP 并完整解压。如果提示仍出现，记录提示文字以便排查。 |
+| GitHub 下载显示 404 | 请从发布页重新下载，或检查网络连接。 [GitHub 发布页](https://github.com/LAWSSSS/YongFeng_FetchDataAutomation/releases/tag/v1.3.11) |
+| 解压后看到「启动简易版.command」 | 这是源码包。日常使用请选择包含「启动采集助手.command」的 **Mac 完整版 ZIP**。 |
+| 浏览器没有打开 | 运行 `zsh ./启动采集助手.command status`，把终端显示的本机地址粘贴到浏览器地址栏。 |
+| 提示找不到内置运行组件 | 完整解压 ZIP，并把「启动采集助手.command」和「运行组件」放在同一文件夹。 |
 | 程序位置不可写 | 在访达把整个程序文件夹移到「文稿」等可写位置后再打开。已经使用过的应用先停止，再连同「数据」一起移动。 |
 | 查询没有记录，或某条不能勾选 | 核对日期、质检网站连接和记录旁的原因。默认要求质检时长**超过 10 分钟**，并且有真实车牌或至少一张有效的智能判级照片。准入条件可在 **设置 → 采集设置** 查看。 |
 | 提示已有采集 | 可打开已有记录，也可勾选后点 **确认采集所选**。若提示原任务归属不明，先在采集平台核对任务 ID。 |
@@ -106,4 +114,4 @@
 
 源码版需要 Python 3.13 和 Node.js 22.13 或更新版本。在源码目录打开终端并运行 `zsh ./启动简易版.command`，停止时运行 `zsh ./启动简易版.command stop`。
 
-源码版的照片识别还需要 Python 3.11、FFmpeg、ffprobe 和模型包。将模型 ZIP 放到源码目录，运行 `zsh ./启动简易版.command setup-models ./models-v1.zip`，再重启应用。 [下载 models-v1.zip](https://github.com/LAWSSSS/YongFeng_FetchDataAutomation/releases/download/v1.3.10/models-v1.zip)
+源码版的照片识别还需要 Python 3.11、FFmpeg、ffprobe 和模型包。将模型 ZIP 放到源码目录，运行 `zsh ./启动简易版.command setup-models ./models-v1.zip`，再重启应用。 [下载 models-v1.zip](https://github.com/LAWSSSS/YongFeng_FetchDataAutomation/releases/download/v1.3.11/models-v1.zip)

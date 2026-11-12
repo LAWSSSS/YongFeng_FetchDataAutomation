@@ -11,6 +11,9 @@ import subprocess
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name, parse_wheel_filename
 
+PORTABLE_APP = Path("运行组件/采集助手.app")
+PORTABLE_COMMAND = "启动采集助手.command"
+
 ROOT_FILES = {".gitignore", "README.md", "THIRD_PARTY_NOTICES.md", "pytest.ini", "index.html", "package.json",
               "package-lock.json", "tsconfig.json", "vite.config.ts", "packaging.lock.json",
               "requirements.txt", "requirements.lock.txt", "requirements-slicing.txt",

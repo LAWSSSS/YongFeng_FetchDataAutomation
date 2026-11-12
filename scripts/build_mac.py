@@ -22,7 +22,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from app.runtime import BUNDLE_ID, VERSION
 from scripts.fetch_models import verify as verify_models
-from scripts.package_safety import source_inventory, inventory_digest, inventory_tree, relative_name, verify_requirement_wheels
+from scripts.package_safety import (
+    PORTABLE_APP, PORTABLE_COMMAND, inventory_digest, inventory_tree, relative_name,
+    source_inventory, verify_requirement_wheels,
+)
 from scripts.scan_secrets import issues
 
 MACH_HEADERS = {b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf", b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca"}
@@ -184,7 +187,7 @@ def assemble(args):
     if output.exists():
         raise ValueError("Output already exists. Choose a fresh staging directory.")
     output.mkdir(parents=True)
-    app = output / "采集助手.app"
+    app = output / PORTABLE_APP
     contents = app / "Contents"
     resources = contents / "Resources"
     application = resources / "application"
@@ -234,7 +237,7 @@ def assemble(args):
             "LSArchitecturePriority": ["arm64"], "NSHighResolutionCapable": True,
             "NSLocalNetworkUsageDescription": "连接用户指定的质检、采集和视觉AI平台。"}
     (contents / "Info.plist").write_bytes(plistlib.dumps(info))
-    stop_app = output / "停止采集助手.app"
+    stop_app = app.with_name("停止采集助手.app")
     stop_contents = stop_app / "Contents"
     (stop_contents / "MacOS").mkdir(parents=True)
     shutil.copy2(launcher, stop_contents / "MacOS/Launcher")
@@ -252,6 +255,9 @@ def assemble(args):
     run(args.pandoc, "--from=gfm", "--to=html5", "--standalone", "--variable=lang:zh-CN",
         "--metadata=pagetitle:采集助手使用说明", ROOT / "README.md", "--output", output / "使用说明.html")
     shutil.copy2(ROOT / "THIRD_PARTY_NOTICES.md", output / "THIRD_PARTY_NOTICES.md")
+    command = output / PORTABLE_COMMAND
+    shutil.copy2(ROOT / "scripts/portable_command.sh", command)
+    command.chmod(0o755)
     binaries = audit_binaries(app) + audit_binaries(stop_app)
     # Export the actual working tree, including reviewed new modules. HEAD alone
     # cannot reproduce an uncommitted pre-release; never label it as that commit.

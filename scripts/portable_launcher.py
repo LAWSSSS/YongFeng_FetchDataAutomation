@@ -48,8 +48,10 @@ def clear_server_state(home, instance_id):
 
 
 def profile():
-    return Path(os.environ.get("IVG_PROFILE_DIR") or
-                RESOURCES.parents[2] / "数据" / "系统").expanduser().resolve()
+    folder = RESOURCES.parents[2]
+    if folder.name == "运行组件":
+        folder = folder.parent
+    return Path(os.environ.get("IVG_PROFILE_DIR") or folder / "数据" / "系统").expanduser().resolve()
 
 
 @contextlib.contextmanager
@@ -231,20 +233,47 @@ def stop():
         return {"stopped": False, "retry": True, "message": "正在等待当前写入安全结束，请稍后重试停止。"}
 
 
+def status():
+    home = profile()
+    profile_id = read_json(home / "profile.json").get("id")
+    state = read_json(home / "server.json")
+    if (profile_id and (home / "server.lock").is_file()
+            and verified_server(state, profile_id) and server_locked(home)):
+        return {**state, "running": True}
+    return {"running": False}
+
+
+def print_result(action, result, output):
+    if output == "json":
+        print(json.dumps(result, ensure_ascii=False))
+    elif action == "stop":
+        print("采集助手已停止，数据和进度已保留。" if result["stopped"] else result["message"])
+    elif action == "status" and not result["running"]:
+        print("这个数据目录的后台未运行。")
+    else:
+        print(f"采集助手 {result['version']} 正在运行：http://127.0.0.1:{result['port']}/")
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("action", nargs="?", choices=("launch", "serve", "stop"), default="launch")
+    parser.add_argument("action", nargs="?", choices=("launch", "serve", "stop", "status"), default="launch")
     parser.add_argument("--no-browser", action="store_true")
     parser.add_argument("--instance-id", default="")
+    parser.add_argument("--output", choices=("json", "text"), default="json")
     args = parser.parse_args()
     try:
         if args.action == "serve":
             serve(args.instance_id)
         else:
-            result = stop() if args.action == "stop" else launch(args.no_browser)
+            if args.action == "stop":
+                result = stop()
+            elif args.action == "status":
+                result = status()
+            else:
+                result = launch(args.no_browser)
             if result.get("retry"):
                 raise RuntimeError(result["message"])
-            print(json.dumps(result, ensure_ascii=False))
+            print_result(args.action, result, args.output)
     except (OSError, RuntimeError) as error:
         # No remote URL, credential or platform response is ever part of this error.
         message = str(error) if isinstance(error, RuntimeError) else "无法启动，请检查应用和数据目录权限。"
