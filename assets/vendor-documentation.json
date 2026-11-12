@@ -1,11 +1,10 @@
 {
   "description": "Unmodified pinned third-party documentation containing public URL syntax examples. Only these exact file hashes may suppress the embedded-url-password rule. Other secret rules still apply.",
   "files": {
-    "backend/lib/python3.13/site-packages/botocore/httpsession.py": "14b2961314c711499da785ec30f00d9b04ead55a4403b2aba5c5e822ffd93b7b",
-    "backend/lib/python3.13/site-packages/httpx/_urls.py": "757f7d551d4348e1e9828f40abb3f360ee0529dc6a2a3c32369f20adff1d1cdd",
-    "backend/lib/python3.13/site-packages/pydantic/networks.py": "6085ec09a594a84ec533000ee6e8d85c294c2f123728fe9ed8c755c273f95f8b",
-    "backend/lib/python3.13/site-packages/urllib3/util/url.py": "6a2814d91987dd9728278d413a154ee5277b15cb262d9945425377f2a693311f",
-    "backend/lib/python3.13/site-packages/pip/_vendor/urllib3/util/url.py": "3c40d0332a6276e75ed2701972d2cb8852bd7a937e2cf9d21fb2a938b2f0a87d",
-    "inference/lib/python3.11/site-packages/pip/_vendor/urllib3/util/url.py": "942004ecce66c80f040dd5b4b09bb2c9985507d2bf8f7f258d684702715a5a81"
+    "lib/python3.11/site-packages/botocore/httpsession.py": "14b2961314c711499da785ec30f00d9b04ead55a4403b2aba5c5e822ffd93b7b",
+    "lib/python3.11/site-packages/httpx/_urls.py": "757f7d551d4348e1e9828f40abb3f360ee0529dc6a2a3c32369f20adff1d1cdd",
+    "lib/python3.11/site-packages/pydantic/networks.py": "6085ec09a594a84ec533000ee6e8d85c294c2f123728fe9ed8c755c273f95f8b",
+    "lib/python3.11/site-packages/urllib3/util/url.py": "6a2814d91987dd9728278d413a154ee5277b15cb262d9945425377f2a693311f",
+    "lib/python3.11/site-packages/pip/_vendor/urllib3/util/url.py": "942004ecce66c80f040dd5b4b09bb2c9985507d2bf8f7f258d684702715a5a81"
   }
 }

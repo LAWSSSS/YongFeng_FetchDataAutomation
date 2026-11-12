@@ -164,18 +164,28 @@ def audit_binaries(resources):
     return len(binaries)
 
 
+def verify_web_build(web, sources):
+    index = web / "index.html"
+    if not index.is_file():
+        raise ValueError("A frontend build is required. Run npm run build first.")
+    inputs = (entry["path"] for entry in sources if entry["path"].startswith(("src/", "public/"))
+              or entry["path"] in {"index.html", "package.json", "package-lock.json", "tsconfig.json", "vite.config.ts"})
+    build_time = index.stat().st_mtime_ns
+    if any((ROOT / name).stat().st_mtime_ns > build_time for name in inputs):
+        raise ValueError("The frontend build is older than the source. Run npm run build again.")
+    inventory_tree(web)
+
+
 def assemble(args):
     sources = source_inventory(ROOT)
     for entry in sources:
         if issues((ROOT / entry["path"]).read_bytes()):
             raise ValueError(f'Credential scan failed: {entry["path"]}')
-    if not (args.web / "index.html").is_file():
-        raise ValueError("A fresh frontend build is required.")
+    verify_web_build(args.web, sources)
     ffmpeg = args.ffmpeg_tools / "bin/ffmpeg"
     ffprobe = ffmpeg.with_name("ffprobe")
     if not is_macho(ffmpeg) or not ffprobe.is_symlink() or os.readlink(ffprobe) != "ffmpeg":
         raise ValueError("Build the shared FFmpeg tools with scripts/build_ffmpeg.sh first.")
-    inventory_tree(args.web)  # Reject links escaping the fresh web build.
     output = args.output.resolve()
     if output.exists():
         raise ValueError("Output already exists. Choose a fresh staging directory.")

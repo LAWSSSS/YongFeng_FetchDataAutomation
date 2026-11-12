@@ -2,10 +2,15 @@ import hashlib
 import io
 import json
 from pathlib import Path
+import sqlite3
+from threading import Event
+from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 
-from app.original_restore import RestoreFailure, download_bound_object, edge_hash
+from app.file_leases import FileEnvironmentError
+from app.original_restore import OriginalRestoreManager, RestoreFailure, download_bound_object, edge_hash
 
 
 def make_item(data):
@@ -74,6 +79,57 @@ class FakeS3:
 
 def expected_version(data):
     return {"size": len(data), "edgeHash": edge_hash(data[:65536], data[-65536:])}
+
+
+@pytest.mark.asyncio
+async def test_empty_profile_does_not_create_a_legacy_repair():
+    with sqlite3.connect(":memory:") as db:
+        restore = OriginalRestoreManager(db, None, None, None)
+        with pytest.raises(ValueError, match="没有已登记"):
+            await restore.start(str(uuid4()))
+        assert restore.store.load() is None
+
+
+def test_legacy_repair_uses_its_current_managed_workspace(tmp_path):
+    path = tmp_path / "采集视频" / "test_video.mp4"
+    workspace = SimpleNamespace(enabled=True, asset_for=lambda candidate: candidate == path,
+                                media_path=lambda candidate: candidate)
+    with sqlite3.connect(":memory:") as db:
+        restore = OriginalRestoreManager(db, SimpleNamespace(workspace=workspace), None, None)
+        assert restore._destination(path, path.name) == path
+        with pytest.raises(RestoreFailure, match="不在已确认"):
+            restore._destination(tmp_path / path.name, path.name)
+
+        def disconnected(_path):
+            raise FileEnvironmentError("工作区未连接。", "disk_offline")
+
+        workspace.media_path = disconnected
+        with pytest.raises(RestoreFailure) as captured:
+            restore._destination(path, path.name)
+        assert captured.value.code == "disk"
+        assert captured.value.retryable
+
+
+def test_stopping_legacy_restore_keeps_checkpoint_without_publishing(tmp_path):
+    data = bytes(index % 251 for index in range(750_123))
+    item = make_item(data)
+    client = FakeS3(item)
+    destination = tmp_path / item["name"]
+    stop = Event()
+    options = {"chunk_size": 200_000, "workers": 1, "backoff": (0,)}
+    with pytest.raises(RestoreFailure) as captured:
+        download_bound_object(client, item, expected_version(data), destination, **options,
+                              stopping=stop.is_set, progress=lambda *_: stop.set())
+    assert captured.value.code == "stopping"
+    assert not destination.exists()
+    checkpoint = next(tmp_path.glob(".*.restore-*.json"))
+    assert json.loads(checkpoint.read_text())["chunks"]
+
+    calls_before = client.calls.copy()
+    download_bound_object(client, item, expected_version(data), destination, **options)
+    assert destination.read_bytes() == data
+    assert any(calls_before.get(key) == calls for key, calls in client.calls.items())
+    assert not checkpoint.exists()
 
 
 def test_download_retries_a_streaming_range_and_publishes_verified_original(tmp_path):

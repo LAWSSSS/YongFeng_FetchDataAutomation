@@ -128,36 +128,49 @@ def test_profile_id_survives_restart_without_reading_legacy_data(portable):
     assert (home / "profile.json").stat().st_mode & 0o077 == 0
 
 
-def test_source_launcher_skips_other_checkout_and_finds_its_own_nondefault_port(tmp_path, monkeypatch, capsys):
+def test_source_launcher_can_stop_its_own_legacy_service_without_starting_one(tmp_path, monkeypatch, capsys):
     from scripts import local_service
 
     data = tmp_path / "数据" / "系统"
     data.mkdir(parents=True)
     monkeypatch.setattr(local_service, "ROOT", tmp_path)
     monkeypatch.setattr(local_service, "DATA", data)
-    owned = set()
-    monkeypatch.setattr(local_service, "can_bind", lambda port: port == 8787)
-    monkeypatch.setattr(local_service, "check_available", lambda: None)
+    monkeypatch.setattr(local_service.local_instance, "isolated_directory", lambda: None)
+    (data / "local-service-8787.plist").touch()
+    owned = local_service.service_label(8787)
+    bootout = []
 
     def launchctl(argv, **_):
-        if argv[1] == "bootstrap":
-            config = local_service.plistlib.loads(Path(argv[-1]).read_bytes())
-            assert config["ProgramArguments"][0] == str(tmp_path / ".venv/bin/python")
-            owned.add(config["Label"])
-            return SimpleNamespace(returncode=0)
         label = argv[-1].rsplit("/", 1)[-1]
-        return SimpleNamespace(returncode=int(label not in owned), stdout="")
+        assert argv[1] in {"print", "bootout"}
+        if argv[1] == "bootout":
+            bootout.append(label)
+            return SimpleNamespace(returncode=0)
+        return SimpleNamespace(returncode=int(label != owned or bool(bootout)), stdout="")
 
     monkeypatch.setattr(local_service.subprocess, "run", launchctl)
-    local_service.run("start", 8786, False)
-    endpoint = json.loads(capsys.readouterr().out)
-    assert endpoint["port"] == 8787
-    assert endpoint["instanceId"] == local_service.service_label(8787)
-    local_service.run("start", 8786, False)
-    assert json.loads(capsys.readouterr().out) == endpoint
+    with pytest.raises(RuntimeError, match="旧后台仍在运行"):
+        local_service.run("start", 8786, False)
     local_service.run("status", 8786, False)
     assert "127.0.0.1:8787/" in capsys.readouterr().out
-    assert len(owned) == 1
+    local_service.run("stop", 8786, False)
+    assert bootout == [owned]
+    assert "已停止" in capsys.readouterr().out
+
+
+def test_blocked_native_module_reports_startup_failure_and_releases_state(tmp_path, monkeypatch):
+    import uvicorn
+
+    def blocked(*_args, **_kwargs):
+        raise ImportError("dlopen(/sensitive/local/path): library load disallowed by system policy")
+
+    monkeypatch.setattr(uvicorn.Server, "run", blocked)
+    monkeypatch.setattr(launcher, "service_logging", lambda *_: None)
+    monkeypatch.setattr(launcher, "announce", lambda *_: pytest.fail("must not report that startup succeeded"))
+    with pytest.raises(launcher.LaunchError, match="macOS 拦截了内置运行组件") as captured:
+        launcher.serve(tmp_path, True, "text", port=0)
+    assert "/sensitive/" not in str(captured.value)
+    assert not (tmp_path / "server.json").exists()
 
 
 def test_source_uses_system_media_tools_without_building_them(tmp_path, monkeypatch):

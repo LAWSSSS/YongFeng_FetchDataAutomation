@@ -26,44 +26,36 @@ if (!buildTime || newest(path.join(root, 'src')) > buildTime || newest(path.join
         process.exit(result.status ?? 1);
     }
 }
-if (process.platform === 'darwin') {
-    const result = spawnSync(python, [path.join(root, 'scripts/local_service.py'), 'start'], {
-        encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'], cwd: root,
-    });
-    if (result.status !== 0) process.exit(result.status ?? 1);
-    const { port, instanceId, logPath } = JSON.parse(result.stdout);
-    const appUrl = `http://127.0.0.1:${port}/`;
-    console.log(`正在检查后台服务：${appUrl}`);
-    const deadline = Date.now() + 30_000;
-    while (Date.now() < deadline) {
-        try {
-            const response = await fetch(`${appUrl}api/health`, { signal: AbortSignal.timeout(1200) });
-            const health = response.ok ? await response.json() : null;
-            if (health?.app === 'inspection-video-gather-simple' && health.instanceId === instanceId) {
-                console.log(`程序已启动：${appUrl}\n关闭终端后仍会继续运行。停止：zsh ./启动简易版.command stop`);
-                openBrowser(appUrl);
-                process.exit(0);
-            }
-        } catch { /* 等待已保存连接和队列恢复。 */ }
-        await new Promise(resolve => setTimeout(resolve, 500));
-    }
-    console.error(`未能连接此文件夹的后台服务。请查看日志：${logPath}\n如需重新启动，请先运行 zsh ./启动简易版.command stop。`);
-    process.exit(1);
-}
-const appUrl = `http://127.0.0.1:${process.env.PORT || '8786'}`;
-const server = spawn(python, ['-m', 'app.main'], { stdio: 'inherit', cwd: root });
+if (process.argv.includes('--build-only')) process.exit(0);
+
+const mac = process.platform === 'darwin';
+const backend = mac
+    ? ['scripts/local_service.py', 'start', ...process.argv.slice(2)]
+    : ['-m', 'app.main'];
+const server = spawn(python, backend, { stdio: 'inherit', cwd: root });
+server.on('error', () => {
+    console.error('无法启动后端，请按 README.md 检查 Python 环境。');
+    process.exitCode = 1;
+});
 server.on('exit', code => process.exit(code ?? 1));
-for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => server.kill(signal));
-for (let attempt = 0; attempt < 50; attempt++) {
-    await new Promise(resolve => setTimeout(resolve, 200));
-    if (server.exitCode !== null) break;
-    try {
-        if ((await fetch(`${appUrl}/api/health`, { signal: AbortSignal.timeout(1200) })).ok) {
-            console.log(`\n简易版质检视频采集已启动：${appUrl}\n关闭本终端或按 Ctrl+C 可停止本地程序。`);
-            openBrowser(appUrl);
-            break;
-        }
-    } catch { /* 等待服务启动。 */ }
+for (const signal of ['SIGHUP', 'SIGINT', 'SIGTERM']) process.on(signal, () => server.kill(signal));
+if (!mac) await openWhenReady();
+
+async function openWhenReady() {
+    const appUrl = `http://127.0.0.1:${process.env.PORT || '8786'}`;
+    for (let attempt = 0; attempt < 50; attempt++) {
+        await new Promise(resolve => setTimeout(resolve, 200));
+        if (server.exitCode !== null || !server.pid) break;
+        try {
+            const response = await fetch(`${appUrl}/api/health`, { redirect: 'error', signal: AbortSignal.timeout(1200) });
+            const health = response.ok ? await response.json() : null;
+            if (health?.app === 'inspection-video-gather-simple' && health.pid === server.pid) {
+                console.log(`\n简易版质检视频采集已启动：${appUrl}\n关闭本终端或按 Ctrl+C 可停止本地程序。`);
+                openBrowser(appUrl);
+                break;
+            }
+        } catch { /* 等待服务启动。 */ }
+    }
 }
 
 function openBrowser(appUrl) {

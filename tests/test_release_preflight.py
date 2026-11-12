@@ -115,10 +115,48 @@ def test_missing_or_wrong_version_wheel_fails_before_build(tmp_path):
             verify_requirement_wheels(requirements, entries)
 
 
-def test_source_defaults_use_resources_relative_to_code():
+def test_source_model_defaults_use_resources_relative_to_code():
     from app import runtime
-    for value in runtime.source_model_paths().values():
-        assert Path(value).is_relative_to(ROOT)
+    defaults = runtime.source_model_paths()
+    for key in ("magnetModelPath", "bedModelPath", "bedGeometryPath", "workerPythonPath"):
+        assert Path(defaults[key]).is_relative_to(ROOT)
+
+
+def test_stale_frontend_build_fails_before_packaging(tmp_path, monkeypatch):
+    import os
+    from scripts import build_mac
+    index = tmp_path / "web/index.html"
+    source = tmp_path / "src/main.tsx"
+    for path in (index, source):
+        path.parent.mkdir()
+        path.write_text("fixture")
+    monkeypatch.setattr(build_mac, "ROOT", tmp_path)
+    os.utime(index, (1, 1))
+    with pytest.raises(ValueError, match="older than the source"):
+        build_mac.verify_web_build(index.parent, [{"path": "src/main.tsx"}])
+
+
+def test_mixed_source_and_incomplete_release_are_not_exported(tmp_path, monkeypatch):
+    from scripts import release_assets
+    folder = tmp_path / "package"
+    resources = folder / release_assets.PORTABLE_RESOURCES
+    resources.mkdir(parents=True)
+    (resources / "release.json").write_text('{"sourceTreeSha256":"different"}')
+    manifest = {"version": release_assets.VERSION, "files": inventory_tree(folder)}
+    (folder / "文件校验.json").write_text(json.dumps(manifest))
+    output = tmp_path / "release"
+    with pytest.raises(ValueError, match="different source files"):
+        release_assets.export(folder, output)
+    assert not output.exists()
+
+    def fail_after_writing(_folder, stage):
+        (stage / "incomplete.zip").touch()
+        raise ValueError("asset could not be prepared")
+
+    monkeypatch.setattr(release_assets, "build_assets", fail_after_writing)
+    with pytest.raises(ValueError, match="asset could not be prepared"):
+        release_assets.export(folder, output)
+    assert set(tmp_path.iterdir()) == {folder}
 
 
 def test_source_export_includes_new_modules_but_excludes_runtime_data(tmp_path, monkeypatch):
@@ -142,6 +180,21 @@ def test_bundled_source_zip_is_scanned_without_extracting(tmp_path):
     assert set(archive_issues(path)) == {("src/credentials.json", "private-runtime-file"),
                                         ("src/config.py", "github-token")}
     assert not (tmp_path / "src").exists()
+
+
+def test_archive_only_exempts_exact_vendor_documentation(tmp_path):
+    import hashlib
+    import zipfile
+    from scripts.scan_secrets import archive_issues
+    package = tmp_path / "package.zip"
+    vendor = "lib/python3.11/site-packages/vendor/docs.py"
+    example = b"https://user:" + b"example-only@example.invalid"
+    known = {vendor: hashlib.sha256(example).hexdigest()}
+    with zipfile.ZipFile(package, "w") as archive:
+        archive.writestr("bundle/runtime/" + vendor, example)
+        archive.writestr("bundle/app/docs.py", example)
+    assert archive_issues(package, known) == [("bundle/app/docs.py", "embedded-url-password")]
+    assert len(archive_issues(package, {vendor: "changed"})) == 2
 
 
 def test_model_loader_rejects_duplicate_archive_entries(tmp_path, monkeypatch):

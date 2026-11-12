@@ -1,4 +1,4 @@
-"""Verified, range-retry recovery for the five originals removed by old cleanup."""
+"""Resume previously registered repairs for originals removed by legacy cleanup."""
 from __future__ import annotations
 
 import asyncio
@@ -18,16 +18,11 @@ from uuid import UUID
 
 import httpx
 
+from .audit_moves import checked_path
 from .domain import now_iso
+from .file_leases import FileEnvironmentError, finish_io
 from .upload_storage import runtime_management_credentials
 
-RESTORE_NAMES = (
-    "冀AZC799_20261002095000_6422d379f2be.mp4",
-    "苏GB3338_20261003081300_0aa4967a0d79.mp4",
-    "苏CRW129_20261004003000_cc6f536b89e9.mp4",
-    "苏GU9100_20261004033500_b655eade6193.mp4",
-    "鲁AG7205_20261009110000_81232b5d06ee.mp4",
-)
 CHUNK_SIZE = 8 * 1024 * 1024
 LEGACY_CHUNK_SIZE = 32 * 1024 * 1024
 RANGE_WORKERS = 2
@@ -129,11 +124,17 @@ def _hash_fd_range(fd: int, start: int, length: int):
     return digest.hexdigest()
 
 
+def _check_stop(stopping):
+    if stopping and stopping():
+        raise RestoreFailure("stopping", "程序正在停止，已保留校验通过的分段。")
+
+
 def _stream_range(client, obj: dict, etag: str, version_id: str, total: int,
-                  index: int, start: int, end: int, fd: int, *, retries: int, backoff,
-                  sleep=time.sleep) -> str:
+                  start: int, end: int, fd: int, *, retries: int, backoff,
+                  sleep=time.sleep, stopping=None) -> str:
     length = end - start + 1
     for attempt in range(retries):
+        _check_stop(stopping)
         response = None
         try:
             args = {"Bucket": obj["bucket"], "Key": obj["key"],
@@ -153,6 +154,7 @@ def _stream_range(client, obj: dict, etag: str, version_id: str, total: int,
                 raise OSError(errno.EIO, "缺少分段内容")
             digest, received, offset = hashlib.sha256(), 0, start
             while received < length:
+                _check_stop(stopping)
                 block = body.read(min(1024 * 1024, length - received))
                 if not block:
                     break
@@ -173,6 +175,7 @@ def _stream_range(client, obj: dict, etag: str, version_id: str, total: int,
                 raise RestoreFailure("identity", "云端对象版本已变化，未发布文件。") from None
             if attempt + 1 >= retries:
                 raise RestoreFailure("network", "云端分段多次中断，保留已验证分段并稍后续传。", retryable=True) from None
+            _check_stop(stopping)
             sleep(backoff[min(attempt, len(backoff) - 1)])
         finally:
             body = response.get("Body") if isinstance(response, dict) else None
@@ -186,20 +189,20 @@ def _stream_range(client, obj: dict, etag: str, version_id: str, total: int,
 
 def _stream_range_resilient(client, obj: dict, etag: str, version_id: str, total: int,
                             start: int, end: int, fd: int, *, retries: int, backoff,
-                            sleep=time.sleep):
+                            sleep=time.sleep, stopping=None):
     """Retry a large range, then split only that range if streaming stays unstable."""
     try:
-        return _stream_range(client, obj, etag, version_id, total, 0, start, end, fd,
-                             retries=retries, backoff=backoff, sleep=sleep)
+        return _stream_range(client, obj, etag, version_id, total, start, end, fd,
+                             retries=retries, backoff=backoff, sleep=sleep, stopping=stopping)
     except RestoreFailure as error:
         length = end - start + 1
         if error.code != "network" or length <= MIN_RANGE_SIZE:
             raise
         middle = start + length // 2 - 1
         _stream_range_resilient(client, obj, etag, version_id, total, start, middle, fd,
-                                retries=retries, backoff=backoff, sleep=sleep)
+                                retries=retries, backoff=backoff, sleep=sleep, stopping=stopping)
         _stream_range_resilient(client, obj, etag, version_id, total, middle + 1, end, fd,
-                                retries=retries, backoff=backoff, sleep=sleep)
+                                retries=retries, backoff=backoff, sleep=sleep, stopping=stopping)
         digest = _hash_fd_range(fd, start, length)
         if digest is None:
             raise RestoreFailure("network", "拆分分段未完整落盘，保留进度并稍后续传。", retryable=True)
@@ -267,9 +270,10 @@ def _publish_exclusive(part: Path, final: Path, expected_size: int, expected_edg
 def download_bound_object(client, item: dict, expected: dict, final_path: Path, *,
                           chunk_size: int = CHUNK_SIZE, workers: int = RANGE_WORKERS,
                           retries: int = RANGE_RETRIES, backoff=RANGE_BACKOFF, sleep=time.sleep,
-                          progress=None):
+                          progress=None, stopping=None):
     """Download one exact S3 object with independently retried, version-bound ranges."""
     final_path = Path(final_path)
+    _check_stop(stopping)
     if final_path.exists():
         if (final_path.is_file() and final_path.stat().st_size == expected["size"]
                 and _file_edge(final_path) == expected["edgeHash"]):
@@ -313,6 +317,7 @@ def download_bound_object(client, item: dict, expected: dict, final_path: Path, 
                     # hashes. This safely preserves progress after a chunk-size
                     # adjustment without trusting partial or unverified bytes.
                     for old_index, expected_digest in old_saved.items():
+                        _check_stop(stopping)
                         old_start = old_index * old_chunk_size
                         old_length = min(old_chunk_size, expected["size"] - old_start)
                         if old_index < 0 or old_length <= 0:
@@ -335,6 +340,7 @@ def download_bound_object(client, item: dict, expected: dict, final_path: Path, 
         except (OSError, ValueError, TypeError):
             pass
         for index in list(saved):
+            _check_stop(stopping)
             start = index * chunk_size
             end = min(expected["size"], start + chunk_size) - 1
             if index >= count or start > end:
@@ -370,7 +376,7 @@ def download_bound_object(client, item: dict, expected: dict, final_path: Path, 
         with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
             futures = {pool.submit(_stream_range_resilient, client, obj, metadata["etag"], metadata["versionId"],
                                    expected["size"], start, end, fd,
-                                   retries=retries, backoff=backoff, sleep=sleep): (index, start, end)
+                                   retries=retries, backoff=backoff, sleep=sleep, stopping=stopping): (index, start, end)
                        for index, start, end in pending}
             for future in as_completed(futures):
                 index, _, _ = futures[future]
@@ -386,6 +392,7 @@ def download_bound_object(client, item: dict, expected: dict, final_path: Path, 
     finally:
         os.close(fd)
 
+    _check_stop(stopping)
     if part.stat().st_size != expected["size"] or _file_edge(part) != expected["edgeHash"]:
         raise RestoreFailure("identity", "恢复文件与原视频指纹不一致，未发布。")
     _publish_exclusive(part, final_path, expected["size"], expected["edgeHash"])
@@ -418,7 +425,6 @@ class OriginalRestoreManager:
         self.loop_task = None
         self.stopping = False
         self.active = False
-        self.inflight = set()
         self.changed = asyncio.Event()
 
     def state(self):
@@ -438,10 +444,8 @@ class OriginalRestoreManager:
             raise ValueError("恢复请求编号无效。") from None
         if self.active:
             return self.state()
-        if not self.job:
-            self.job = {"id": "current", "requestIds": [], "state": "queued", "items": [
-                {"name": name, "state": "queued", "bytes": 0, "size": 0, "message": "等待恢复。"}
-                for name in RESTORE_NAMES]}
+        if not self.job or not self.job.get("items"):
+            raise ValueError("没有已登记的原片恢复记录。")
         if request_id not in self.job.setdefault("requestIds", []):
             self.job["requestIds"].append(request_id)
         for row in self.job.get("items", []):
@@ -474,6 +478,22 @@ class OriginalRestoreManager:
         row["updatedAt"] = now_iso()
         self.store.save(self.job)
 
+    def _destination(self, path, name):
+        if path.name != name:
+            raise RestoreFailure("identity", "原片名称与恢复记录不符。")
+        workspace = getattr(self.uploads, 'workspace', None)
+        try:
+            if workspace and workspace.enabled and workspace.asset_for(path):
+                return workspace.media_path(path)
+            # Earlier repairs may have a registered path outside the managed workspace.
+            if path.parts[:2] == ('/', 'Volumes') and path.parts[3:-1] == ('视频', '已上传'):
+                return checked_path(path)
+        except FileEnvironmentError as error:
+            raise RestoreFailure("disk", str(error), retryable=True) from None
+        except ValueError:
+            pass
+        raise RestoreFailure("identity", "原片记录不在已确认的工作区或原归档目录。")
+
     def _records(self, name):
         source = [i for i in self.slicing.store.list("items") if i.get("name") == name]
         if not source:
@@ -483,14 +503,7 @@ class OriginalRestoreManager:
         if (len(paths) != 1 or not next(iter(paths))
                 or len({(v.get("size"), v.get("edgeHash")) for v in versions}) != 1):
             raise RestoreFailure("identity", "切片记录中的原片位置或指纹不唯一。")
-        path = Path(next(iter(paths)))
-        root = Path("/Volumes/HIKSEMI/视频/已上传")
-        workspace = getattr(self.uploads, 'workspace', None)
-        managed = bool(workspace and workspace.enabled and workspace.asset_for(path))
-        if managed:
-            workspace.require_root()
-        if (not managed and path.parent != root) or path.name != name:
-            raise RestoreFailure("identity", "原片记录不在已确认的外置盘目标目录。")
+        path = self._destination(Path(next(iter(paths))), name)
         expected = versions[0]
         if expected.get("size") is None or not re.fullmatch(r"[a-f0-9]{64}", str(expected.get("edgeHash", ""))):
             raise RestoreFailure("identity", "原片记录缺少可验证的文件指纹。")
@@ -552,11 +565,10 @@ class OriginalRestoreManager:
             def progress(done, total):
                 loop.call_soon_threadsafe(partial(self._save_row, row, state="running", bytes=done,
                                                   size=total, message="正在恢复并校验原片分段。"))
-            if not Path("/Volumes/HIKSEMI").is_mount():
-                raise RestoreFailure("disk", "外置盘当前未挂载，未在内部磁盘写入。", retryable=True)
             with self.leases.write(path):
-                await asyncio.to_thread(download_bound_object, client, upload_item, expected, path,
-                                         progress=progress)
+                self._destination(path, name)
+                await finish_io(download_bound_object, client, upload_item, expected, path,
+                                progress=progress, stopping=lambda: self.stopping)
                 from .slicing import source_version
                 current = source_version(path)
                 if current["size"] != expected["size"] or current["edgeHash"] != expected["edgeHash"]:
@@ -565,6 +577,8 @@ class OriginalRestoreManager:
             self._save_row(row, state="complete", bytes=expected["size"], size=expected["size"],
                            message="原片已恢复并校验。")
         except RestoreFailure as error:
+            if error.code == "stopping":
+                return
             state = {"disk": "waiting_disk", "authorization": "waiting_connection",
                      "network": "retry_wait"}.get(error.code, "attention")
             self._save_row(row, state=state, errorCode=error.code, message=str(error))
@@ -603,7 +617,7 @@ class OriginalRestoreManager:
                 await asyncio.gather(*(self._restore_one(row) for row in todo))
                 if all(i.get("state") in {"complete", "cleaned"} for i in self.job["items"]):
                     self.job.update(state="complete", message='恢复记录已核对；已清理的媒体不再下载。'
-                                    if any(i.get('state') == 'cleaned' for i in self.job['items']) else "五条原片均已恢复并校验。")
+                                    if any(i.get('state') == 'cleaned' for i in self.job['items']) else "本次原片均已恢复并校验。")
                     self.store.save(self.job)
                     return
                 retryable = any(i.get("state") in {"queued", "running", "retry_wait", "waiting_connection", "waiting_disk"}

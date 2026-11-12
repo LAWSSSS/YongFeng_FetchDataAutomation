@@ -7,6 +7,7 @@ from functools import partial
 import hashlib
 import json
 import os
+import pty
 import shutil
 import signal
 import socket
@@ -72,12 +73,12 @@ def invoke(folder, profile, *arguments, instance_dir):
 
 
 @contextmanager
-def foreground(folder, profile, *, instance_dir):
+def foreground(folder, profile, *, instance_dir, terminal=None):
     with tempfile.TemporaryFile(mode="w+") as console:
         process = subprocess.Popen(
             [str(folder / PORTABLE_COMMAND), "start", "--no-browser", "--output", "json"],
             env=command_environment(profile, instance_dir), cwd=instance_dir.parent,
-            stdout=console, stderr=console,
+            stdin=terminal, stdout=console, stderr=console, start_new_session=terminal is not None,
         )
         try:
             deadline = time.monotonic() + 30
@@ -150,7 +151,21 @@ def smoke(folder):
                 assert run(folder, profile, "stop")["stopped"]
                 assert process.wait(timeout=45) == 0
                 assert not run(folder, profile, "stop")["stopped"]
-            print("Port conflict, all API entries, repeat launch, terminal hangup, relaunch and stop passed.")
+
+            master, terminal = pty.openpty()
+            try:
+                # The new session has no controlling terminal and receives no SIGHUP.
+                with start(folder, profile, terminal=terminal) as (_, process):
+                    os.close(master)
+                    master = None
+                    assert process.wait(timeout=10) == 0
+                assert not run(folder, profile, "status")["running"]
+                assert not (profile / "server.json").exists()
+            finally:
+                if master is not None:
+                    os.close(master)
+                os.close(terminal)
+            print("Port conflict, all API entries, repeat launch, terminal close, relaunch and stop passed.")
         finally:
             if owns_blocker:
                 assert blocker.getsockname()[1] == 8786
@@ -242,6 +257,7 @@ def main():
     args = parser.parse_args()
     folder = args.folder.resolve()
     verify_files(folder)
+    subprocess.run([sys.executable, str(ROOT / "scripts/scan_secrets.py"), "--directory", str(folder)], check=True)
     check_native_runtime(folder)
     smoke(folder)
     if args.reference_python and args.sample:

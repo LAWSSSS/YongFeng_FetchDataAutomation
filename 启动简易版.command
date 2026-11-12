@@ -13,7 +13,7 @@ case "${1:-start}" in
     ;;
   setup-models)
     if [ "$#" -ne 2 ] || [ ! -f "$2" ]; then
-      printf '请提供项目负责人发给你的 models-v1.zip 路径。用法见 README.md。\n' >&2
+      printf '请填写从 GitHub 发布页下载的 models-v1.zip 路径。用法见 README.md。\n' >&2
       exit 2
     fi
     if ! command -v python3.13 >/dev/null 2>&1; then
@@ -21,7 +21,7 @@ case "${1:-start}" in
       exit 1
     fi
     if ! python3.13 scripts/fetch_models.py --archive "$2" --destination assets/models; then
-      printf '模型包未通过校验。请确认未解压或修改 ZIP，并向项目负责人获取适用于本版本的模型包。\n' >&2
+      printf '模型包未通过校验。请从 README.md 链接重新下载适用的 ZIP。\n' >&2
       exit 1
     fi
     /bin/sh scripts/setup-slicing-env.sh
@@ -77,4 +77,5 @@ if [[ $(cat node_modules/.requirements-installed 2>/dev/null || true) != "$web_l
   fi
   printf '%s\n' "$web_lock" > node_modules/.requirements-installed
 fi
-exec npm start -- "$@"
+node scripts/start.mjs --build-only
+exec .venv/bin/python scripts/local_service.py start "$@"

@@ -1,151 +1,132 @@
-"""Manage this checkout's macOS backend independently of the starting terminal."""
-import fcntl
+"""Run the source checkout in Terminal and stop its legacy background service."""
+import argparse
+from contextlib import ExitStack
 import hashlib
-import json
 import os
 from pathlib import Path
-import plistlib
 import re
-import socket
 import subprocess
 import sys
 import time
+from uuid import uuid4
 
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from app.local_instance import InstanceBusy, check_available
+from app import local_instance
+from scripts import portable_launcher as launcher
 
-DATA = ROOT / "数据" / "系统"
-DEFAULT_PORT = 8786
+DATA = Path(os.environ.get("IVG_PROFILE_DIR") or ROOT / "数据" / "系统").expanduser().absolute()
+
+
+def checkout_id():
+    return hashlib.sha256(str(ROOT).encode()).hexdigest()[:12]
 
 
 def service_label(port):
-    identity = hashlib.sha256(str(ROOT).encode()).hexdigest()[:12]
-    return f"cn.local.inspection-video.{identity}.{port}"
-
-
-def can_bind(port):
-    with socket.socket() as probe:
-        # Match uvicorn's bind flags when connections are in TIME_WAIT.
-        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            probe.bind(("127.0.0.1", port))
-        except OSError:
-            return False
-        return True
+    return f"cn.local.inspection-video.{checkout_id()}.{port}"
 
 
 def existing_services(domain, preferred):
-    ports = {preferred, DEFAULT_PORT}
+    if local_instance.isolated_directory():
+        return
+    ports = {preferred, launcher.DEFAULT_PORT}
     for path in DATA.glob("local-service-*.plist"):
         match = re.fullmatch(r"local-service-([0-9]{4,5})\.plist", path.name)
         if match and 1024 <= int(match[1]) <= 65535:
             ports.add(int(match[1]))
     for port in sorted(ports, key=lambda port: (port != preferred, port)):
-        result = subprocess.run(["launchctl", "print", f"{domain}/{service_label(port)}"],
-                                capture_output=True, text=True)
+        result = subprocess.run(["/bin/launchctl", "print", f"{domain}/{service_label(port)}"],
+                                capture_output=True, text=True, timeout=3)
         if result.returncode == 0:
             yield port, result.stdout
 
 
-def run(action, preferred, explicit_port):
-    domain = f"gui/{os.getuid()}"
-    active = next(existing_services(domain, preferred), None)
-    if action == "status":
-        print(f"后台服务已加载：http://127.0.0.1:{active[0]}/" if active else "后台服务未启动。")
-        return
-    if action == "stop" and not active:
-        print("此目录的后台服务未启动。")
-        return
-    if active:
-        port, existing_output = active
-    else:
-        try:
-            check_available()
-        except InstanceBusy as error:
-            raise SystemExit(str(error)) from None
-        choices = (preferred,) if explicit_port else range(DEFAULT_PORT, DEFAULT_PORT + 20)
-        port = next((candidate for candidate in choices if can_bind(candidate)), None)
-        if port is None:
-            raise SystemExit("本机端口已被占用。请尝试 PORT=8806 zsh ./启动简易版.command。")
-    label = service_label(port)
-    target = f"{domain}/{label}"
-    log = DATA / "local-service.log"
-    if action == "stop":
-        result = subprocess.run(["launchctl", "bootout", target], capture_output=True)
-        if result.returncode:
-            raise SystemExit("停止失败，请等待当前文件操作完成后重试。")
-        pid = re.search(r"\bpid = (\d+)", existing_output)
-        deadline = time.monotonic() + 45
-        while True:
-            alive = False
-            if pid:
-                try:
-                    os.kill(int(pid.group(1)), 0)
-                    alive = True
-                except ProcessLookupError:
-                    pass
-            registered = subprocess.run(["launchctl", "print", target], capture_output=True).returncode == 0
-            if not registered and not alive:
-                break
-            if time.monotonic() >= deadline:
-                raise SystemExit("后台仍在安全停止，文件与进度保留；请稍后检查状态。")
-            time.sleep(.2)
-        print("后台服务已停止，任务进度保留。")
-        return
-
-    endpoint = {"port": port, "instanceId": label, "logPath": str(log)}
-    if active:
-        print(json.dumps(endpoint))
-        return
-    env = {"PORT": str(port), "IVG_INSTANCE_ID": label,
-           "PATH": "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin"}
-    if os.environ.get("IVG_SKIP_SAVED_CONNECTIONS") == "1":
-        env["IVG_SKIP_SAVED_CONNECTIONS"] = "1"
-    configuration = {
-        "Label": label,
-        "ProgramArguments": [str(ROOT / ".venv/bin/python"), "-u", "-m", "app.main"],
-        "WorkingDirectory": str(ROOT),
-        "EnvironmentVariables": env,
-        "RunAtLoad": True,
-        # The browser waits on this local HTTP server. launchd's default
-        # Standard class throttles disk I/O even for these foreground requests;
-        # XPC-based Adaptive promotion does not apply to HTTP connections.
-        "ProcessType": "Interactive",
-        "KeepAlive": {"SuccessfulExit": False},
-        "ThrottleInterval": 10,
-        "StandardOutPath": str(log),
-        "StandardErrorPath": str(log),
-    }
-    path = DATA / f"local-service-{port}.plist"
-    path.write_bytes(plistlib.dumps(configuration))
-    path.chmod(0o600)
-    result = subprocess.run(["launchctl", "bootstrap", domain, str(path)], capture_output=True)
+def stop_legacy(domain, port, details):
+    target = f"{domain}/{service_label(port)}"
+    result = subprocess.run(["/bin/launchctl", "bootout", target], capture_output=True, timeout=45)
     if result.returncode:
-        raise SystemExit(f"无法加载 macOS 后台服务。请在已登录的桌面账户中打开终端重试。日志：{log}")
-    print(json.dumps(endpoint))
+        raise launcher.LaunchError("停止旧后台失败，请稍后重试。")
+    pid = re.search(r"\bpid = (\d+)", details)
+    deadline = time.monotonic() + 45
+    while True:
+        alive = False
+        if pid:
+            try:
+                os.kill(int(pid.group(1)), 0)
+                alive = True
+            except ProcessLookupError:
+                pass
+        registered = subprocess.run(["/bin/launchctl", "print", target], capture_output=True, timeout=3).returncode == 0
+        if not registered and not alive:
+            return
+        if time.monotonic() >= deadline:
+            raise launcher.LaunchError("旧后台仍在安全停止，请稍后检查状态。")
+        time.sleep(.2)
+
+
+def run(action, preferred, explicit_port, *, no_browser=False):
+    profile_id = checkout_id()
+    domain = f"gui/{os.getuid()}"
+    with ExitStack() as ownership:
+        with launcher.lock(DATA / "launch.lock"):
+            if launcher.server_locked(DATA):
+                state = launcher.read_json(DATA / "server.json")
+                if not launcher.verified_server(state, profile_id, bundle_id="development"):
+                    raise launcher.LaunchError("此目录的服务正在启动或安全停止，请稍后重试。")
+                if action == "start":
+                    launcher.announce(state, no_browser, "text", reused=True)
+                elif action == "status":
+                    launcher.print_result("status", {**state, "running": True}, "text")
+                elif launcher.stop_server(DATA, state):
+                    launcher.print_result("stop", {"stopped": True}, "text")
+                else:
+                    raise launcher.LaunchError("正在等待当前写入安全结束，请稍后检查状态。")
+                return
+            if legacy := next(existing_services(domain, preferred), None):
+                if action == "start":
+                    raise launcher.LaunchError("此目录的旧后台仍在运行。请先运行启动简易版.command stop，再重新启动。")
+                if action == "stop":
+                    stop_legacy(domain, *legacy)
+                    launcher.print_result("stop", {"stopped": True}, "text")
+                else:
+                    print(f"旧后台已加载：http://127.0.0.1:{legacy[0]}/")
+                return
+            if action != "start":
+                print("此目录的服务未运行。")
+                return
+            ownership.enter_context(local_instance.backend_instance())
+            ownership.enter_context(launcher.lock(DATA / "server.lock", blocking=False))
+        for key in ("IVG_PORTABLE", "IVG_PACKAGE_ID", "IVG_RESOURCES"):
+            os.environ.pop(key, None)
+        os.environ.update(IVG_PROFILE_DIR=str(DATA), IVG_PROFILE_ID=profile_id, IVG_INSTANCE_ID=uuid4().hex)
+        launcher.serve(DATA, no_browser, "text", port=preferred, fixed_port=explicit_port)
 
 
 def main():
     if sys.platform != "darwin":
         raise SystemExit("此后台启动入口仅用于 macOS。")
-    action = sys.argv[1] if len(sys.argv) > 1 else "status"
-    if action not in {"start", "stop", "status"}:
-        raise SystemExit("用法：local_service.py start|stop|status")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("action", choices=("start", "stop", "status"), nargs="?", default="status")
+    parser.add_argument("--no-open", "--no-browser", dest="no_browser", action="store_true")
+    args = parser.parse_args()
     raw_port = os.environ.get("PORT")
     if raw_port is not None and (not re.fullmatch(r"[0-9]{4,5}", raw_port) or not 1024 <= int(raw_port) <= 65535):
         raise SystemExit("端口必须是 1024 到 65535 之间的整数。")
-    if action != "start" and not DATA.is_dir():
-        print("此目录的后台服务未启动。")
-        return
     for directory in (DATA.parent, DATA):
         if directory.is_symlink():
             raise SystemExit("程序数据目录不能是符号链接。")
-        directory.mkdir(mode=0o700, exist_ok=True)
-    with (DATA / ".local-service.lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        run(action, int(raw_port) if raw_port else DEFAULT_PORT, raw_port is not None)
+    if args.action != "start" and not DATA.is_dir():
+        print("此目录的服务未运行。")
+        return
+    try:
+        DATA.mkdir(parents=True, mode=0o700, exist_ok=True)
+        run(args.action, int(raw_port) if raw_port else launcher.DEFAULT_PORT,
+            raw_port is not None, no_browser=args.no_browser)
+    except (launcher.LaunchError, local_instance.InstanceBusy) as error:
+        raise SystemExit(str(error)) from None
+    except (OSError, subprocess.TimeoutExpired):
+        raise SystemExit("无法操作本地服务。请检查数据目录权限，或稍后重试。") from None
 
 
 if __name__ == "__main__":

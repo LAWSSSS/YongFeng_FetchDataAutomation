@@ -16,7 +16,7 @@ PATTERNS = {
     "aws-access-key": re.compile(rb"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"),
 }
 PRIVATE_NAMES = {"credentials.json", ".env", "collection.sqlite3", "server.json", "profile.json"}
-TEXT_SUFFIXES = {".py", ".md", ".json", ".txt", ".toml", ".ini", ".cfg", ".xml", ".yaml", ".yml",
+TEXT_SUFFIXES = {".py", ".md", ".html", ".json", ".txt", ".toml", ".ini", ".cfg", ".xml", ".yaml", ".yml",
                  ".sh", ".command", ".mjs", ".tsx", ".ts", ".js", ".css", ".pem", ".key"}
 
 
@@ -25,8 +25,14 @@ def issues(data, *, documentation=False):
             and not (documentation and kind == "embedded-url-password")]
 
 
-def archive_issues(path):
-    """Inspect bundled source text in place; never extract user archives."""
+def document_issues(relative, data, documentation):
+    known = any(relative.endswith("runtime/" + name) and hashlib.sha256(data).hexdigest() == checksum
+                for name, checksum in documentation.items())
+    return issues(data, documentation=known)
+
+
+def archive_issues(path, documentation=None):
+    """Inspect packaged text in place without extracting archives."""
     findings = []
     with zipfile.ZipFile(path) as archive:
         for info in archive.infolist():
@@ -37,7 +43,8 @@ def archive_issues(path):
                 if info.file_size > 30 * 1024 ** 2:
                     findings.append((info.filename, "unscanned-large-text"))
                 else:
-                    findings.extend((info.filename, kind) for kind in issues(archive.read(info)))
+                    findings.extend((info.filename, kind) for kind in
+                                    document_issues(info.filename, archive.read(info), documentation or {}))
     return findings
 
 
@@ -56,13 +63,10 @@ def main():
             if path.name in PRIVATE_NAMES or path.suffix in {".sqlite3", ".db", ".mp4", ".mov", ".jpg", ".jpeg"}:
                 failures.append((relative, "private-runtime-file"))
             if path.suffix.lower() == ".zip":
-                failures.extend((relative + "!" + name, kind) for name, kind in archive_issues(path))
+                failures.extend((relative + "!" + name, kind) for name, kind in archive_issues(path, documentation))
             if path.suffix.lower() in TEXT_SUFFIXES and path.stat().st_size < 30 * 1024 ** 2:
                 count += 1
-                data = path.read_bytes()
-                known_documentation = any(relative.endswith("runtime/" + name) and
-                    hashlib.sha256(data).hexdigest() == checksum for name, checksum in documentation.items())
-                failures.extend((relative, kind) for kind in issues(data, documentation=known_documentation))
+                failures.extend((relative, kind) for kind in document_issues(relative, path.read_bytes(), documentation))
     else:
         names = subprocess.check_output(["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"], cwd=ROOT).split(b"\0")
         for name in set(names):

@@ -6,7 +6,9 @@ import contextlib
 import errno
 import fcntl
 import json
+import logging
 import os
+import select
 import signal
 import socket
 import subprocess
@@ -16,11 +18,16 @@ from pathlib import Path
 from uuid import uuid4
 
 BUNDLE_ID = "cn.yongfeng.video-gather.standalone"
+DEFAULT_PORT = 8786
 APP_ROOT = Path(__file__).resolve().parent
 RESOURCES = APP_ROOT.parent
 sys.path.insert(0, str(APP_ROOT if (APP_ROOT / "app").is_dir() else APP_ROOT.parent))
 from app import local_instance
 from app.runtime import identity, portable_package_directory
+
+
+class LaunchError(RuntimeError):
+    """A startup failure whose message is safe to show in Terminal."""
 
 
 def private_json(path, value):
@@ -78,9 +85,9 @@ def environment(home, manifest, profile_id, instance_id):
     return env
 
 
-def verified_server(state, profile_id, package_id=None):
+def verified_server(state, profile_id, package_id=None, *, bundle_id=BUNDLE_ID):
     """Never reuse/stop another app just because it owns port 8786."""
-    if (state.get("bundleId") != BUNDLE_ID or state.get("profileId") != profile_id
+    if (state.get("bundleId") != bundle_id or state.get("profileId") != profile_id
             or not isinstance(state.get("pid"), int) or state["pid"] <= 1
             or not isinstance(state.get("port"), int) or not 1 <= state["port"] <= 65535
             or not state.get("instanceId") or (package_id and state.get("packageId") != package_id)):
@@ -122,7 +129,7 @@ def stop_server(home, state):
 def release_manifest():
     manifest = read_json(RESOURCES / "release.json")
     if manifest.get("bundleId") != BUNDLE_ID or not manifest.get("packageId"):
-        raise RuntimeError("应用文件不完整，请重新解压完整包。")
+        raise LaunchError("应用文件不完整，请重新解压完整包。")
     return manifest
 
 
@@ -131,7 +138,7 @@ def prepare_profile():
     try:
         home.mkdir(parents=True, mode=0o700, exist_ok=True)
     except OSError:
-        raise RuntimeError("程序所在位置不可写，请将整个程序文件夹移到可写的磁盘后再打开。") from None
+        raise LaunchError("程序所在位置不可写，请将整个程序文件夹移到可写的磁盘后再打开。") from None
     os.chmod(home, 0o700)
     path = home / "profile.json"
     with lock(home / "launch.lock"):
@@ -150,7 +157,7 @@ def launch(no_browser=False, output="json"):
             state = read_json(home / "server.json")
             if verified_server(state, profile_id) and server_locked(home):
                 if state.get("packageId") != manifest["packageId"]:
-                    raise RuntimeError("旧版采集助手仍在运行，请先停止旧版，再打开新版。")
+                    raise LaunchError("旧版采集助手仍在运行，请先停止旧版，再打开新版。")
                 previous = state.get("profilePath")
                 moved = (isinstance(previous, str) and Path(previous).is_absolute()
                          and Path(previous) != home and not Path(previous).exists())
@@ -158,9 +165,9 @@ def launch(no_browser=False, output="json"):
                     announce(state, no_browser, output, reused=True)
                     return
                 if not stop_server(home, state):
-                    raise RuntimeError("正在停止移动前的服务，请稍后再次打开。")
+                    raise LaunchError("正在停止移动前的服务，请稍后再次打开。")
             if server_locked(home):
-                raise RuntimeError("采集助手正在启动或安全停止，请稍后再打开。")
+                raise LaunchError("采集助手正在启动或安全停止，请稍后再打开。")
             ownership.enter_context(local_instance.backend_instance())
             ownership.enter_context(lock(home / "server.lock", blocking=False))
         instance_id = uuid4().hex
@@ -196,23 +203,43 @@ def service_logging(home):
     }
 
 
-def serve(home, no_browser, output):
-    import uvicorn
+def serve(home, no_browser, output, *, port=DEFAULT_PORT, fixed_port=False):
+    try:
+        import uvicorn
+    except ImportError:
+        raise LaunchError("运行依赖缺失。请按使用说明重新准备程序文件。") from None
+
+    terminal_fd = next((fd for fd in (0, 1, 2) if os.isatty(fd)), None)
+    terminal = None
+    if terminal_fd is not None:
+        terminal = select.poll()
+        terminal.register(terminal_fd, select.POLLHUP | select.POLLERR | select.POLLNVAL)
 
     class TerminalServer(uvicorn.Server):
+        stop_requested = False
+
         def handle_exit(self, sig, frame):
             # All three terminal exit paths go through Uvicorn's lifespan
             # shutdown, without replaying the signal after cleanup.
-            self.should_exit = True
+            self.stop_requested = self.should_exit = True
+
+        def check_terminal(self):
+            if terminal is not None and terminal.poll(0):
+                self.handle_exit(None, None)
 
         async def startup(self, sockets=None):
             await super().startup(sockets=sockets)
+            self.check_terminal()
             if not self.should_exit:
                 try:
                     announce(state, no_browser, output)
                 except OSError:
                     # The terminal can vanish while printing the ready message.
-                    self.should_exit = True
+                    self.handle_exit(None, None)
+
+        async def on_tick(self, counter):
+            self.check_terminal()
+            return await super().on_tick(counter)
 
     config = uvicorn.Config("app.main:create_app", factory=True, host="127.0.0.1",
                             log_config=service_logging(home), access_log=False,
@@ -226,17 +253,36 @@ def serve(home, no_browser, output):
             cleanup.callback(signal.signal, sig, original)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
-            sock.bind(("127.0.0.1", 8786))
+            sock.bind(("127.0.0.1", port))
         except OSError as error:
             if error.errno != errno.EADDRINUSE:
                 raise
+            if fixed_port:
+                raise LaunchError(f"端口 {port} 已被占用。请更换端口后重新启动。") from None
             sock.bind(("127.0.0.1", 0))
         sock.listen(128)
         state = {**identity(), "port": sock.getsockname()[1], "profilePath": str(home)}
         cleanup.callback(clear_server_state, home, state["instanceId"])
         if not server.should_exit:
             private_json(home / "server.json", state)
-            server.run(sockets=[sock])
+            try:
+                server.run(sockets=[sock])
+            except ImportError as error:
+                detail = str(error).lower()
+                if ("library load disallowed by system policy" in detail or
+                        ("code signature" in detail and "not valid for use in process" in detail)):
+                    logging.getLogger("uvicorn.error").error("Startup failed: macOS rejected a native dependency")
+                    raise LaunchError("macOS 拦截了内置运行组件。请打开使用说明，查看启动故障的处理方法。") from None
+                logging.getLogger("uvicorn.error").error("Startup failed: dependency import (%s)", type(error).__name__)
+                raise LaunchError("无法加载运行依赖。请按使用说明检查程序文件。") from None
+            except SystemExit:
+                if not server.stop_requested:
+                    raise LaunchError("服务未能启动。请查看数据/系统/logs/service.log。") from None
+            except Exception as error:
+                logging.getLogger("uvicorn.error").error("Server exited unexpectedly (%s)", type(error).__name__)
+                raise LaunchError("服务异常退出。请查看数据/系统/logs/service.log。") from None
+        if not server.started and not server.stop_requested:
+            raise LaunchError("服务未能启动。请查看数据/系统/logs/service.log。")
 
 
 def stop():
@@ -289,12 +335,13 @@ def main():
         else:
             result = stop() if args.action == "stop" else status()
             if result.get("retry"):
-                raise RuntimeError(result["message"])
+                raise LaunchError(result["message"])
             print_result(args.action, result, args.output)
-    except (OSError, RuntimeError) as error:
-        # No remote URL, credential or platform response is ever part of this error.
-        message = str(error) if isinstance(error, RuntimeError) else "无法启动，请检查应用和数据目录权限。"
-        print(message, file=sys.stderr)
+    except (LaunchError, local_instance.InstanceBusy) as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    except OSError:
+        print("无法操作程序文件。请检查程序和数据目录权限。", file=sys.stderr)
         return 1
     return 0
 

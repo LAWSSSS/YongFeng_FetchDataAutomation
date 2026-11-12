@@ -14,7 +14,7 @@
 2. 在访达的「下载」文件夹双击 ZIP，把解压出来的 **采集助手-Mac-arm64** 整个文件夹放在「文稿」或其他可写位置。
 3. 双击 **启动采集助手.command**。终端会启动服务并自动打开网页。使用期间保持这个终端窗口打开。
 
-完整包已经包含 Python、视频工具和识别模型。后端与识别共用一套 Python，FFmpeg 与 ffprobe 共用同一个可执行文件。ZIP 使用临时签名，首次运行时 macOS 仍可能要求确认。 [Apple 的安全打开说明](https://support.apple.com/zh-cn/102445)
+完整包已经包含 Python、视频工具和识别模型。通过浏览器下载后，首次运行时 macOS 可能要求确认，也可能拦截包内的运行组件。遇到拦截时，见下文「遇到问题时」。 [Apple 的安全打开说明](https://support.apple.com/zh-cn/102445)
 
 也可以从终端运行。这个例子假设你把文件夹放在了「文稿」。
 
@@ -104,7 +104,8 @@ zsh "$HOME/Documents/采集助手-Mac-arm64/启动采集助手.command" stop
 | --- | --- |
 | GitHub 下载显示 404 | 请从发布页重新下载，或检查网络连接。 [GitHub 发布页](https://github.com/LAWSSSS/YongFeng_FetchDataAutomation/releases/tag/v1.3.15) |
 | 解压后看到「启动简易版.command」 | 这是源码包。日常使用请选择包含「启动采集助手.command」的 **Mac 免安装包**。 |
-| 浏览器没有打开 | 运行 `zsh ./启动采集助手.command status`，把终端显示的本机地址粘贴到浏览器地址栏。 |
+| 终端显示网址，浏览器没有打开 | 把终端显示的网址粘贴到浏览器地址栏。也可运行 `zsh ./启动采集助手.command status` 查看当前网址。 |
+| macOS 拦截内置运行组件 | 核对 ZIP 是否来自项目发布页，并用同一发布页的 `SHA256SUMS` 核对下载文件。查看 Apple 的安全打开说明。如果包内组件仍被系统拦截，可以从源码启动。 [Apple 的安全打开说明](https://support.apple.com/zh-cn/102445) |
 | 提示找不到内置运行组件 | 完整解压 ZIP，并把「启动采集助手.command」和「运行组件」放在同一文件夹。 |
 | 程序位置不可写 | 在访达把整个程序文件夹移到「文稿」等可写位置后再打开。已经使用过的应用先停止，再连同「数据」一起移动。 |
 | 查询没有记录，或某条不能勾选 | 核对日期、质检网站连接和记录旁的原因。默认要求质检时长**超过 10 分钟**，并且有真实车牌或至少一张有效的智能判级照片。准入条件可在 **设置 → 采集设置** 查看。 |
@@ -118,17 +119,22 @@ zsh "$HOME/Documents/采集助手-Mac-arm64/启动采集助手.command" stop
 
 ## 从源码启动
 
-源码版需要 Python 3.13 和 Node.js 22.13 或更新版本。在源码目录打开终端并运行 `zsh ./启动简易版.command`，停止时运行 `zsh ./启动简易版.command stop`。
+源码版需要 Python 3.13 和 Node.js 22.13 或更新版本。在源码目录运行 `zsh ./启动简易版.command`。首次启动会联网准备依赖。关闭启动终端或按 **Control–C** 即可停止。如果之前运行过常驻的源码版，先运行 `zsh ./启动简易版.command stop`。
 
 源码版的照片识别还需要 Python 3.11、FFmpeg、ffprobe 和模型包。将模型 ZIP 放到源码目录，运行 `zsh ./启动简易版.command setup-models ./models-v1.zip`，再重启应用。 [下载 models-v1.zip](https://github.com/LAWSSSS/YongFeng_FetchDataAutomation/releases/download/v1.3.15/models-v1.zip)
 
 ## 维护者构建 Mac 免安装包
 
-准备 `packaging.lock.json` 指定的独立 Python 3.11、`assets/wheels.lock.json` 中锁定的 arm64 wheels，以及模型文件。按以下顺序构建，再从生成的 ZIP 解压验证。
+准备 `packaging.lock.json` 指定的独立 Python 3.11、`assets/wheels.lock.json` 中锁定的 arm64 wheels，以及模型文件。构建和导出时使用同一份源码。导出完成后，从实际生成的 ZIP 解压验证。
 
 ```sh
 npm run build -- --outDir build/web
 ./scripts/build_ffmpeg.sh
 python scripts/build_mac.py --python /path/to/python-3.11 --output build/采集助手-Mac-arm64
 python scripts/release_assets.py build/采集助手-Mac-arm64 --output build/release-assets
+version=$(node -p 'require("./package.json").version')
+mkdir -p build/extracted
+ditto -x -k "build/release-assets/gather-assistant-${version}-macos-arm64.zip" build/extracted
+python scripts/verify_mac.py build/extracted/采集助手-Mac-arm64
+(cd build/release-assets && shasum -a 256 -c SHA256SUMS)
 ```
