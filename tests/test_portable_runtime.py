@@ -58,6 +58,18 @@ def test_move_repairs_bundled_paths_but_preserves_custom_paths(portable, monkeyp
     assert not runtime.refresh_bundled_paths(settings)
 
 
+def test_upgrade_replaces_only_the_old_bundled_worker(portable):
+    settings = SlicingStore.defaults()
+    settings["workerPythonPath"] = str(runtime.resources() / "runtime/inference/bin/python3.11")
+    assert runtime.refresh_bundled_paths(settings)
+    assert Path(settings["workerPythonPath"]) == runtime.resources() / runtime.PORTABLE_PYTHON
+
+    custom = portable / "custom/bin/python3.11"
+    settings["workerPythonPath"] = str(custom)
+    assert not runtime.refresh_bundled_paths(settings)
+    assert settings["workerPythonPath"] == str(custom)
+
+
 @pytest.mark.asyncio
 async def test_health_identifies_only_own_instance_and_fresh_data(portable):
     # Explicit test data disables all saved-session restore and platform access.

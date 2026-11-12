@@ -20,7 +20,7 @@ ROOT_FILES = {".gitignore", "README.md", "THIRD_PARTY_NOTICES.md", "pytest.ini",
               "requirements-slicing.lock.txt", "启动简易版.command"}
 SOURCE_SUFFIXES = {
     "app": {".py"}, "src": {".ts", ".tsx", ".css"}, "tests": {".py", ".mjs"},
-    "scripts": {".py", ".m", ".mjs", ".sh"},
+    "scripts": {".py", ".m", ".mjs", ".sh", ".patch"},
     "assets": {".json", ".py"}, "public": {".svg", ".ico"},
 }
 

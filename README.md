@@ -1,5 +1,7 @@
 # 采集助手使用说明
 
+[**直接下载完整程序 ZIP（Apple 芯片 Mac）**](https://github.com/LAWSSSS/YongFeng_FetchDataAutomation/releases/download/v1.3.15/gather-assistant-1.3.15-macos-arm64.zip)
+
 在 Mac 上按日期查询质检、确认采集区间，再由采集助手把识别出的照片导入工作平台。网页里的日期和时间均为北京时间。
 
 日常使用顺序是 **日期采集 → 视频确认 → 处理结果**。第一次使用，先在「设置」连接工作平台，再试着完成一条视频。
@@ -8,11 +10,11 @@
 
 适用于 **Apple 芯片 Mac（M 系列）和 macOS 14 或更新版本**。可以在苹果菜单的「关于本机」查看芯片和系统版本。
 
-1. 打开 GitHub 发布页。Mac 免安装包包含运行环境、视频工具和识别模型。当前版本请选择 `gather-assistant-1.3.14-macos-arm64.zip`。正式公证版提供后可选择 DMG。 [GitHub 发布页](https://github.com/LAWSSSS/YongFeng_FetchDataAutomation/releases/tag/v1.3.14)
-2. 双击 DMG，把里面的 **采集助手-Mac-arm64** 整个文件夹拖到「文稿」等可写位置。使用 ZIP 时，在访达双击解压即可。
-3. 在 **采集助手-Mac-arm64** 文件夹里双击 **启动采集助手.command**。终端会启动服务并自动打开网页。使用期间保持这个终端窗口打开。
+1. 点击上方的 **直接下载完整程序 ZIP**，浏览器会开始下载。
+2. 在访达的「下载」文件夹双击 ZIP，把解压出来的 **采集助手-Mac-arm64** 整个文件夹放在「文稿」或其他可写位置。
+3. 双击 **启动采集助手.command**。终端会启动服务并自动打开网页。使用期间保持这个终端窗口打开。
 
-v1.3.14 的 ZIP 是验证版，使用临时签名。macOS 仍可能提示「无法验证开发者」。正式免安装包需要经过 Apple 公证，首次打开时仍可能出现 macOS 的普通确认。 [Apple 的安全打开说明](https://support.apple.com/zh-cn/102445)
+完整包已经包含 Python、视频工具和识别模型。后端与识别共用一套 Python，FFmpeg 与 ffprobe 共用同一个可执行文件。ZIP 使用临时签名，首次运行时 macOS 仍可能要求确认。 [Apple 的安全打开说明](https://support.apple.com/zh-cn/102445)
 
 也可以从终端运行。这个例子假设你把文件夹放在了「文稿」。
 
@@ -100,7 +102,7 @@ zsh "$HOME/Documents/采集助手-Mac-arm64/启动采集助手.command" stop
 
 | 现象 | 先做什么 |
 | --- | --- |
-| GitHub 下载显示 404 | 请从发布页重新下载，或检查网络连接。 [GitHub 发布页](https://github.com/LAWSSSS/YongFeng_FetchDataAutomation/releases/tag/v1.3.14) |
+| GitHub 下载显示 404 | 请从发布页重新下载，或检查网络连接。 [GitHub 发布页](https://github.com/LAWSSSS/YongFeng_FetchDataAutomation/releases/tag/v1.3.15) |
 | 解压后看到「启动简易版.command」 | 这是源码包。日常使用请选择包含「启动采集助手.command」的 **Mac 免安装包**。 |
 | 浏览器没有打开 | 运行 `zsh ./启动采集助手.command status`，把终端显示的本机地址粘贴到浏览器地址栏。 |
 | 提示找不到内置运行组件 | 完整解压 ZIP，并把「启动采集助手.command」和「运行组件」放在同一文件夹。 |
@@ -118,27 +120,15 @@ zsh "$HOME/Documents/采集助手-Mac-arm64/启动采集助手.command" stop
 
 源码版需要 Python 3.13 和 Node.js 22.13 或更新版本。在源码目录打开终端并运行 `zsh ./启动简易版.command`，停止时运行 `zsh ./启动简易版.command stop`。
 
-源码版的照片识别还需要 Python 3.11、FFmpeg、ffprobe 和模型包。将模型 ZIP 放到源码目录，运行 `zsh ./启动简易版.command setup-models ./models-v1.zip`，再重启应用。 [下载 models-v1.zip](https://github.com/LAWSSSS/YongFeng_FetchDataAutomation/releases/download/v1.3.14/models-v1.zip)
+源码版的照片识别还需要 Python 3.11、FFmpeg、ffprobe 和模型包。将模型 ZIP 放到源码目录，运行 `zsh ./启动简易版.command setup-models ./models-v1.zip`，再重启应用。 [下载 models-v1.zip](https://github.com/LAWSSSS/YongFeng_FetchDataAutomation/releases/download/v1.3.15/models-v1.zip)
 
-## 维护者发布 Mac 免安装包
+## 维护者构建 Mac 免安装包
 
-在构建用 Mac 的钥匙串配置 **Developer ID Application** 证书和私钥，以及 `notarytool` 公证配置。签名身份可以填写证书名称或指纹，公证参数使用本机钥匙串配置名。 [Apple 公证指南](https://developer.apple.com/documentation/security/customizing-the-notarization-workflow)
-
-准备好网页构建、两套独立 Python 和锁定的依赖文件后，运行以下命令。将示例路径和两个环境变量改为本机对应的值。
+准备 `packaging.lock.json` 指定的独立 Python 3.11、`assets/wheels.lock.json` 中锁定的 arm64 wheels，以及模型文件。按以下顺序构建，再从生成的 ZIP 解压验证。
 
 ```sh
-python scripts/build_mac.py \
-  --backend /path/to/python-3.13 --inference /path/to/python-3.11 \
-  --wheels build/wheels --web build/web \
-  --signing-identity "$MACOS_SIGNING_IDENTITY" \
-  --output build/采集助手-Mac-arm64
-
-python scripts/release_assets.py build/采集助手-Mac-arm64 \
-  --output build/release-assets \
-  --signing-identity "$MACOS_SIGNING_IDENTITY" \
-  --notary-profile "$MACOS_NOTARY_PROFILE"
-
-python scripts/verify_mac.py build/release-assets/*.dmg
+npm run build -- --outDir build/web
+./scripts/build_ffmpeg.sh
+python scripts/build_mac.py --python /path/to/python-3.11 --output build/采集助手-Mac-arm64
+python scripts/release_assets.py build/采集助手-Mac-arm64 --output build/release-assets
 ```
-
-发布脚本核对运行组件的签名和公证票据，验证通过后输出 DMG。发布前在另一台 Mac 或干净环境中用浏览器下载，按第 1 节从访达打开并运行一次。省略签名参数时生成用于本机验证的 ZIP。 [Apple 的发行测试说明](https://developer.apple.com/documentation/xcode/packaging-mac-software-for-distribution)

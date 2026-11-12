@@ -1,0 +1,79 @@
+--- a/fftools/Makefile
++++ b/fftools/Makefile
+@@ -14,0 +15,2 @@
++    fftools/ffprobe.o           \
++    fftools/fftools_main.o      \
+--- a/fftools/cmdutils.h
++++ b/fftools/cmdutils.h
+@@ -40 +40 @@
+-extern const char program_name[];
++extern const char *program_name;
+@@ -45 +45 @@
+-extern const int program_birth_year;
++extern int program_birth_year;
+@@ -289,0 +290,4 @@
++void ffmpeg_show_help_default(const char *opt, const char *arg);
++void ffprobe_show_help_default(const char *opt, const char *arg);
++int ffmpeg_main(int argc, char **argv);
++int ffprobe_main(int argc, char **argv);
+--- a/fftools/ffmpeg.c
++++ b/fftools/ffmpeg.c
+@@ -88,3 +87,0 @@
+-
+-const char program_name[] = "ffmpeg";
+-const int program_birth_year = 2000;
+@@ -981 +978 @@
+-int main(int argc, char **argv)
++int ffmpeg_main(int argc, char **argv)
+--- a/fftools/ffmpeg_opt.c
++++ b/fftools/ffmpeg_opt.c
+@@ -1309 +1309 @@
+-void show_help_default(const char *opt, const char *arg)
++void ffmpeg_show_help_default(const char *opt, const char *arg)
+--- a/fftools/ffprobe.c
++++ b/fftools/ffprobe.c
+@@ -91,3 +90,0 @@
+-
+-const char program_name[] = "ffprobe";
+-const int program_birth_year = 2007;
+@@ -2912 +2909 @@
+-void show_help_default(const char *opt, const char *arg)
++void ffprobe_show_help_default(const char *opt, const char *arg)
+@@ -3233 +3230 @@
+-int main(int argc, char **argv)
++int ffprobe_main(int argc, char **argv)
+--- /dev/null
++++ b/fftools/fftools_main.c
+@@ -0,0 +1,32 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++
++#include <string.h>
++
++#include "cmdutils.h"
++
++const char *program_name = "ffmpeg";
++int program_birth_year = 2000;
++
++static int probe_mode;
++
++void show_help_default(const char *opt, const char *arg)
++{
++    if (probe_mode)
++        ffprobe_show_help_default(opt, arg);
++    else
++        ffmpeg_show_help_default(opt, arg);
++}
++
++int main(int argc, char **argv)
++{
++    const char *name = strrchr(argv[0], '/');
++
++    /* Both command names resolve to this same executable. */
++    probe_mode = !strcmp(name ? name + 1 : argv[0], "ffprobe");
++    if (probe_mode) {
++        program_name = "ffprobe";
++        program_birth_year = 2007;
++        return ffprobe_main(argc, argv);
++    }
++    return ffmpeg_main(argc, argv);
++}

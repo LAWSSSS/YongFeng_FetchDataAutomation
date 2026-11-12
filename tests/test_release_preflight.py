@@ -97,10 +97,13 @@ def test_all_release_versions_agree():
 
 
 def test_every_runtime_requirement_has_a_locked_wheel():
+    from packaging.utils import parse_wheel_filename
     from scripts.package_safety import verify_requirement_wheels
     entries = json.loads((ROOT / "assets/wheels.lock.json").read_text())["files"]
-    for environment, filename in (("backend", "requirements.lock.txt"), ("inference", "requirements-slicing.lock.txt")):
-        verify_requirement_wheels(ROOT / filename, [entry for entry in entries if entry["environment"] == environment])
+    names = [parse_wheel_filename(entry["wheel"])[0] for entry in entries]
+    assert len(set(names)) == len(names)
+    for filename in ("requirements.lock.txt", "requirements-slicing.lock.txt"):
+        verify_requirement_wheels(ROOT / filename, entries)
 
 
 def test_missing_or_wrong_version_wheel_fails_before_build(tmp_path):

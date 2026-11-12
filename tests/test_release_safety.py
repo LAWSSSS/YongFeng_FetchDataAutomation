@@ -36,5 +36,5 @@ def test_builder_rejects_a_venv_before_copying(tmp_path):
     (source / "pyvenv.cfg").write_text("home = /some/system/python")
     import pytest
     with pytest.raises(ValueError, match="never a virtualenv"):
-        module.make_runtime(source, tmp_path / "output", "3.13", tmp_path / "wheels", ROOT / "requirements.lock.txt")
+        module.make_runtime(source, tmp_path / "output", tmp_path / "wheels")
     assert not (tmp_path / "output").exists()

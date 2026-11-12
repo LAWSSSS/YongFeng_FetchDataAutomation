@@ -18,7 +18,7 @@ esac
 
 folder=${0:A:h}
 resources="$folder/运行组件"
-python="$resources/runtime/backend/bin/python3.13"
+python="$resources/runtime/bin/python3.11"
 launcher="$resources/application/launcher.py"
 
 if [[ ! -x "$python" || ! -f "$launcher" ]]; then

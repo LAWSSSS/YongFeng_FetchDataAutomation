@@ -1,14 +1,13 @@
 {
-  "version": "1.3.14",
+  "version": "1.3.15",
   "platform": "macos-arm64",
   "minimumMacOS": "14.0",
   "python": {
     "provider": "astral-sh/python-build-standalone",
     "build": "20260623",
-    "backend": "3.13.14",
-    "inference": "3.11.15",
     "distribution": "aarch64-apple-darwin-install_only",
-    "source": "https://github.com/astral-sh/python-build-standalone/releases/tag/20260623"
+    "source": "https://github.com/astral-sh/python-build-standalone/releases/tag/20260623",
+    "version": "3.11.15"
   },
   "ffmpeg": {
     "version": "8.1.2",
@@ -18,7 +17,8 @@
     "license": "LGPL-2.1-or-later",
     "gpl": false,
     "nonfree": false,
-    "externalLibraries": false
+    "externalLibraries": false,
+    "patch": "scripts/ffmpeg-multicall.patch"
   },
   "opencvEmbeddedFFmpeg": {
     "version": "6.0",

@@ -5,9 +5,10 @@ import os
 from pathlib import Path
 import shutil
 
-VERSION = "1.3.14"
+VERSION = "1.3.15"
 BUNDLE_ID = "cn.yongfeng.video-gather.standalone"
 PROFILE_NAME = "InspectionVideoGatherStandalone"
+PORTABLE_PYTHON = Path("runtime/bin/python3.11")
 
 
 def portable() -> bool:
@@ -64,7 +65,7 @@ def slicing_paths() -> dict:
             "bedModelPath": str(root / "models" / "bed" / "model.pt"),
             "bedGeometryPath": str(root / "models" / "bed" / "geometry.npz"),
             "frameToolPath": str(root / "tools" / "bin" / "ffmpeg"),
-            "workerPythonPath": str(root / "runtime" / "inference" / "bin" / "python3.11")}
+            "workerPythonPath": str(root / PORTABLE_PYTHON)}
 
 
 def source_model_paths() -> dict:
@@ -107,11 +108,13 @@ def refresh_bundled_paths(settings: dict) -> bool:
     for key, value in desired.items():
         if key == "directories":
             continue
-        old_default = None
+        old_defaults = [None] if not previous else []
         if previous:
             relative = Path(value).relative_to(resources())
-            old_default = str(Path(previous) / relative)
-        if key not in settings or settings[key] == old_default:
+            old_defaults.append(str(Path(previous) / relative))
+            if key == "workerPythonPath":
+                old_defaults.append(str(Path(previous) / "runtime/inference/bin/python3.11"))
+        if key not in settings or settings[key] in old_defaults:
             if settings.get(key) != value:
                 settings[key] = value
                 changed = True
