@@ -26,6 +26,11 @@ if [[ ! -x "$python" || ! -f "$launcher" ]]; then
     exit 1
 fi
 
+if [[ "$action" == launch && -z "${IVG_PROFILE_DIR:-}" && ! -w "$folder" ]]; then
+    print -u2 '程序所在目录不可写。请将整个采集助手文件夹复制到“文稿”等可写位置，再双击启动。'
+    exit 1
+fi
+
 # The package's data lives beside this command, even when Terminal's current
 # directory is elsewhere. Verification may supply an isolated profile.
 export IVG_PROFILE_DIR="${IVG_PROFILE_DIR:-$folder/数据/系统}"

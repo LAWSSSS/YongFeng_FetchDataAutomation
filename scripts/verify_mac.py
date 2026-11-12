@@ -19,6 +19,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+from scripts.macos_signing import verify_notarized_image
 from scripts.package_safety import PORTABLE_COMMAND, PORTABLE_RESOURCES, verify_tree
 
 
@@ -36,6 +37,42 @@ def verify_files(folder):
     manifest = json.loads((folder / "文件校验.json").read_text())
     verify_tree(folder, manifest)
     print(f'Verified {len(manifest["files"])} packaged file checksums.')
+
+
+@contextmanager
+def writable_copy(artifact):
+    if artifact.is_dir():
+        yield artifact
+        return
+    if artifact.suffix.lower() != ".dmg":
+        raise ValueError("Provide an extracted folder or a notarized DMG.")
+    verify_notarized_image(artifact)
+    with tempfile.TemporaryDirectory(prefix="ivg-dmg-") as temporary:
+        work = Path(temporary).resolve()
+        mount = work / "mount"
+        mount.mkdir()
+        subprocess.run(["/usr/bin/hdiutil", "attach", "-readonly", "-nobrowse", "-mountpoint",
+                        str(mount), str(artifact)], check=True)
+        try:
+            packages = [path for path in mount.iterdir() if (path / PORTABLE_COMMAND).is_file()]
+            if len(packages) != 1:
+                raise ValueError("DMG must contain one portable command folder.")
+            copied = work / packages[0].name
+            shutil.copytree(packages[0], copied, symlinks=True)
+        finally:
+            subprocess.run(["/usr/bin/hdiutil", "detach", str(mount)], check=True)
+        yield copied
+
+
+def check_native_runtime(folder):
+    resources = folder / PORTABLE_RESOURCES
+    for name in ("ffmpeg", "ffprobe"):
+        subprocess.run([str(resources / "tools/bin" / name), "-version"], check=True,
+                       stdout=subprocess.DEVNULL, timeout=15)
+    python = resources / "runtime/inference/bin/python3.11"
+    subprocess.run([str(python), "-I", "-B", "-c", "import cv2, numpy, onnxruntime, torch"],
+                   check=True, timeout=60)
+    print("FFmpeg, ffprobe and both model runtimes loaded.")
 
 
 def command_environment(profile, instance_dir):
@@ -218,15 +255,17 @@ def parity(folder, reference_python, samples, reference_models):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("folder", type=Path)
+    parser.add_argument("artifact", type=Path, help="extracted package folder or notarized DMG")
     parser.add_argument("--reference-python", type=Path)
     parser.add_argument("--reference-models", type=Path, default=ROOT / "build/models")
     parser.add_argument("--sample", type=Path, action="append", default=[])
     args = parser.parse_args()
-    verify_files(args.folder)
-    smoke(args.folder.resolve())
-    if args.reference_python and args.sample:
-        parity(args.folder.resolve(), args.reference_python, args.sample, args.reference_models.resolve())
+    with writable_copy(args.artifact.resolve()) as folder:
+        verify_files(folder)
+        check_native_runtime(folder)
+        smoke(folder)
+        if args.reference_python and args.sample:
+            parity(folder, args.reference_python, args.sample, args.reference_models.resolve())
 
 
 if __name__ == "__main__":

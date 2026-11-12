@@ -21,14 +21,12 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from app.runtime import BUNDLE_ID, VERSION
 from scripts.fetch_models import verify as verify_models
+from scripts.macos_signing import find_identity, is_macho, native_files, sign_native
 from scripts.package_safety import (
     PORTABLE_COMMAND, PORTABLE_RESOURCES, inventory_digest, inventory_tree, relative_name,
     source_inventory, verify_requirement_wheels,
 )
 from scripts.scan_secrets import issues
-
-MACH_HEADERS = {b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf", b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca"}
-
 
 def run(*args, **kwargs):
     subprocess.run([str(value) for value in args], check=True, **kwargs)
@@ -37,13 +35,6 @@ def run(*args, **kwargs):
 def digest(path):
     with path.open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
-
-
-def is_macho(path):
-    if not path.is_file() or path.is_symlink():
-        return False
-    with path.open("rb") as stream:
-        return stream.read(4) in MACH_HEADERS
 
 
 def make_runtime(source, destination, version, wheels, requirements):
@@ -129,7 +120,7 @@ def collect_licenses(resources, wheels):
     (resources / "dependencies.json").write_text(json.dumps(inventory, indent=2) + "\n")
 
 
-def audit_binaries(resources):
+def audit_binaries(resources, identity=None):
     # Strip resource-fork/Finder metadata from newly assembled copies only.
     # Never clear quarantine on a user's downloaded application or alter Gatekeeper.
     libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
@@ -139,7 +130,7 @@ def audit_binaries(resources):
             continue
         for name in ("com.apple.FinderInfo", "com.apple.ResourceFork"):
             libc.removexattr(os.fsencode(path), name.encode(), 0)
-    binaries = [path for path in resources.rglob("*") if is_macho(path)]
+    binaries = native_files(resources)
     for path in binaries:
         if path.suffix == ".dylib":
             identifiers = subprocess.check_output(["/usr/bin/otool", "-arch", "arm64", "-D", str(path)], text=True).splitlines()[1:]
@@ -160,13 +151,11 @@ def audit_binaries(resources):
                 version = line.split()[-1]
                 if tuple(map(int, version.split(".")[:2])) > (14, 0):
                     raise ValueError(f"Requires macOS newer than 14: {path.relative_to(resources)}")
-        run("/usr/bin/codesign", "--force", "--sign", "-", "--timestamp=none", path,
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-        run("/usr/bin/codesign", "--verify", "--strict", path)
+        sign_native(path, identity)
     return len(binaries)
 
 
-def assemble(args):
+def assemble(args, identity=None):
     sources = source_inventory(ROOT)
     for entry in sources:
         if issues((ROOT / entry["path"]).read_bytes()):
@@ -219,6 +208,7 @@ def assemble(args):
                "sourceCommit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
                "sourceDirty": bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=ROOT)),
                "sourceTreeSha256": inventory_digest(sources),
+               "signing": {"mode": "developer-id", "team": identity.team} if identity else {"mode": "ad-hoc"},
                "algorithmChanged": False}
     (resources / "release.json").write_text(json.dumps(package, indent=2) + "\n")
     (resources / "source-manifest.json").write_text(json.dumps({"files": sources}, ensure_ascii=False, indent=2) + "\n")
@@ -228,7 +218,7 @@ def assemble(args):
     command = output / PORTABLE_COMMAND
     shutil.copy2(ROOT / "scripts/portable_command.sh", command)
     command.chmod(0o755)
-    binaries = audit_binaries(resources)
+    binaries = audit_binaries(resources, identity)
     # Export the actual working tree, including reviewed new modules. HEAD alone
     # cannot reproduce an uncommitted pre-release; never label it as that commit.
     if sources != source_inventory(ROOT):
@@ -257,13 +247,18 @@ def main():
     parser.add_argument("--wheels", type=Path, default=ROOT / "build/wheels")
     parser.add_argument("--web", type=Path, default=ROOT / "build/web")
     parser.add_argument("--pandoc", default=shutil.which("pandoc"), help="Pandoc executable used to generate the offline guide")
+    parser.add_argument("--signing-identity", help="Developer ID Application name or certificate hash in the local Keychain")
     parser.add_argument("--output", type=Path, default=Path.home() / "Library/Caches/InspectionVideoGatherBuild" / VERSION / "采集助手-Mac-arm64")
     args = parser.parse_args()
     if sys.platform != "darwin" or os.uname().machine != "arm64":
         parser.error("Build on an Apple Silicon Mac.")
     if not args.pandoc:
         parser.error("Install Pandoc or provide its path with --pandoc.")
-    assemble(args)
+    try:
+        identity = find_identity(args.signing_identity) if args.signing_identity else None
+    except ValueError as error:
+        parser.error(str(error))
+    assemble(args, identity)
 
 
 if __name__ == "__main__":
