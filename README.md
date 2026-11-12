@@ -8,9 +8,9 @@
 
 适用于 **Apple 芯片 Mac（M 系列）和 macOS 14 或更新版本**。可以在苹果菜单的「关于本机」查看芯片和系统版本。
 
-1. 下载 **Mac 终端版 ZIP**。完整包包含运行环境、视频工具和识别模型。 [下载 v1.3.12](https://github.com/LAWSSSS/YongFeng_FetchDataAutomation/releases/download/v1.3.12/gather-assistant-1.3.12-macos-arm64.zip)
+1. 下载 **Mac 终端版 ZIP**。完整包包含运行环境、视频工具和识别模型。 [下载 v1.3.13](https://github.com/LAWSSSS/YongFeng_FetchDataAutomation/releases/download/v1.3.13/gather-assistant-1.3.13-macos-arm64.zip)
 2. 在访达的「下载」文件夹双击 ZIP。解压后可以直接使用，也可以把 **采集助手-Mac-arm64** 整个文件夹移到「文稿」。
-3. 在解压后的文件夹里双击 **启动采集助手.command**。终端会启动后台，并自动打开网页。完整包解压即用，里面没有 `.app`，无需安装。
+3. 在解压后的文件夹里双击 **启动采集助手.command**。终端会启动服务并自动打开网页。使用期间保持这个终端窗口打开。完整包解压即用，里面没有 `.app`，无需安装。
 
 也可以从终端运行。这个例子假设你把文件夹放在了「文稿」。
 
@@ -61,7 +61,7 @@ zsh "$HOME/Documents/采集助手-Mac-arm64/启动采集助手.command"
 | **可用部分已完成** | 已跳过损坏的位置，并核验可用部分生成的照片成果。 |
 | **未检出目标／未找到可用画面** | 这次没有生成照片。具体原因在记录详情中。 |
 
-关掉浏览器标签页后，本地服务仍在后台处理。处理期间让 Mac 保持开机，并连接所需网络和磁盘。
+需要继续处理时，保持启动命令的终端窗口打开。即使暂时关闭浏览器标签页，处理也会继续。
 
 ## 4. 文件保存、清理和更新
 
@@ -83,22 +83,22 @@ zsh "$HOME/Documents/采集助手-Mac-arm64/启动采集助手.command"
 
 ### 停止或升级应用
 
-在启动命令末尾加 `status` 可查看运行状态和网址，加 `stop` 可停止后台。以下以放在「文稿」中的文件夹为例。
+关闭启动命令所在的终端窗口，或在里面按 **Control–C**，即可安全停止服务。下次双击启动文件即可继续。也可以在另一个终端用 `status` 查看网址，用 `stop` 停止服务。以下以放在「文稿」中的文件夹为例。
 
 ```sh
 zsh "$HOME/Documents/采集助手-Mac-arm64/启动采集助手.command" status
 zsh "$HOME/Documents/采集助手-Mac-arm64/启动采集助手.command" stop
 ```
 
-升级时先停止旧版。旧安装有「停止采集助手.app」时，可用它停止。备份 **数据** 文件夹，再把它复制到解压后的新版文件夹，放在「启动采集助手.command」旁。若工作区在外置盘，启动前请接上原盘。
+升级时先停止旧版。v1.3.12 及更早的终端版需用旧启动文件的 `stop` 命令。更早的应用版可以用「停止采集助手.app」。备份 **数据** 文件夹，再把它复制到解压后的新版文件夹，放在「启动采集助手.command」旁。若工作区在外置盘，启动前请接上原盘。
 
-同一个 macOS 账户一次运行一份采集助手。再次双击同一个启动文件会回到当前网页。切换目录、版本或源码版前，先运行停止命令。
+同一个 macOS 账户一次运行一份采集助手。运行中再次双击会打开当前网页，服务仍由第一次启动的终端窗口控制。切换目录、版本或源码版前，先停止正在运行的版本。
 
 ## 5. 遇到问题时
 
 | 现象 | 先做什么 |
 | --- | --- |
-| GitHub 下载显示 404 | 请从发布页重新下载，或检查网络连接。 [GitHub 发布页](https://github.com/LAWSSSS/YongFeng_FetchDataAutomation/releases/tag/v1.3.12) |
+| GitHub 下载显示 404 | 请从发布页重新下载，或检查网络连接。 [GitHub 发布页](https://github.com/LAWSSSS/YongFeng_FetchDataAutomation/releases/tag/v1.3.13) |
 | 解压后看到「启动简易版.command」 | 这是源码包。日常使用请选择包含「启动采集助手.command」的 **Mac 完整版 ZIP**。 |
 | 浏览器没有打开 | 运行 `zsh ./启动采集助手.command status`，把终端显示的本机地址粘贴到浏览器地址栏。 |
 | 提示找不到内置运行组件 | 完整解压 ZIP，并把「启动采集助手.command」和「运行组件」放在同一文件夹。 |
@@ -116,4 +116,4 @@ zsh "$HOME/Documents/采集助手-Mac-arm64/启动采集助手.command" stop
 
 源码版需要 Python 3.13 和 Node.js 22.13 或更新版本。在源码目录打开终端并运行 `zsh ./启动简易版.command`，停止时运行 `zsh ./启动简易版.command stop`。
 
-源码版的照片识别还需要 Python 3.11、FFmpeg、ffprobe 和模型包。将模型 ZIP 放到源码目录，运行 `zsh ./启动简易版.command setup-models ./models-v1.zip`，再重启应用。 [下载 models-v1.zip](https://github.com/LAWSSSS/YongFeng_FetchDataAutomation/releases/download/v1.3.12/models-v1.zip)
+源码版的照片识别还需要 Python 3.11、FFmpeg、ffprobe 和模型包。将模型 ZIP 放到源码目录，运行 `zsh ./启动简易版.command setup-models ./models-v1.zip`，再重启应用。 [下载 models-v1.zip](https://github.com/LAWSSSS/YongFeng_FetchDataAutomation/releases/download/v1.3.13/models-v1.zip)

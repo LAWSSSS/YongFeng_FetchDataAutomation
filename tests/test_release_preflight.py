@@ -61,14 +61,14 @@ def setup_launcher(monkeypatch, tmp_path):
     monkeypatch.setattr(launcher, "release_manifest", lambda: {"bundleId": launcher.BUNDLE_ID, "packageId": "new-package"})
     monkeypatch.setattr(launcher, "prepare_profile", lambda: (tmp_path, "profile"))
     monkeypatch.setattr(launcher, "verified_server", lambda *args: False)
-    monkeypatch.setattr(launcher.subprocess, "Popen", lambda *a, **k: pytest.fail("must not spawn another writer"))
+    monkeypatch.setattr(launcher, "serve", lambda *a, **k: pytest.fail("must not start another writer"))
     monkeypatch.setattr(launcher.os, "kill", lambda *a: pytest.fail("must not signal an unverified process"))
 
 
 def test_busy_instance_is_not_mistaken_for_absent_server(monkeypatch, tmp_path):
     setup_launcher(monkeypatch, tmp_path)
     with launcher.lock(tmp_path / "server.lock"):
-        with pytest.raises(RuntimeError, match="未创建第二个"):
+        with pytest.raises(RuntimeError, match="正在启动或安全停止"):
             launcher.launch(no_browser=True)
         result = launcher.stop()
         assert not result["stopped"]

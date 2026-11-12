@@ -16,12 +16,11 @@ from pathlib import Path
 from uuid import uuid4
 
 BUNDLE_ID = "cn.yongfeng.video-gather.standalone"
-PROFILE_NAME = "InspectionVideoGatherStandalone"
 APP_ROOT = Path(__file__).resolve().parent
 RESOURCES = APP_ROOT.parent
 sys.path.insert(0, str(APP_ROOT if (APP_ROOT / "app").is_dir() else APP_ROOT.parent))
 from app import local_instance
-from app.runtime import portable_package_directory
+from app.runtime import identity, portable_package_directory
 
 
 def private_json(path, value):
@@ -91,12 +90,13 @@ def verified_server(state, profile_id, package_id=None):
                                ("bundleId", "profileId", "instanceId", "packageId", "pid"))
 
 
-def open_browser(port, disabled=False):
-    if not disabled:
-        address = f"http://127.0.0.1:{port}/"
-        result = subprocess.run(["/usr/bin/open", address], capture_output=True, check=False)
-        if result.returncode:
-            raise RuntimeError(f"采集助手已启动。请在浏览器地址栏手动打开 {address}")
+def open_browser(port):
+    address = f"http://127.0.0.1:{port}/"
+    try:
+        subprocess.run(["/usr/bin/open", address], check=True, timeout=5,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        print(f"请在浏览器打开 {address}", file=sys.stderr)
 
 
 def server_locked(home):
@@ -142,61 +142,89 @@ def prepare_profile():
     return home, config["id"]
 
 
-def launch(no_browser=False):
+def launch(no_browser=False, output="json"):
     manifest = release_manifest()
     home, profile_id = prepare_profile()
-    with lock(home / "launch.lock"):
-        state = read_json(home / "server.json")
-        if verified_server(state, profile_id) and server_locked(home):
-            # Updates must be explicitly restarted, not started over an old writer.
-            if state.get("packageId") != manifest["packageId"]:
-                raise RuntimeError("旧版采集助手仍在运行，请先使用旧版的停止入口，再打开新版。进度会保留。")
-            previous = state.get("profilePath")
-            moved = (isinstance(previous, str) and Path(previous).is_absolute()
-                     and Path(previous) != home and not Path(previous).exists()
-                     and server_locked(home))
-            if not moved:
-                open_browser(state["port"], no_browser)
-                return state
-            if not stop_server(home, state):
-                raise RuntimeError("正在停止移动前的后台，请稍后再次打开。")
-        if server_locked(home):
-            raise RuntimeError("采集助手正在启动、忙碌或安全停止中，请稍后再打开；未创建第二个后台实例。")
-        local_instance.check_available()
-        instance_id = uuid4().hex
-        executable = RESOURCES / "runtime" / "backend" / "bin" / "python3.13"
-        logs = home / "logs"
-        logs.mkdir(mode=0o700, exist_ok=True)
-        log_path = logs / "service.log"
-        if log_path.exists() and log_path.stat().st_size > 5 * 1024 ** 2:
-            log_path.replace(logs / "service.previous.log")
-        with log_path.open("ab") as stream:
-            os.chmod(log_path, 0o600)
-            child = subprocess.Popen([str(executable), "-I", "-B", str(Path(__file__).resolve()),
-                                      "serve", "--instance-id", instance_id],
-                                     cwd=APP_ROOT, env=environment(home, manifest, profile_id, instance_id),
-                                     stdin=subprocess.DEVNULL, stdout=stream, stderr=stream,
-                                     start_new_session=True, close_fds=True)
-        for _ in range(240):
+    with contextlib.ExitStack() as ownership:
+        with lock(home / "launch.lock"):
             state = read_json(home / "server.json")
-            if state.get("instanceId") == instance_id and verified_server(state, profile_id, manifest["packageId"]):
-                open_browser(state["port"], no_browser)
-                return state
-            if child.poll() is not None:
-                local_instance.check_available()
-                raise RuntimeError("采集助手启动失败。请在应用旁打开“数据 → 系统 → logs”，查看 service.log。")
-            time.sleep(0.25)
-        raise RuntimeError("采集助手仍在启动，请稍后再次打开。原程序不会被停止。")
+            if verified_server(state, profile_id) and server_locked(home):
+                if state.get("packageId") != manifest["packageId"]:
+                    raise RuntimeError("旧版采集助手仍在运行，请先停止旧版，再打开新版。")
+                previous = state.get("profilePath")
+                moved = (isinstance(previous, str) and Path(previous).is_absolute()
+                         and Path(previous) != home and not Path(previous).exists())
+                if not moved:
+                    announce(state, no_browser, output, reused=True)
+                    return
+                if not stop_server(home, state):
+                    raise RuntimeError("正在停止移动前的服务，请稍后再次打开。")
+            if server_locked(home):
+                raise RuntimeError("采集助手正在启动或安全停止，请稍后再打开。")
+            ownership.enter_context(local_instance.backend_instance())
+            ownership.enter_context(lock(home / "server.lock", blocking=False))
+        instance_id = uuid4().hex
+        env = environment(home, manifest, profile_id, instance_id)
+        os.environ.clear()
+        os.environ.update(env)
+        serve(home, no_browser, output)
 
 
-def serve(instance_id):
-    home = profile()
-    # The parent holds launch.lock until health is ready; do not take it here.
-    with local_instance.backend_instance(), lock(home / "server.lock", blocking=False):
-        import uvicorn
-        from app.main import create_app
-        from app.runtime import identity
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+def announce(state, no_browser, output, *, reused=False):
+    print_result("launch", state, output)
+    if output == "text":
+        print("服务由首次启动的终端窗口控制。关闭该窗口或按 Control-C 可停止。" if reused
+              else "关闭此终端窗口或按 Control-C 可停止服务。", flush=True)
+    if not no_browser:
+        open_browser(state["port"])
+
+
+def service_logging(home):
+    logs = home / "logs"
+    logs.mkdir(mode=0o700, exist_ok=True)
+    path = logs / "service.log"
+    if path.exists() and path.stat().st_size > 5 * 1024 ** 2:
+        path.replace(logs / "service.previous.log")
+    path.touch(mode=0o600, exist_ok=True)
+    return {
+        "version": 1, "disable_existing_loggers": False,
+        "formatters": {"service": {"format": "%(asctime)s %(levelname)s %(message)s"}},
+        "handlers": {"service": {"class": "logging.FileHandler", "filename": str(path),
+                                 "encoding": "utf-8", "formatter": "service"}},
+        "root": {"level": "WARNING", "handlers": ["service"]},
+        "loggers": {"uvicorn": {"level": "INFO"}},
+    }
+
+
+def serve(home, no_browser, output):
+    import uvicorn
+
+    class TerminalServer(uvicorn.Server):
+        def handle_exit(self, sig, frame):
+            # All three terminal exit paths go through Uvicorn's lifespan
+            # shutdown, without replaying the signal after cleanup.
+            self.should_exit = True
+
+        async def startup(self, sockets=None):
+            await super().startup(sockets=sockets)
+            if not self.should_exit:
+                try:
+                    announce(state, no_browser, output)
+                except OSError:
+                    # The terminal can vanish while printing the ready message.
+                    self.should_exit = True
+
+    config = uvicorn.Config("app.main:create_app", factory=True, host="127.0.0.1",
+                            log_config=service_logging(home), access_log=False,
+                            timeout_graceful_shutdown=30)
+    server = TerminalServer(config)
+    # Closing a macOS Terminal window sends SIGHUP. Uvicorn handles SIGINT and
+    # SIGTERM itself, but a hangup needs an explicit handler.
+    with contextlib.ExitStack() as cleanup, socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        for sig in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+            original = signal.signal(sig, server.handle_exit)
+            cleanup.callback(signal.signal, sig, original)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             sock.bind(("127.0.0.1", 8786))
         except OSError as error:
@@ -204,15 +232,11 @@ def serve(instance_id):
                 raise
             sock.bind(("127.0.0.1", 0))
         sock.listen(128)
-        sock.set_inheritable(True)
         state = {**identity(), "port": sock.getsockname()[1], "profilePath": str(home)}
-        private_json(home / "server.json", state)
-        try:
-            uvicorn.Server(uvicorn.Config(create_app(), host="127.0.0.1", access_log=False,
-                                         timeout_graceful_shutdown=30)).run(sockets=[sock])
-        finally:
-            sock.close()
-            clear_server_state(home, instance_id)
+        cleanup.callback(clear_server_state, home, state["instanceId"])
+        if not server.should_exit:
+            private_json(home / "server.json", state)
+            server.run(sockets=[sock])
 
 
 def stop():
@@ -244,7 +268,7 @@ def status():
 
 def print_result(action, result, output):
     if output == "json":
-        print(json.dumps(result, ensure_ascii=False))
+        print(json.dumps(result, ensure_ascii=False), flush=True)
     elif action == "stop":
         print("采集助手已停止，数据和进度已保留。" if result["stopped"] else result["message"])
     elif action == "status" and not result["running"]:
@@ -255,21 +279,15 @@ def print_result(action, result, output):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("action", nargs="?", choices=("launch", "serve", "stop", "status"), default="launch")
+    parser.add_argument("action", nargs="?", choices=("launch", "stop", "status"), default="launch")
     parser.add_argument("--no-browser", action="store_true")
-    parser.add_argument("--instance-id", default="")
     parser.add_argument("--output", choices=("json", "text"), default="json")
     args = parser.parse_args()
     try:
-        if args.action == "serve":
-            serve(args.instance_id)
+        if args.action == "launch":
+            launch(args.no_browser, args.output)
         else:
-            if args.action == "stop":
-                result = stop()
-            elif args.action == "status":
-                result = status()
-            else:
-                result = launch(args.no_browser)
+            result = stop() if args.action == "stop" else status()
             if result.get("retry"):
                 raise RuntimeError(result["message"])
             print_result(args.action, result, args.output)
