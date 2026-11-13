@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import pty
+import select
 import shutil
 import signal
 import socket
@@ -61,6 +62,74 @@ def command_environment(profile, instance_dir):
     if profile is not None:
         env["IVG_PROFILE_DIR"] = str(profile)
     return env
+
+
+def verify_first_use(folder):
+    """Inject download metadata into an extracted test package, then approve once.
+
+    This is a controlled quarantine test, not proof of notarization or a fresh
+    Mac's Gatekeeper cache. Never point this option at an installed user's copy.
+    """
+    resources = folder / PORTABLE_RESOURCES
+    manifest = json.loads((resources / "first-run.json").read_text())
+    native = [resources / entry for entry in manifest["nativeFiles"]]
+    if any(not path.resolve().is_relative_to(resources) or path.is_symlink() for path in native):
+        raise ValueError("Invalid first-use native inventory.")
+    sentinel = resources / "application/launcher.py"
+    targets = [*native, sentinel, resources]
+    marker = "0083;69150e00;Safari;C264A041-6210-448D-8D61-9741876E7066"
+    for offset in range(0, len(targets), 100):
+        subprocess.run(["/usr/bin/xattr", "-w", "com.apple.quarantine", marker,
+                        *map(str, targets[offset:offset + 100])], check=True, timeout=15)
+    with tempfile.TemporaryDirectory(prefix="ivg-first-use-") as temporary:
+        work = Path(temporary).resolve()
+        profile, instance = work / "profile", work / "instance"
+        master, slave = pty.openpty()
+        process = subprocess.Popen([str(folder / PORTABLE_COMMAND), "start", "--no-browser", "--output", "json"],
+                                   env=command_environment(profile, instance), stdin=slave, stdout=slave,
+                                   stderr=slave, start_new_session=True)
+        os.close(slave)
+        output = b""
+        approved = False
+        ready = False
+        started = time.monotonic()
+        try:
+            while time.monotonic() - started < 180 and process.poll() is None:
+                if select.select([master], [], [], 0.25)[0]:
+                    try:
+                        output += os.read(master, 65536)
+                    except OSError:
+                        break
+                    if b"[y/N]" in output and not approved:
+                        os.write(master, b"y\n")
+                        approved = True
+                    if b'"instanceId"' in output:
+                        state = invoke(folder, profile, "status", instance_dir=instance)
+                        assert state.get("pid") == process.pid
+                        assert read(f'http://127.0.0.1:{state["port"]}/api/health')["instanceId"] == state["instanceId"]
+                        ready = True
+                        break
+            if not approved or not ready:
+                raise RuntimeError("First-use approval did not start the site: " + output.decode(errors="replace"))
+            assert output.count(b"[y/N]") == 1
+            for path in native:
+                result = subprocess.run(["/usr/bin/xattr", "-p", "com.apple.quarantine", str(path)], capture_output=True)
+                assert result.returncode != 0, path.name
+            assert subprocess.run(["/usr/bin/xattr", "-p", "com.apple.quarantine", str(sentinel)],
+                                  capture_output=True).returncode == 0
+            print(f"One first-use approval prepared {len(native)} native files; site ready in {time.monotonic() - started:.1f}s.", flush=True)
+        finally:
+            os.close(master)  # Also exercises the actual terminal-disconnect path.
+            if process.poll() is None:
+                try:
+                    process.wait(timeout=45)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+                    raise
+            if ready:
+                assert process.returncode == 0
+                assert not invoke(folder, profile, "status", instance_dir=instance)["running"]
 
 
 def invoke(folder, profile, *arguments, instance_dir):
@@ -254,10 +323,13 @@ def main():
     parser.add_argument("--reference-python", type=Path)
     parser.add_argument("--reference-models", type=Path, default=ROOT / "build/models")
     parser.add_argument("--sample", type=Path, action="append", default=[])
+    parser.add_argument("--first-use", action="store_true", help="inject download quarantine into this isolated test package and exercise one approval")
     args = parser.parse_args()
     folder = args.folder.resolve()
     verify_files(folder)
     subprocess.run([sys.executable, str(ROOT / "scripts/scan_secrets.py"), "--directory", str(folder)], check=True)
+    if args.first_use:
+        verify_first_use(folder)
     check_native_runtime(folder)
     smoke(folder)
     if args.reference_python and args.sample:

@@ -129,7 +129,8 @@ def collect_licenses(resources, wheels, ffmpeg_tools):
 
 def audit_binaries(resources):
     # Strip resource-fork/Finder metadata from newly assembled copies only.
-    # Never clear quarantine on a user's downloaded application or alter Gatekeeper.
+    # Download quarantine is handled only by the user's explicit first-use choice.
+    # The build never changes Gatekeeper or the source runtime's metadata.
     libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
     libc.removexattr.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]
     for path in (resources, *resources.rglob("*")):
@@ -162,6 +163,30 @@ def audit_binaries(resources):
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         run("/usr/bin/codesign", "--verify", "--strict", path)
     return len(binaries)
+
+
+def install_first_use(resources, command):
+    """Pin a system-only bootstrap after native signatures have been finalized."""
+    helper = resources / "prepare-first-run.js"
+    shutil.copy2(ROOT / "scripts/prepare_first_run.js", helper)
+    entries = inventory_tree(resources)
+    if any(any(ord(character) < 32 or ord(character) == 127 for character in entry["path"])
+           for entry in entries):
+        raise ValueError("First-use checksum paths must not contain control characters.")
+    manifest = resources / "first-run.json"
+    native = [entry["path"] for entry in entries if is_macho(resources / entry["path"])]
+    if not native:
+        raise ValueError("A portable package must contain native runtime components.")
+    manifest.write_text(json.dumps({"schema": 1, "nativeFiles": native, "files": entries},
+                                   ensure_ascii=False, indent=2) + "\n")
+    template = (ROOT / "scripts/portable_command.sh").read_text()
+    for placeholder, value in (("@FIRST_USE_HELPER_SHA256@", digest(helper)),
+                               ("@FIRST_USE_MANIFEST_SHA256@", digest(manifest))):
+        if template.count(placeholder) != 1:
+            raise ValueError("First-use bootstrap checksum placeholder missing or duplicated.")
+        template = template.replace(placeholder, value)
+    command.write_text(template)
+    command.chmod(0o755)
 
 
 def verify_web_build(web, sources):
@@ -235,9 +260,8 @@ def assemble(args):
         "--metadata=pagetitle:采集助手使用说明", ROOT / "README.md", "--output", output / "使用说明.html")
     shutil.copy2(ROOT / "THIRD_PARTY_NOTICES.md", output / "THIRD_PARTY_NOTICES.md")
     command = output / PORTABLE_COMMAND
-    shutil.copy2(ROOT / "scripts/portable_command.sh", command)
-    command.chmod(0o755)
     binaries = audit_binaries(resources)
+    install_first_use(resources, command)
     # Export the actual working tree, including reviewed new modules. HEAD alone
     # cannot reproduce an uncommitted pre-release; never label it as that commit.
     if sources != source_inventory(ROOT):

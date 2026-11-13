@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 import shutil
 
-VERSION = "1.3.15"
+VERSION = "1.3.16"
 BUNDLE_ID = "cn.yongfeng.video-gather.standalone"
 PROFILE_NAME = "InspectionVideoGatherStandalone"
 PORTABLE_PYTHON = Path("runtime/bin/python3.11")

@@ -1,6 +1,6 @@
 # 采集助手使用说明
 
-[**直接下载完整程序 ZIP（Apple 芯片 Mac）**](https://github.com/LAWSSSS/YongFeng_FetchDataAutomation/releases/download/v1.3.15/gather-assistant-1.3.15-macos-arm64.zip)
+[**直接下载完整程序 ZIP（Apple 芯片 Mac）**](https://github.com/LAWSSSS/YongFeng_FetchDataAutomation/releases/download/v1.3.16/gather-assistant-1.3.16-macos-arm64.zip)
 
 在 Mac 上按日期查询质检、确认采集区间，再由采集助手把识别出的照片导入工作平台。网页里的日期和时间均为北京时间。
 
@@ -12,9 +12,11 @@
 
 1. 点击上方的 **直接下载完整程序 ZIP**，浏览器会开始下载。
 2. 在访达的「下载」文件夹双击 ZIP，把解压出来的 **采集助手-Mac-arm64** 整个文件夹放在「文稿」或其他可写位置。
-3. 双击 **启动采集助手.command**。终端会启动服务并自动打开网页。使用期间保持这个终端窗口打开。
+3. 双击 **启动采集助手.command**。如果终端提示「是否信任并准备这份采集助手」，核对下载来源，输入 **y** 并按回车。程序会校验文件，并一次性准备本包的内置组件，随后自动打开网页。使用期间保持这个终端窗口打开。
 
-完整包已经包含 Python、视频工具和识别模型。通过浏览器下载后，首次运行时 macOS 可能要求确认，也可能拦截包内的运行组件。遇到拦截时，见下文「遇到问题时」。 [Apple 的安全打开说明](https://support.apple.com/zh-cn/102445)
+完整包已经包含 Python、视频工具和识别模型。首次准备只处理当前程序包内已校验的运行组件，不需要管理员密码，不关闭 macOS 安全保护；同一份包以后启动无需重复确认。重新下载的包可能需要再确认一次。校验不通过时会停止，请重新下载解压，不要反复逐个放行组件。
+
+macOS 对**启动文件本身**的首次打开、**文件夹访问**和**钥匙串访问**仍可能分别询问，这些系统权限无法合并。如果双击启动文件被拦截，可按下面的方法从终端启动；系统询问目录或钥匙串权限时，再按实际需要确认。 [Apple 的安全打开说明](https://support.apple.com/zh-cn/102445)
 
 也可以从终端运行。这个例子假设你把文件夹放在了「文稿」。
 
@@ -102,10 +104,12 @@ zsh "$HOME/Documents/采集助手-Mac-arm64/启动采集助手.command" stop
 
 | 现象 | 先做什么 |
 | --- | --- |
-| GitHub 下载显示 404 | 请从发布页重新下载，或检查网络连接。 [GitHub 发布页](https://github.com/LAWSSSS/YongFeng_FetchDataAutomation/releases/tag/v1.3.15) |
+| GitHub 下载显示 404 | 请从发布页重新下载，或检查网络连接。 [GitHub 发布页](https://github.com/LAWSSSS/YongFeng_FetchDataAutomation/releases/tag/v1.3.16) |
 | 解压后看到「启动简易版.command」 | 这是源码包。日常使用请选择包含「启动采集助手.command」的 **Mac 免安装包**。 |
 | 终端显示网址，浏览器没有打开 | 把终端显示的网址粘贴到浏览器地址栏。也可运行 `zsh ./启动采集助手.command status` 查看当前网址。 |
-| macOS 拦截内置运行组件 | 核对 ZIP 是否来自项目发布页，并用同一发布页的 `SHA256SUMS` 核对下载文件。查看 Apple 的安全打开说明。如果包内组件仍被系统拦截，可以从源码启动。 [Apple 的安全打开说明](https://support.apple.com/zh-cn/102445) |
+| macOS 拦截启动文件 | 打开「终端」，输入 `zsh` 和一个空格，把「启动采集助手.command」拖进终端，按回车。核对来源后，在首次准备提示中输入 `y`。无需逐个运行包内的 Python 或工具。 |
+| 提示组件校验未通过 | 当前包有文件缺失、变化或混入其他内容。重新下载并解压到新文件夹；旧「数据」文件夹先保留，不要放进「运行组件」。也可用发布页的 `SHA256SUMS` 核对 ZIP。 |
+| 系统仍询问文件夹或钥匙串权限 | 这是与运行组件放行不同的系统权限，按需要允许。若单位的设备管理策略禁止运行，请联系管理员；首次准备不会更改这些策略。 |
 | 提示找不到内置运行组件 | 完整解压 ZIP，并把「启动采集助手.command」和「运行组件」放在同一文件夹。 |
 | 程序位置不可写 | 在访达把整个程序文件夹移到「文稿」等可写位置后再打开。已经使用过的应用先停止，再连同「数据」一起移动。 |
 | 查询没有记录，或某条不能勾选 | 核对日期、质检网站连接和记录旁的原因。默认要求质检时长**超过 10 分钟**，并且有真实车牌或至少一张有效的智能判级照片。准入条件可在 **设置 → 采集设置** 查看。 |
@@ -121,7 +125,7 @@ zsh "$HOME/Documents/采集助手-Mac-arm64/启动采集助手.command" stop
 
 源码版需要 Python 3.13 和 Node.js 22.13 或更新版本。在源码目录运行 `zsh ./启动简易版.command`。首次启动会联网准备依赖。关闭启动终端或按 **Control–C** 即可停止。如果之前运行过常驻的源码版，先运行 `zsh ./启动简易版.command stop`。
 
-源码版的照片识别还需要 Python 3.11、FFmpeg、ffprobe 和模型包。将模型 ZIP 放到源码目录，运行 `zsh ./启动简易版.command setup-models ./models-v1.zip`，再重启应用。 [下载 models-v1.zip](https://github.com/LAWSSSS/YongFeng_FetchDataAutomation/releases/download/v1.3.15/models-v1.zip)
+源码版的照片识别还需要 Python 3.11、FFmpeg、ffprobe 和模型包。将模型 ZIP 放到源码目录，运行 `zsh ./启动简易版.command setup-models ./models-v1.zip`，再重启应用。 [下载 models-v1.zip](https://github.com/LAWSSSS/YongFeng_FetchDataAutomation/releases/download/v1.3.16/models-v1.zip)
 
 ## 维护者构建 Mac 免安装包
 
@@ -135,6 +139,8 @@ python scripts/release_assets.py build/采集助手-Mac-arm64 --output build/rel
 version=$(node -p 'require("./package.json").version')
 mkdir -p build/extracted
 ditto -x -k "build/release-assets/gather-assistant-${version}-macos-arm64.zip" build/extracted
-python scripts/verify_mac.py build/extracted/采集助手-Mac-arm64
+python scripts/verify_mac.py build/extracted/采集助手-Mac-arm64 --first-use
 (cd build/release-assets && shasum -a 256 -c SHA256SUMS)
 ```
+
+`--first-use` 仅用于上述新解压的测试副本：它模拟下载隔离标记，验证一次确认后启动、模型环境加载和关闭终端退出。不要对正在使用的程序目录运行。此项验证不代表 Apple 签名或公证。
