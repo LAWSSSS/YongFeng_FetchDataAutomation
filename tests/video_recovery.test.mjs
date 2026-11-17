@@ -1,12 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { recoveryInProgress, videoRecovery, versionDownloadable } from '../src/video-recovery.ts';
+import { recoveryInProgress, recoveryOperationInProgress, videoRecovery, versionDownloadable } from '../src/video-recovery.ts';
 import {videoCategory} from '../src/record-groups.ts';
 
 test('only the current bound recovery is processing, while pause and conflicts remain actionable',()=>{
   const row={id:'one',jobId:'job',activeRevision:2,revision:3,versions:[{revision:2,state:'failed'}],
     operation:{kind:'recover-decodable',state:'running',version:2,expectedRevision:3}};
   assert.equal(recoveryInProgress(row),true);
+  assert.equal(recoveryOperationInProgress(row),true);
   assert.equal(videoCategory(row),'processing');
   for(const change of [{state:'paused'},{version:1},{expectedRevision:2},{state:'attention'}]){
     const changed={...row,operation:{...row.operation,...change}};
@@ -19,6 +20,26 @@ test('verified partial media finishes without pretending the original is complet
   const row={id:'one',jobId:'job',activeRevision:0,revision:0,versions:[{revision:0,state:'failed',recovery:{state:'partial_complete',resultVerified:true}}]};
   assert.equal(videoCategory(row),'saved');
   row.versions[0].recovery.resultVerified=false;assert.equal(videoCategory(row),'review');
+});
+
+test('a retried category follows its current version-bound processing receipt',()=>{
+  const row={id:'one',jobId:'job',activeRevision:2,revision:4,
+    versions:[{revision:2,state:'failed',recovery:{state:'attention',slicingItemId:'bound'}}],
+    finalProcessing:{state:'queued',version:2,expectedRevision:4}};
+  for(const state of ['queued','running','waiting']){
+    row.finalProcessing.state=state;
+    assert.equal(recoveryInProgress(row),true);
+    assert.equal(recoveryOperationInProgress(row),false);
+    assert.equal(videoCategory(row),'processing');
+  }
+  for(const change of [{state:'attention'},{state:'paused'},{version:1},{expectedRevision:3},{manualPaused:true}]){
+    const changed={...row,finalProcessing:{...row.finalProcessing,...change}};
+    assert.equal(recoveryInProgress(changed),false);
+    assert.equal(videoCategory(changed),'review');
+  }
+  assert.equal(row.versions[0].state,'failed');
+  delete row.versions[0].recovery.slicingItemId;
+  assert.equal(videoCategory(row),'review');
 });
 
 test('a bound incomplete video offers recapture without approving the damaged file',()=>{

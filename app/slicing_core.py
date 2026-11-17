@@ -108,6 +108,53 @@ def position_excluded(point: float, exclusions: Iterable) -> bool:
     return any(float(start) <= point <= float(end) for start, end in exclusions)
 
 
+def partition_category_observations(item, name, observations, duration, model_fingerprint):
+    """Isolate unreliable bed alignment without changing shared decode facts.
+
+    Only a decoded frame with the model's explicit alignment rejection is
+    skippable. Missing models, resolution, IO and other inference errors remain
+    actionable. The existing model observations are retained unchanged.
+    """
+    rows = list(observations)
+    unavailable = [row for row in rows if row.get('code') == 'decode_unavailable']
+    alignment = [row for row in rows if name == 'bed'
+                 and row.get('code') == 'bed_alignment_uncertain']
+    skip_codes = {'decode_unavailable'} | ({'bed_alignment_uncertain'} if name == 'bed' else set())
+    valid = [row for row in rows if row.get('code') not in skip_codes]
+    category = item['categories'][name]
+    category.update(skippedAlignmentSamples=len(alignment), skippedDecodeSamples=len(unavailable))
+    if alignment:
+        excluded = decode_exclusions([
+            {**row, 'code': 'decode_unavailable' if row.get('code') in skip_codes else row.get('code', '')}
+            for row in rows], duration)
+        category['alignmentCoverage'] = {
+            'fileVersion': item.get('observationVersion', item.get('fileVersion')),
+            'modelFingerprint': model_fingerprint,
+            'failedPositions': [row['time'] for row in alignment],
+            'exclusionIntervals': excluded,
+        }
+        item['partialRecovery'] = True
+    else:
+        category.pop('alignmentCoverage', None)
+    excluded = list((item.get('decodeCoverage') or {}).get('exclusionIntervals', []))
+    excluded.extend((category.get('alignmentCoverage') or {}).get('exclusionIntervals', []))
+    return valid, unavailable, alignment, merge_intervals(excluded)
+
+
+def category_exclusions(item, name):
+    """Keep a category's rejected regions out of export and manual windows."""
+    excluded = list((item.get('decodeCoverage') or {}).get('exclusionIntervals', []))
+    category = item.get('categories', {}).get(name, {})
+    coverage = category.get('alignmentCoverage') or {}
+    if coverage:
+        if coverage.get('fileVersion') != item.get('observationVersion', item.get('fileVersion')):
+            raise ValueError('source_changed')
+        if coverage.get('modelFingerprint') != category.get('modelFingerprint'):
+            raise ValueError('model_changed')
+        excluded.extend(coverage.get('exclusionIntervals', []))
+    return merge_intervals(excluded)
+
+
 def record_decode_coverage(item: dict, observations: Iterable[dict], duration: float):
     """Shared evidence is version-bound and independent of either model label."""
     current = item.get("decodeCoverage") or {}
@@ -128,13 +175,18 @@ def record_decode_coverage(item: dict, observations: Iterable[dict], duration: f
     return current["exclusionIntervals"]
 
 
-def processing_conclusion(item: dict, observations: Iterable[dict], outcome: str) -> dict:
+def processing_conclusion(item: dict, observations: Iterable[dict], outcome: str, *, category=None) -> dict:
     rows = list(observations)
     skipped = sum(row.get("code") == "decode_unavailable" for row in rows)
-    return {"version": 1, "fileVersion": item.get("fileVersion"), "outcome": outcome,
+    proof = {"version": 1, "fileVersion": item.get("fileVersion"), "outcome": outcome,
             "requestedSamples": len(rows), "decodedSamples": len(rows) - skipped,
             "skippedSamples": skipped, "completed": True,
             "exclusionIntervals": (item.get("decodeCoverage") or {}).get("exclusionIntervals", [])}
+    if category == 'bed' and any(row.get('code') == 'bed_alignment_uncertain' for row in rows):
+        alignment = sum(row.get('code') == 'bed_alignment_uncertain' for row in rows)
+        proof.update(skippedAlignmentSamples=alignment, usableSamples=len(rows) - skipped - alignment,
+                     exclusionIntervals=category_exclusions(item, category))
+    return proof
 
 
 def expected_image_count(intervals: Iterable[tuple[float, float]], seconds: int) -> int:

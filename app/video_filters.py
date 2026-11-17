@@ -7,8 +7,6 @@ def record_status(row):
     if row.get("deletion", {}).get("state") in ("pending", "error"):
         return "deleting"
     active = next(v for v in row["versions"] if v["revision"] == row["activeRevision"])
-    if partial_complete(active):
-        return 'saved'
     operation = row.get('operation') or {}
     if active['state'] == 'terminating':
         return 'deleting'
@@ -17,16 +15,31 @@ def record_status(row):
     if (operation.get('kind') in {'correction', 'recapture'}
             and operation.get('state') in {'queued', 'running', 'reconciling', 'waiting_connection'}):
         return 'waiting'
+    approved = row.get('finalProcessing') or {}
+    if (approved.get('version') != row['activeRevision']
+            or approved.get('expectedRevision') != row['revision']):
+        approved = {}
+    if approved.get('state') == 'attention':
+        return 'review'
+    if approved.get('state') == 'complete':
+        return 'saved'
     if (operation.get('kind') == 'recover-decodable'
             and operation.get('version') == row['activeRevision']
             and operation.get('expectedRevision') == row['revision']
             and operation.get('state') in {'queued', 'running', 'waiting_connection', 'reconciling'}):
         return 'processing'
+    if approved.get('state') in {'queued', 'running', 'waiting'}:
+        if active['state'] == 'saved' or (not approved.get('manualPaused')
+                and (active.get('recovery') or {}).get('slicingItemId')):
+            # "saved" in the transfer ledger means the original was saved.
+            # The public result remains in progress until photos are verified.
+            return 'processing'
+    elif partial_complete(active):
+        return 'saved'
     if active["state"] in ("attention", "failed", "uncertain"):
         return "review"
     if active["state"] == "saved":
         return "saved"
-    approved = row.get('finalProcessing') or {}
     if (active["state"] in ("downloading", "publishing") or active.get("downloadRequested")
             or active['state'] == 'ready' and approved.get('state') in {'queued', 'running', 'waiting'}):
         return "download"
@@ -34,12 +47,13 @@ def record_status(row):
 
 
 def matches_status(row, status):
+    current = row.get('recordStatus') or record_status(row)
     if status == 'complete':
         # Older clients may still request the partial-results subset. The
         # current UI groups these records with all other saved results.
         active = next(v for v in row['versions'] if v['revision'] == row['activeRevision'])
-        return record_status(row) != 'deleting' and partial_complete(active)
-    return status == 'all' or record_status(row) == status
+        return current == 'saved' and partial_complete(active)
+    return status == 'all' or current == status
 
 
 def filter_records(rows, query):

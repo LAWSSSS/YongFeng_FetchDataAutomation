@@ -12,12 +12,12 @@ export type CollectionJob = {
 };
 
 export type BatchVideo = {
-  id: string; jobId: string; submittedAt?:string; activeRevision: number; revision: number;
+  id: string; jobId: string; submittedAt?:string; activeRevision: number; revision: number; recordStatus?:VideoCategory;
   capabilities?:{version:number;expectedRevision:number;canConfirmFinal:boolean;confirmFinalReason?:string;captureInFlight?:boolean};
-  versions: {revision: number; state: string; downloadRequested?: boolean;recovery?:{state:string;resultVerified?:boolean}}[];
+  versions: {revision: number; state: string; taskId?:string; platformStatus?:string; downloadRequested?: boolean;recovery?:{state:string;resultVerified?:boolean;slicingItemId?:string}}[];
   deletion?: {state: string};
   operation?:{kind:string;state:string;version?:number;expectedRevision?:number};
-  finalProcessing?:{state:string};
+  finalProcessing?:{state:string;version?:number;expectedRevision?:number;manualPaused?:boolean;stageLabel?:string;endReason?:string};
 };
 
 export const correctionPending = (operation:BatchVideo['operation']) => !!operation &&
@@ -25,13 +25,13 @@ export const correctionPending = (operation:BatchVideo['operation']) => !!operat
 
 export const categoryLabels = {
   ready: '可查看', waiting: '等待平台结果', download: '下载中', saved: '已保存', complete:'已完成', review: '待核对', deleting: '清理中',
-  processing:'恢复处理中',
+  processing:'处理中',
 };
 export type VideoCategory = keyof typeof categoryLabels;
 
 const captureStates:Record<string,string> = {
   pending: '尚未提交采集', awaiting_confirmation: '等待确认采集', submitting: '正在提交采集',
-  submitted: '已提交采集', waiting: '等待平台结果', ready: '待确认', saved: '已保存',
+  submitted: '已提交采集', waiting: '等待平台结果', ready: '待确认', saved: '视频已下载',
   downloading: '下载中', publishing: '正在保存', failed: '需处理', attention: '待核对',
   uncertain: '待核对', withdrawing: '撤回处理中', terminating: '终止采集中', withdrawn: '已撤回', replaced: '已替换', cloud_deleted: '旧版已清理',
 };
@@ -82,6 +82,7 @@ export function splitInspections(records: InspectionRecord[]) {
 }
 
 export function videoCategory(video: BatchVideo): VideoCategory {
+  if (video.recordStatus) return video.recordStatus;
   if (['pending', 'error'].includes(video.deletion?.state || '')) return 'deleting';
   const active = video.versions.find(version => version.revision === video.activeRevision);
   if (active?.state === 'terminating') return 'deleting';
@@ -98,7 +99,34 @@ export function videoCategory(video: BatchVideo): VideoCategory {
 
 export function completedPartialVideo(video: BatchVideo) {
   const active = video.versions.find(v=>v.revision===video.activeRevision);
-  return !['pending','error'].includes(video.deletion?.state||'') && !!active && partialComplete(active);
+  return videoCategory(video)==='saved' && !!active && partialComplete(active);
+}
+
+export function videoStatusBadge(video: BatchVideo) {
+  const active = video.versions.find(version=>version.revision===video.activeRevision);
+  const status = videoCategory(video);
+  const candidate = video.finalProcessing;
+  const final = candidate?.version===video.activeRevision && candidate.expectedRevision===video.revision
+    ? candidate : undefined;
+  if (status==='deleting') {
+    return {label:active && ['terminating','withdrawing'].includes(active.state)
+      ? captureStatusLabel(active) : categoryLabels.deleting, state:'waiting'};
+  }
+  if (status==='waiting' && correctionPending(video.operation)) return {label:'更正处理中',state:'waiting'};
+  if (status==='saved') {
+    const label = final?.state==='complete' ? final.stageLabel || '处理完成'
+      : active && partialComplete(active) ? '可用部分已保存' : categoryLabels.saved;
+    return {label, state:'complete'};
+  }
+  if (status==='review') {
+    return {label:final?.state==='attention' ? final.stageLabel || '处理需核对' : categoryLabels.review,
+      state:'attention'};
+  }
+  if ((status==='processing'||status==='download') && final && ['queued','running','waiting'].includes(final.state)) {
+    return {label:final.stageLabel || categoryLabels[status],state:final.state};
+  }
+  return {label:status==='processing' ? categoryLabels.processing : active ? captureStatusLabel(active) : categoryLabels[status],
+    state:active?.state || status};
 }
 
 export function canDownload(video: BatchVideo) {

@@ -33,7 +33,8 @@ from .presentation import slicing_view, SUMMARY_CATEGORY, SUMMARY_ITEM, category
 from .file_leases import FileLeases, finish_io
 from .inference_pipe import MAX_JPEG_BYTES, abort as abort_inference, read_reply, send_request
 from .slicing_core import (build_category_result, category_image_target, sample_points,
-                           record_decode_coverage, processing_conclusion, position_excluded)
+                           record_decode_coverage, processing_conclusion, position_excluded,
+                           partition_category_observations, category_exclusions)
 from .slicing_remote import (CUT_TYPES, SlicingRemote, log_matches_video, parse_config, source_video_ids,
                              target_dataset_id, task_state)
 from .upload_audit import AuditError, VIDEO_EXTENSIONS
@@ -550,12 +551,14 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
         """Limit scheduler work to the current recovery batch or single item."""
         items = self._effective_items(items)
         run = self.run or {}
+        if run.get("singleMode") and run.get("singleItemId"):
+            # An explicit single retry can select a video from an older local
+            # batch. Its persisted selection, not the latest batch whitelist,
+            # owns this scope. Keep every other video out, including on restart.
+            return [item for item in items if item.get("id") == run["singleItemId"]]
         if run.get("localRecoveryOnly"):
             allowed = set(run.get("items") or [])
             items = [item for item in items if item.get("id") in allowed]
-        if run.get("singleMode") and run.get("singleItemId"):
-            selected = run["singleItemId"]
-            items = [item for item in items if item.get("id") == selected]
         return items
 
     def _effective_items(self, items=None):
@@ -1501,27 +1504,30 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
                                             metadata.get("frameRate", 25))
             if refined:
                 expected_points = [point for point in expected_points if not position_excluded(point, (item.get("decodeCoverage") or {}).get("exclusionIntervals", []))]
+            valid, unavailable, alignment, exclusions = partition_category_observations(
+                item, category, observations, metadata['duration'], fingerprints[category])
             partial = bool(item.get("partialRecovery"))
-            unavailable = [row for row in observations if row.get("code") == "decode_unavailable"]
-            valid = [row for row in observations if row.get("code") != "decode_unavailable"]
             uncertain = [row for row in valid if row["label"] == "uncertain"]
             error = next((row.get("code") for row in valid if row.get("code")), "")
             final_interval = 10 if refined else sample_interval
             result = build_category_result(valid, interval=final_interval, duration=metadata["duration"],
                 positive_labels={"target"}, target=category_image_target(settings, category),
-                exclusion_intervals=(item.get("decodeCoverage") or {}).get("exclusionIntervals", []))
+                exclusion_intervals=exclusions)
             categories = item["categories"][category]
             categories.update(intervals=result["intervals"], intervalSeconds=result["intervalSeconds"],
                               estimatedImages=result["estimatedImages"], observations=len(valid),
                               samplingIntervalSeconds=final_interval, modelFingerprint=fingerprints[category],
-                              partialRecovery=partial, skippedSamples=len(unavailable))
+                              partialRecovery=partial, skippedSamples=len(unavailable) + len(alignment))
             if categories.get("state") == "attention":
                 pass
+            elif not valid and alignment:
+                categories.update(state='attention', errorCode='bed_alignment_uncertain',
+                                  message='车斗抽样画面均无法可靠定位，尚无可处理的正常片段。')
             elif partial and not valid and observations and len(observations) == len(expected_points):
                 categories.update(state="uncuttable", errorCode="", endReason="no_usable_frames",
                                   processingConclusion=processing_conclusion(item, observations, "no_usable_frames"),
                                   message="按配置抽样未找到可用画面，已结束；原片等待手动清理。")
-            elif len(valid) + len(unavailable) != len(expected_points):
+            elif len(valid) + len(unavailable) + len(alignment) != len(expected_points):
                 categories.update(state="attention", errorCode="observations_incomplete",
                                   message=ERROR_TEXT["observations_incomplete"])
             elif error:
@@ -1535,12 +1541,13 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
                                       message=ERROR_TEXT["no_cuttable_fragments"])
                 else:
                     categories.update(state="no_target", errorCode="", endReason="no_target",
-                        processingConclusion=processing_conclusion(item, observations, "no_target"), message=(
+                        processingConclusion=processing_conclusion(item, observations, "no_target", category=category), message=(
                         "可用画面未检出目标，已结束。" if partial else "未检出目标"))
             elif result["tooMany"] or (result["intervalSeconds"] is None and result["estimatedImages"] > 200):
                 categories.update(state="attention", errorCode="slice_limit", message=ERROR_TEXT["slice_limit"])
             elif categories.get("state") not in {"complete", "waiting", "submitting", "attention"}:
                 categories.update(state="ready", errorCode="", message=(
+                    f"已跳过 {len(alignment)} 个定位失败位置，正常片段准备导出。" if alignment else
                     "仅处理可解码片段；损坏位置已跳过，准备提交。" if partial else
                     "识别完成，准备核对平台任务槽位。"))
             target_key = "27912" if category == "bed" else "27944"
@@ -1937,6 +1944,11 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
         self.store.save("items", item)
         self.store.save("requests", {"id": request_id,
             "kind": "recover-decodable" if recover_decodable else "retry", "itemId": identity, "state": "queued"})
+        if run.get('localRecoveryOnly') and identity not in (run.get('items') or []):
+            run['items'] = [*(run.get('items') or []), identity]
+            run['itemCount'] = len(run['items'])
+            self.store.save('runs', run)
+            self.run = run
         if not self.store.settings.get("enabled"):
             # A single retry authorizes this video only, including when the last
             # selected video failed. Never silently enable the rest of the batch.
@@ -1946,11 +1958,6 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
             self.store.save("runs", run)
             self.store.settings["enabled"] = True
             self.store.save_settings()
-        elif run.get('localRecoveryOnly') and identity not in (run.get('items') or []):
-            run['items'] = [*(run.get('items') or []), identity]
-            run['itemCount'] = len(run['items'])
-            self.store.save('runs', run)
-            self.run = run
         self._continue_after_manual_action()
         self._wake_scheduler()
         return self.state()
@@ -2089,6 +2096,9 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
             duration = float((item.get("metadata") or {}).get("duration") or item.get("remote", {}).get("duration") or 0)
             if duration <= 0 or any(end > duration for _, end in intervals):
                 raise ValueError("人工区间超出视频时长。")
+            if any(start <= stop and end >= begin for start, end in intervals
+                   for begin, stop in category_exclusions(item, category)):
+                raise ValueError('人工区间包含已跳过的解码或定位失败片段，请避开这些片段。')
             choice = choose_slice_interval(intervals, target=category_image_target(self.store.settings, category))
             selected = data.get("intervalSeconds") or choice["interval"]
             count = sum(max(1, math.floor((end - start) / selected + 1e-9) + 1) for start, end in intervals)
@@ -3134,7 +3144,11 @@ class SlicingManager(SlicingWorkflow, SharedSlicingAnalysis):
                     message=existing.get('message') or '已有这个视频的切片压缩包，未重复导出。')
                 self._save_export_progress(item, category_name)
                 return
-            points = slice_timestamps(intervals, seconds)
+            exclusions = category_exclusions(item, category_name)
+            points = [point for point in slice_timestamps(intervals, seconds)
+                      if not position_excluded(point, exclusions)]
+            if not points:
+                raise ValueError('no_cuttable_fragments')
             if category_name == "magnet":
                 recognized = await self._recognized_magnet_frames(item, points)
                 if not recognized:

@@ -8,7 +8,8 @@ import json
 from .domain import now_iso
 from .videos import Conflict
 from .workspace_files import compatible
-from .photo_completion import photo_results_verified, verified_empty_conclusion
+from .photo_completion import terminal_slice_results, verified_processing_outcome
+from .processing_status import identity_issue, linked_processing_issue, referenced_packages, verification_issue
 
 
 class FinalProcessing:
@@ -322,7 +323,7 @@ class FinalProcessing:
         linked, conflicts = [], []
         for item in candidates:
             actual = item.get('fileVersion') or {}
-            if (not required.issubset(actual) or not any(compatible(actual, expected)
+            if (item.get('identityConflict') or not required.issubset(actual) or not any(compatible(actual, expected)
                     and compatible(expected, actual) for expected in source_versions)):
                 conflicts.append(item)
             elif not self.control.reason(item, allow_paused=allow_paused):
@@ -341,15 +342,6 @@ class FinalProcessing:
         rows = self.db.execute('SELECT payload FROM simple_slice_package_items WHERE ' + ' OR '.join(clauses),
                                (*ids, *references))
         return [json.loads(value[0]) for value in rows]
-
-    @staticmethod
-    def end_reason(linked):
-        categories = [category for item in linked for category in item.get('categories', {}).values()
-                      if category.get('state') != 'not_applicable']
-        if any(category.get('state') == 'complete' for category in categories):
-            return 'partial_complete' if any(item.get('partialRecovery') for item in linked) else 'complete'
-        return 'no_usable_frames' if categories and all(category.get('state') == 'uncuttable'
-                                                      for category in categories) else 'no_target'
 
     def recover_decode_once(self, operation, linked):
         """Finish the migration after transient scheduler contention, once per item."""
@@ -392,6 +384,7 @@ class FinalProcessing:
             return
         from .final_downloads import RECOVERABLE
         issue = operation.get('issue')
+        current_issue = None
         if version.get('state') in {'ready', 'saved'} and (issue or {}).get('stage') == 'download':
             issue = None
         if (version.get('state') in {'failed', 'attention'} and not version.get('recovery')
@@ -446,9 +439,16 @@ class FinalProcessing:
             linked, conflicts = self.linked_items(row, version, operation['mediaGeneration'])
             self.recover_decode_once(operation, linked)
             linked, conflicts = self.linked_items(row, version, operation['mediaGeneration'])
+            receipts = self.linked_packages(linked)
+            if not conflicts and version.get('state') == 'saved' and not row.get('deletion'):
+                resumed = [self.slicing.resume_legacy_bed_alignment(item, receipts, operation['id']) for item in linked]
+                if any(resumed):
+                    linked, conflicts = self.linked_items(row, version, operation['mediaGeneration'])
             if conflicts:
-                operation.update(state='attention', stage='identity', message='识别记录的原片版本不符，保留文件等待核对。')
+                current_issue = identity_issue()
+                operation.update(state='attention', stage=current_issue['stage'], message=current_issue['message'])
             if linked and not conflicts:
+                current_issue = linked_processing_issue(linked, receipts)
                 operation['successfulSamples'] = sum(max((int(value.get('observations') or 0)
                     for value in item.get('categories', {}).values()), default=0) for item in linked)
                 operation['skippedSamples'] = sum(max((int(value.get('skippedSamples') or 0)
@@ -464,7 +464,7 @@ class FinalProcessing:
                     operation.update(stage=stage, state=state,
                                      message=next((i.get('message') for i in linked if i.get('message')), operation['message']))
                     if operation['stage'] == 'photos' and self.slicing.store.settings.get('localExport', True):
-                        packages = self.linked_packages(linked)
+                        packages = referenced_packages(linked, receipts)
                         stages = {package.get('state') for package in packages if package.get('state') != 'complete'}
                         if stages.intersection({'submitting', 'importing', 'reconciling'}):
                             operation.update(stage='photo_import', message='照片已上传，正在导入并核验结果。')
@@ -472,42 +472,34 @@ class FinalProcessing:
                             operation.update(stage='photo_upload', message='照片已打包，正在上传或等待导入。')
                         else:
                             operation.update(stage='photo_export', message='正在导出照片并打包，随后自动上传和导入。')
-                if operation.get('state') != 'waiting' and any(i.get('state') == 'attention' for i in linked):
-                    operation.update(state='attention', message=next((i.get('message') for i in linked if i.get('state') == 'attention'), '需要核对。'))
+                if operation.get('state') != 'waiting' and current_issue:
+                    operation.update(state='attention', stage=current_issue['stage'], message=current_issue['message'])
             asset = next((asset for asset in self.workspace.rows('assets')
                           if any(i['id'] in {link['id'] for link in self.workspace.effective_links(asset)} for i in linked)), None)
-            empty_verified = all(verified_empty_conclusion(item, name) or
-                (operation.get('legacy') and category.get('state') == 'no_target'
-                 and type(category.get('observations')) is int and category['observations'] > 0
-                 and not category.get('errorCode'))
-                for item in linked for name, category in item.get('categories', {}).items()
-                if category.get('state') in {'no_target', 'uncuttable'})
-            terminal = bool(linked) and all(item.get('state') in {'complete', 'no_target', 'uncuttable'} for item in linked)
-            finished = (not conflicts and terminal and empty_verified
-                        and photo_results_verified(linked, self.linked_packages(linked)))
-            if terminal and not finished and not conflicts:
-                operation.update(state='attention', stage='verification',
-                    message='照片导入凭证或空结果结论未核实，原片和成果保留。')
+            outcome = None if conflicts else verified_processing_outcome(linked, receipts, legacy=operation.get('legacy'))
+            if not outcome and not conflicts and terminal_slice_results(linked):
+                current_issue = verification_issue()
+                operation.update(state='attention', stage=current_issue['stage'], message=current_issue['message'])
             cleanup_reason = '本地文件不在可清理工作区内，原位保留。'
             if asset and not conflicts:
                 operation['workspaceAssetId'] = asset['id']
                 if asset.get('cleanup', {}).get('state') == 'complete':
                     operation.update(state='complete', stage='cleaned', cleanupBytes=0, message='处理完成，本地文件已清理。')
-                    self.save(operation)
-                    return
-                eligible, cleanup_reason = self.workspace.cleanup_eligibility(asset)
-                if eligible:
-                    operation.update(state='complete', stage='awaiting_cleanup', endReason=self.end_reason(linked),
-                                     cleanupBytes=self.workspace.cleanup_asset_bytes(asset),
-                                     message='处理已结束，等待你点击“清理已结束文件”。')
-            if finished and operation.get('stage') not in {'awaiting_cleanup', 'cleaned'}:
+                elif outcome:
+                    eligible, cleanup_reason = self.workspace.cleanup_eligibility(asset)
+                    if eligible:
+                        operation.update(state='complete', stage='awaiting_cleanup', endReason=outcome,
+                                         cleanupBytes=self.workspace.cleanup_asset_bytes(asset),
+                                         message='处理已结束，等待你点击“清理已结束文件”。')
+            if outcome and operation.get('stage') not in {'awaiting_cleanup', 'cleaned'}:
                 # Old no-target conclusions and explicitly retained originals
                 # are finished work, but are not new deletion authority.
-                operation.update(state='complete', stage='retained', endReason=self.end_reason(linked),
+                operation.update(state='complete', stage='retained', endReason=outcome,
                                  cleanupBytes=0, message='处理已结束；' + cleanup_reason)
         if operation.get('state') == 'attention':
-            operation['issue'] = issue if operation.get('environmentBlocker') and issue else {
-                'code': version.get('review', {}).get('code') or version.get('errorCode') or operation.get('stage'),
+            operation['issue'] = issue if operation.get('environmentBlocker') and issue else current_issue or {
+                'code': ((version.get('review', {}).get('code') or version.get('errorCode'))
+                         if operation.get('stage') == 'download' else None) or operation.get('stage'),
                 'stage': operation.get('stage'), 'message': operation.get('message')}
         elif not operation.get('environmentBlocker'):
             operation['issue'] = None

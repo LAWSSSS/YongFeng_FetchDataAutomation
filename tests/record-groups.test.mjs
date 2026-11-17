@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { batchDate, canDownload, captureStatusLabel, completedPartialVideo, groupVideos, groupVideoDays, mergeOpenVideoRows, splitInspections, syncVideoSelection, videoCategory, videoStatusOptions, selectVideoScope, visibleVideoSelections } from '../src/record-groups.ts';
+import { batchDate, canDownload, captureStatusLabel, completedPartialVideo, groupVideos, groupVideoDays, mergeOpenVideoRows, splitInspections, syncVideoSelection, videoCategory, videoStatusBadge, videoStatusOptions, selectVideoScope, visibleVideoSelections } from '../src/record-groups.ts';
 
 const video = (id, jobId, state, extra = {}) => ({id, jobId, activeRevision: 0, revision: 0,
   versions: [{revision: 0, state}], capabilities:{version:0,expectedRevision:0,canConfirmFinal:state==='ready'}, ...extra});
@@ -45,6 +45,20 @@ test('pending submission and a bound platform queue have distinct labels', () =>
   assert.equal(captureStatusLabel({state:'waiting', taskId:'bound', platformStatus:'PENDING'}), '平台排队中');
   assert.equal(captureStatusLabel({state:'waiting', taskId:'bound', platformStatus:'FIXED'}), '等待平台结果');
   assert.equal(captureStatusLabel({state:'ready', taskId:'bound', platformStatus:'FIXED'}), '待确认');
+});
+
+test('downloaded videos use the current server result for the badge, group and terminal selection', () => {
+  const review = video('local', 'j', 'saved', {recordStatus:'review', finalProcessing:{
+    version:0, expectedRevision:0, state:'attention', stageLabel:'识别需核对'}});
+  assert.equal(videoCategory(review), 'review');
+  assert.deepEqual(videoStatusBadge(review), {label:'识别需核对', state:'attention'});
+  assert.equal(captureStatusLabel(review.versions[0]), '视频已下载');
+  const stale = {...review, recordStatus:'saved', activeRevision:1, revision:1,
+    versions:[{revision:1,state:'saved'}]};
+  assert.deepEqual(videoStatusBadge(stale), {label:'已保存', state:'complete'});
+  const finished = {...review,recordStatus:'saved',finalProcessing:{...review.finalProcessing,
+    state:'complete',stageLabel:'已清理'}};
+  assert.deepEqual(videoStatusBadge(finished), {label:'已清理', state:'complete'});
 });
 
 test('bulk selection never silently adopts a newer revision or version', () => {

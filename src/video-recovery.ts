@@ -1,12 +1,24 @@
 type RecoverableVersion = {state:string;taskId?:string;resultId?:string;errorCode?:string;
   filePath?:string;sha256?:string;localCleanupState?:string;review?:{code:string};recovery?:{state:string;resultVerified?:boolean}};
 
-export function recoveryInProgress(video:{activeRevision:number;revision:number;operation?:{
-  kind:string;state:string;version?:number;expectedRevision?:number}}) {
+type RecoveryVideo = {activeRevision:number;revision:number;
+  versions?:{revision:number;recovery?:{slicingItemId?:string}}[];
+  finalProcessing?:{state:string;version?:number;expectedRevision?:number;manualPaused?:boolean};
+  operation?:{kind:string;state:string;version?:number;expectedRevision?:number}};
+
+export function recoveryOperationInProgress(video:RecoveryVideo) {
   const operation=video.operation;
   return operation?.kind==='recover-decodable'&&operation.version===video.activeRevision
     &&operation.expectedRevision===video.revision
     &&['queued','running','waiting_connection','reconciling'].includes(operation.state);
+}
+
+export function recoveryInProgress(video:RecoveryVideo) {
+  const active=video.versions?.find(version=>version.revision===video.activeRevision);
+  const processing=video.finalProcessing;
+  return recoveryOperationInProgress(video) || !!(active?.recovery?.slicingItemId && processing
+    && processing.version===video.activeRevision && processing.expectedRevision===video.revision
+    && !processing.manualPaused && ['queued','running','waiting'].includes(processing.state));
 }
 
 export function partialComplete(version:RecoverableVersion) {

@@ -446,11 +446,12 @@ class VideoManager:
                                     'captureInFlight': capture_in_flight(active),
                                     'canTerminateCapture': can_terminate(row, active)},
                    'submittedAt': (job or {}).get('createdAt') or row.get('submittedAt', '')}
+            row['recordStatus'] = record_status(row)
             rows.append(row)
         found = filter_records(rows, query)
         counts = Counter()
         for row in rows:
-            status = record_status(row)
+            status = row['recordStatus']
             counts[status] += 1
             if status == 'saved' and partial_complete(self.version(row, row['activeRevision'])):
                 counts['complete'] += 1
@@ -1635,6 +1636,10 @@ class VideoManager:
             if row.get('deletion', {}).get('state') in {'pending', 'error'} or row.get('cleanupPending'):
                 raise Conflict('此条正在清理或替换旧版，稍后再归类。')
             version = self.version(row, payload['version'])
+            flow = getattr(self, 'final_processing', None)
+            current = flow.current_operation(row, version) if flow else None
+            if current and flow.operation(current['id'])['state'] != 'complete':
+                raise ValueError('当前版本尚有识别或照片导入需要处理，未归入已保存。')
             if version['state'] != 'saved':
                 proof = self.recovery_completion_proof(row, version)
                 if proof is None:

@@ -1,6 +1,6 @@
 # 采集助手使用说明
 
-[**直接下载完整程序 ZIP（Apple 芯片 Mac）**](https://github.com/LAWSSSS/YongFeng_FetchDataAutomation/releases/download/v1.3.16/gather-assistant-1.3.16-macos-arm64.zip)
+[**直接下载完整程序 ZIP（Apple 芯片 Mac）**](https://github.com/LAWSSSS/YongFeng_FetchDataAutomation/releases/download/v1.3.18/gather-assistant-1.3.18-macos-arm64.zip)
 
 在 Mac 上按日期查询质检、确认采集区间，再由采集助手把识别出的照片导入工作平台。网页里的日期和时间均为北京时间。
 
@@ -60,6 +60,10 @@ zsh "$HOME/Documents/采集助手-Mac-arm64/启动采集助手.command"
 
 打开 **处理结果**，查看下载、识别、上传、导入和核验进度。照片导入并核验通过后，才会显示完成。记录有本地照片时，点 **查看结果图片** 可以打开对应照片包。
 
+在 **视频确认** 中，原片下载后，仍在识别、导出或导入的记录会留在 **处理中**。需要人工检查的记录可以在 **待核对** 中找到。当前版本的车斗和磁盘吊结果都通过核验后，记录才会归入 **已保存**。
+
+少数画面无法解码或车斗定位失败时，程序会记录并跳过对应片段，继续处理正常部分。车斗定位异常不会影响磁盘吊照片，已经导入的成果不会重复上传。如果没有任何可可靠定位的画面，或出现文件变化、模型缺失等问题，仍会明确提示需要处理。
+
 | 处理状态 | 含义 |
 | --- | --- |
 | **等待恢复** | 展开记录查看原因。磁盘、平台连接或文件占用恢复后，能自动继续的项目会接着处理。 |
@@ -104,7 +108,7 @@ zsh "$HOME/Documents/采集助手-Mac-arm64/启动采集助手.command" stop
 
 | 现象 | 先做什么 |
 | --- | --- |
-| GitHub 下载显示 404 | 请从发布页重新下载，或检查网络连接。 [GitHub 发布页](https://github.com/LAWSSSS/YongFeng_FetchDataAutomation/releases/tag/v1.3.16) |
+| GitHub 下载显示 404 | 请从发布页重新下载，或检查网络连接。 [GitHub 发布页](https://github.com/LAWSSSS/YongFeng_FetchDataAutomation/releases/tag/v1.3.18) |
 | 解压后看到「启动简易版.command」 | 这是源码包。日常使用请选择包含「启动采集助手.command」的 **Mac 免安装包**。 |
 | 终端显示网址，浏览器没有打开 | 把终端显示的网址粘贴到浏览器地址栏。也可运行 `zsh ./启动采集助手.command status` 查看当前网址。 |
 | macOS 拦截启动文件 | 打开「终端」，输入 `zsh` 和一个空格，把「启动采集助手.command」拖进终端，按回车。核对来源后，在首次准备提示中输入 `y`。无需逐个运行包内的 Python 或工具。 |
@@ -125,7 +129,7 @@ zsh "$HOME/Documents/采集助手-Mac-arm64/启动采集助手.command" stop
 
 源码版需要 Python 3.13 和 Node.js 22.13 或更新版本。在源码目录运行 `zsh ./启动简易版.command`。首次启动会联网准备依赖。关闭启动终端或按 **Control–C** 即可停止。如果之前运行过常驻的源码版，先运行 `zsh ./启动简易版.command stop`。
 
-源码版的照片识别还需要 Python 3.11、FFmpeg、ffprobe 和模型包。将模型 ZIP 放到源码目录，运行 `zsh ./启动简易版.command setup-models ./models-v1.zip`，再重启应用。 [下载 models-v1.zip](https://github.com/LAWSSSS/YongFeng_FetchDataAutomation/releases/download/v1.3.16/models-v1.zip)
+源码版的照片识别还需要 Python 3.11、FFmpeg、ffprobe 和模型包。将模型 ZIP 放到源码目录，运行 `zsh ./启动简易版.command setup-models ./models-v1.zip`，再重启应用。 [下载 models-v1.zip](https://github.com/LAWSSSS/YongFeng_FetchDataAutomation/releases/download/v1.3.18/models-v1.zip)
 
 ## 维护者构建 Mac 免安装包
 

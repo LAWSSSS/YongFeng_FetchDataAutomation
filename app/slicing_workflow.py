@@ -68,6 +68,81 @@ class SlicingWorkflow:
         self.store.save('requests', {'id': request_id, 'kind': 'continue-pending', 'itemId': identity, 'state': 'queued'})
         self._wake_scheduler()
 
+    def _legacy_alignment_has_usable_observations(self, item, bed):
+        from .slicing_core import sample_points
+
+        fingerprint = bed.get('modelFingerprint')
+        metadata = item.get('metadata') or {}
+        interval = self.store.settings['sampleIntervalSeconds' if self.store.settings.get('sharedSampling')
+                                       else 'bedIntervalSeconds']
+        if not fingerprint or bed.get('samplingIntervalSeconds') != interval or not metadata.get('duration'):
+            return False
+        try:
+            points = sample_points(float(metadata['duration']), interval, float(metadata.get('frameRate') or 25))
+        except (TypeError, ValueError, OverflowError):
+            return False
+        usable = rejected = False
+        for point in points:
+            observation = self._get_observation(self._observation_key(item, 'bed', point, fingerprint))
+            if not observation:
+                return False
+            code = observation.get('code')
+            if code == 'bed_alignment_uncertain':
+                rejected = True
+            elif not code and observation.get('label') in {'target', 'clear'}:
+                usable = True
+            elif code != 'decode_unavailable':
+                return False
+        return usable and rejected
+
+    def resume_legacy_bed_alignment(self, item, packages, intent):
+        """Re-evaluate one old bed result, keeping the verified magnet untouched."""
+        from .photo_completion import category_verified
+
+        settings = self.store.settings
+        run = self.store.get('runs', settings.get('latestRunId')) or {}
+        if (self.stopping or self.start_lock.locked() or not settings.get('localExport', True)
+                or (not settings.get('enabled') and self.busy)
+                or run.get('state') in {'paused', 'scanning'}
+                or settings.get('enabled') and (run.get('pilotMode') or run.get('singleMode'))
+                or not item.get('localWorkspace') or item.get('sourceVideoId')
+                or item.get('finalProcessingIntent') != intent
+                or item.get('pipelinePaused') or item.get('collectionRecoveryPaused')
+                or item.get('localCleanupState') == 'complete' or not item.get('path')
+                or item.get('settingsRevision') != settings['revision']
+                or not self.control.allowed(item)):
+            return False
+        bed = item.get('categories', {}).get('bed') or {}
+        if not bed or any(bed.get(key) for key in ('packageId', 'taskId', 'operationId', 'prefix',
+                                                  'submitAt', 'preSubmitTaskIds', 'preSubmitImageIds')):
+            return False
+        if any(p.get('itemId') == item['id'] and p.get('category') == 'bed' for p in packages):
+            return False
+        marker = item.get('legacyAlignmentRepair')
+        if marker:
+            # The item may have been committed just before the old process
+            # stopped. Attach the same pending slot to the run on restart.
+            if (marker != intent or bed.get('state') != 'pending' or item.get('state') != 'pending'
+                    or settings.get('enabled') and item['id'] in (run.get('items') or [])):
+                return False
+        else:
+            magnet = item['categories'].get('magnet') or {}
+            if (item.get('state') != 'attention' or bed.get('state') != 'attention'
+                    or bed.get('errorCode') != 'bed_alignment_uncertain' or 'skippedAlignmentSamples' in bed
+                    or magnet.get('state') != 'complete' or not category_verified(item, 'magnet', packages)
+                    or not self._legacy_alignment_has_usable_observations(item, bed)):
+                return False
+            bed.update(state='pending', errorCode='', message='复用已有抽样，跳过定位不可靠的位置。',
+                       retryNotBefore=0)
+            item.update(state='pending', errorCode='', message='继续车斗识别，已核验的磁盘吊成果保留。',
+                        legacyAlignmentRepair=intent, revision=item['revision'] + 1)
+            self.store.save('items', item)
+        self.queue_workspace_sources([{'existingItemIds': [item['id']], 'fileVersion': item['fileVersion'],
+                                       'collectionVideoId': item['collectionVideoId'],
+                                       'collectionRevision': item['collectionRevision'], 'finalProcessingIntent': intent}],
+                                     'alignment-' + item['id'] + '-' + intent)
+        return True
+
     def queue_workspace_sources(self, sources, request_id):
         """Analyze registered local originals and upload only the resulting photos."""
         if not self.store.settings.get('localExport', True):

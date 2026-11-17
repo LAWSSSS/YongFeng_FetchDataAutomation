@@ -5,7 +5,8 @@ from contextlib import ExitStack
 
 from .file_leases import finish_io
 from .slicing_core import (build_category_result, category_image_target, sample_points,
-                           record_decode_coverage, processing_conclusion, position_excluded)
+                           record_decode_coverage, processing_conclusion, position_excluded,
+                           partition_category_observations)
 
 
 def category_signature(category):
@@ -188,26 +189,30 @@ class SharedSlicingAnalysis:
                     observations = self._category_observations(work, name, points, keys[name], fingerprints[name])
                     record_decode_coverage(work, observations, metadata['duration'])
                     category = work['categories'][name]
+                    valid, unavailable, alignment, exclusions = partition_category_observations(
+                        work, name, observations, metadata['duration'], fingerprints[name])
                     partial = bool(work.get('partialRecovery'))
-                    unavailable = [row for row in observations if row.get('code') == 'decode_unavailable']
-                    valid = [row for row in observations if row.get('code') != 'decode_unavailable']
                     result = build_category_result(valid, interval=interval, duration=metadata['duration'],
                         positive_labels={'target'}, target=category_image_target(self.store.settings, name),
-                        exclusion_intervals=(work.get('decodeCoverage') or {}).get('exclusionIntervals', []))
+                        exclusion_intervals=exclusions)
                     category.update(intervals=result['intervals'], intervalSeconds=result['intervalSeconds'],
                         estimatedImages=result['estimatedImages'], observations=len(valid),
                         samplingIntervalSeconds=interval, modelFingerprint=fingerprints[name],
                         targetDatasetId=self.store.settings['targetDatasetIds'][peers[name]['sourceDatasetId']],
-                        partialRecovery=partial, skippedSamples=len(unavailable))
+                        partialRecovery=partial, skippedSamples=len(unavailable) + len(alignment))
                     uncertain = next((row for row in valid if row.get('code') or row['label'] == 'uncertain'), None)
                     if category.get('state') == 'attention':
+                        continue
+                    if not valid and alignment:
+                        category.update(state='attention', errorCode='bed_alignment_uncertain',
+                            message='车斗抽样画面均无法可靠定位，尚无可处理的正常片段。')
                         continue
                     if partial and not valid and observations and len(observations) == len(points):
                         category.update(state='uncuttable', errorCode='', endReason='no_usable_frames',
                             processingConclusion=processing_conclusion(work, observations, 'no_usable_frames'),
                             message='按配置抽样未找到可用画面，已结束；原片等待手动清理。')
                         continue
-                    elif len(valid) + len(unavailable) != len(points):
+                    elif len(valid) + len(unavailable) + len(alignment) != len(points):
                         code = 'observations_incomplete'
                     elif uncertain:
                         code = uncertain.get('code') or 'bed_alignment_uncertain'
@@ -221,11 +226,12 @@ class SharedSlicingAnalysis:
                         category.update(state='attention', errorCode=code, message=ERROR_TEXT.get(code, ERROR_TEXT['inference_failed']))
                     else:
                         category.update(state='ready' if result['intervals'] else 'no_target', errorCode='',
-                                        message=('仅处理可解码片段；损坏位置已跳过。' if partial and result['intervals'] else
+                                        message=(f'已跳过 {len(alignment)} 个定位失败位置，正常片段准备导出。' if alignment and result['intervals'] else
+                                                 '仅处理可解码片段；损坏位置已跳过。' if partial and result['intervals'] else
                                                  '可解码片段未检出目标，损坏位置已跳过。' if partial else
                                                  '等待平台空位。' if result['intervals'] else '未检出目标'))
                         if not result['intervals']:
-                            category.update(endReason='no_target', processingConclusion=processing_conclusion(work, observations, 'no_target'))
+                            category.update(endReason='no_target', processingConclusion=processing_conclusion(work, observations, 'no_target', category=name))
                 self._save_analysis_item(work)
                 magnet = work['categories'].get('magnet', {})
                 if phase == 'refine' or 'magnet' not in fingerprints or magnet.get('state') == 'attention' or 100 <= (magnet.get('estimatedImages') or 0) <= 200:

@@ -21,7 +21,12 @@ def verified_empty_conclusion(item, name):
             or not {'device', 'inode', 'size', 'modifiedNs'}.issubset(expected)
             or not compatible(actual, expected)):
         return False
-    return ((outcome == 'no_target' and category.get('state') == 'no_target' and decoded > 0)
+    alignment = proof.get('skippedAlignmentSamples', 0)
+    usable = proof.get('usableSamples', decoded)
+    if (type(alignment) is not int or alignment < 0 or type(usable) is not int
+            or usable < 0 or usable + alignment != decoded):
+        return False
+    return ((outcome == 'no_target' and category.get('state') == 'no_target' and usable > 0)
             or (outcome == 'no_usable_frames' and category.get('state') == 'uncuttable'
                 and decoded == 0 and skipped == requested))
 
@@ -137,3 +142,28 @@ def photo_results_verified(items, packages):
         if not verified_package(package, item, package.get('category')):
             return False
     return True
+
+
+def terminal_slice_results(items):
+    return bool(items) and all(item.get('state') in {'complete', 'no_target', 'uncuttable'} for item in items)
+
+
+def verified_processing_outcome(items, packages, *, legacy=False):
+    """Shared terminal decision for the worker and the read-only status views."""
+    if not terminal_slice_results(items):
+        return None
+    slots = [(item, name, category) for item in items for name, category in item.get('categories', {}).items()
+             if category.get('state') != 'not_applicable']
+    if any(category.get('state') not in {'complete', 'no_target', 'uncuttable'} for _, _, category in slots):
+        return None
+    for item, name, category in slots:
+        if category.get('state') in {'no_target', 'uncuttable'} and not (
+                verified_empty_conclusion(item, name) or
+                (legacy and category.get('state') == 'no_target' and type(category.get('observations')) is int
+                 and category['observations'] > 0 and not category.get('errorCode'))):
+            return None
+    if not photo_results_verified(items, packages):
+        return None
+    if any(category.get('state') == 'complete' for _, _, category in slots):
+        return 'partial_complete' if any(item.get('partialRecovery') for item in items) else 'complete'
+    return 'no_usable_frames' if all(category.get('state') == 'uncuttable' for _, _, category in slots) else 'no_target'

@@ -109,6 +109,68 @@ async def test_one_verified_package_does_not_hide_the_other_category_export(env)
     app.state.slicing.store.save('items', item)
     shown = app.state.pipeline.state()['items'][0]
     assert shown['stage'] == '照片导出' and shown['state'] == 'processing'
+    assert app.state.videos.state({'status': 'saved'})['videos'] == []
+    processing = app.state.videos.state({'status': 'processing'})['videos'][0]
+    assert processing['recordStatus'] == 'processing' and processing['versions'][0]['state'] == 'saved'
+
+
+@pytest.mark.asyncio
+async def test_saved_transfer_with_current_recognition_issue_is_only_in_review(env):
+    app, row = env
+    _, item, _ = confirmed_photos(app, row, state='complete')
+    item['categories']['bed']['state'] = 'complete'
+    item['categories']['magnet'].update(state='attention', errorCode='model_load_failed',
+                                       message='磁盘吊模型加载失败。')
+    item.update(state='attention', errorCode='model_load_failed', message='识别异常')
+    app.state.slicing.store.save('items', item)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://127.0.0.1') as client:
+        saved = (await client.get('/api/videos?compact=true&status=saved')).json()
+        review = (await client.get('/api/videos?compact=true&status=review')).json()
+        result = (await client.get('/api/pipeline?filter=attention')).json()['items'][0]
+    assert saved['videos'] == [] and saved['counts']['saved'] == 0
+    assert review['counts']['review'] == 1
+    video = review['videos'][0]
+    assert video['recordStatus'] == 'review' and video['versions'][0]['state'] == 'saved'
+    assert video['finalProcessing']['stageLabel'] == result['stage'] == '识别需核对'
+    assert video['finalProcessing']['issue']['code'] == 'model_load_failed'
+    with pytest.raises(ValueError, match='未归入已保存'):
+        await app.state.videos.classify_partial_saved(row['id'], payload(row, 'wrongly-classify'))
+
+
+@pytest.mark.asyncio
+async def test_verified_callback_replaces_stale_issue_but_wrong_receipt_does_not(env):
+    from app.slicing_core import processing_conclusion
+
+    app, row = env
+    _, item, operation = confirmed_photos(app, row, state='complete')
+    flow = app.state.final_processing
+    item.update(state='complete', partialRecovery=True)
+    item['categories']['bed'].update(state='complete', actualImages=61)
+    item['categories']['magnet']['processingConclusion'] = processing_conclusion(
+        item, [{'time': 0, 'label': 'clear'}], 'no_target')
+    app.state.slicing.store.save('items', item)
+    store = app.state.slicing.packages.store
+    package = store.get('items', 'exact-package')
+    package.update(actualImages=61, jobId='import-bed', verifiedJobId='different-job',
+                   outputImageIds=[str(i+1) for i in range(61)])
+    store.save('items', package)
+    operation.update(state='attention', stage='recognition_review',
+                     issue={'code': 'bed_alignment_uncertain', 'stage': 'recognition_review', 'message': '旧定位错误'})
+    flow.save(operation)
+
+    broken = app.state.videos.state({'status': 'review'})['videos'][0]['finalProcessing']
+    assert broken['issue']['code'] == 'result_unverified' and not broken['terminal']
+    assert not app.state.videos.state({'status': 'saved'})['videos']
+
+    package['verifiedJobId'] = package['jobId']
+    store.save('items', package)
+    ready = app.state.videos.state({'status': 'saved'})['videos'][0]['finalProcessing']
+    assert ready['state'] == 'complete' and ready['terminal'] and ready['endReason'] == 'partial_complete'
+    assert ready['issue'] is None and ready['progress'] is None
+    assert flow.get(operation['id'])['state'] == 'attention', 'The GET must not mutate the ledger.'
+    await flow.tick()
+    settled = flow.get(operation['id'])
+    assert settled['state'] == 'complete' and settled['issue'] is None
 
 
 @pytest.mark.asyncio

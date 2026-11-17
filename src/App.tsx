@@ -14,15 +14,15 @@ import DateCollection,{CollectionSettings} from './DateCollection';
 import { correctionInterval, correctionReviewCurrent, prepareCorrection } from './corrections';
 import type { PreparedCorrection } from './corrections';
 import { VideoBatches, VideoStatusFilters } from './RecordGroups';
-import { canDownload as canConfirmFinal, captureStatusLabel, correctionPending, mergeOpenVideoRows, syncVideoSelection, visibleVideoSelections } from './record-groups';
+import { canDownload as canConfirmFinal, captureStatusLabel, correctionPending, mergeOpenVideoRows, syncVideoSelection, videoStatusBadge, visibleVideoSelections } from './record-groups';
 import RecordSelection from './RecordSelection';
 import './compact-controls.css';
 import SubmissionRecords from './SubmissionRecords';
 import RecordDelete from './RecordDelete';
 import RecordBatch, {reconcileRecordChoices} from './RecordBatch';
 import type {RecordChoice} from './RecordBatch';
-import { partialComplete, recoveryInProgress, videoRecovery, versionDownloadable } from './video-recovery';
-import type { CollectionJob } from './record-groups';
+import { partialComplete, recoveryInProgress, recoveryOperationInProgress, videoRecovery, versionDownloadable } from './video-recovery';
+import type { CollectionJob, VideoCategory } from './record-groups';
 import VideoProcessing from './VideoProcessing';
 import type { ProcessingGroup } from './VideoProcessing';
 import DateSection from './DateSection';
@@ -47,10 +47,10 @@ type Version = {
   etag?:string; recovery?:{state:string;resultVerified?:boolean;filePath?:string;slicingItemId?:string;successfulSamples?:number;skippedSamples?:number;
     message?:string;stage?:string;errorCode?:string;progress?:number;categories?:Record<string,{state?:string;message?:string;errorCode?:string;observations?:number;skippedSamples?:number;imageCount?:number;actualImages?:number;packageId?:string}>};
   review?: {code: string; message: string; actual?: {videoName?: string; startTime?: string; endTime?: string; taskStatus?: string} | null}};
-type Video = {id: string; jobId: string; submittedAt?:string; plate: string; name: string; qualityStart: string; qualityEnd: string;
+type Video = {id: string; jobId: string; submittedAt?:string; plate: string; name: string; qualityStart: string; qualityEnd: string; recordStatus?:VideoCategory;
   revision: number; activeRevision: number; acceptedRevision: number | null; versions: Version[];
   operation?:{id:string;kind:string;state:string;version?:number;expectedRevision?:number;stage?:string;message?:string;slicingItemId?:string}; recovery?:Version['recovery'];
-  finalProcessing?:{operationId:string;state:string;stage:string;message:string;manualPaused?:boolean;successfulSamples?:number;skippedSamples?:number;endReason?:string;
+  finalProcessing?:{operationId:string;version?:number;expectedRevision?:number;state:string;stage:string;message:string;manualPaused?:boolean;successfulSamples?:number;skippedSamples?:number;endReason?:string;
     stageLabel?:string;terminal?:boolean;progress?:{done:number;total:number;unit:string}|null;
     issue?:{code:string;stage?:string;message:string}|null;environmentBlocker?:{code:string;message:string}|null};
   capabilities?:{version:number;expectedRevision:number;canConfirmFinal:boolean;confirmFinalReason?:string;canRestartDownload?:boolean;restartDownloadReason?:string;canContinueProcessing?:boolean;canWithdraw?:boolean;withdrawReason?:string;canForceRecapture?:boolean;captureInFlight?:boolean;canTerminateCapture?:boolean};
@@ -108,13 +108,13 @@ function VideoCard({video,onSelect,selected,onOpen,children}:{
   const expanded=!!children;
   const active=video.versions.find(v=>v.revision===video.activeRevision)!;
   const clearing=['pending','error'].includes(video.deletion?.state||'');
-  const label=correctionPending(video.operation)?'更正处理中':video.finalProcessing?.stageLabel||
-    (video.finalProcessing?.stage==='queued'?'下载已登记':partialComplete(active)?'可用部分已保存':video.finalProcessing?.state==='complete'?'处理完成':captureStatusLabel(active));
-  const progress=video.finalProcessing?.terminal?null:video.finalProcessing?.progress;
+  const badge=videoStatusBadge(video);
+  const progress=['running','queued','waiting'].includes(badge.state)&&!correctionPending(video.operation)
+    ? video.finalProcessing?.progress : null;
   return <article className={`video-card${expanded?' is-expanded':''}`} id={`video-${video.id}`}>
-    <div className="video-head"><label className="record-pick">{onSelect&&<input type="checkbox" aria-label={`选择采集记录 ${video.name} ${video.qualityStart}`} checked={selected} disabled={clearing} onChange={onSelect}/>}<h3>{video.name}</h3></label><span className={`badge ${video.finalProcessing?.state||active.state}`}>{label}</span></div>
+    <div className="video-head"><label className="record-pick">{onSelect&&<input type="checkbox" aria-label={`选择采集记录 ${video.name} ${video.qualityStart}`} checked={selected} disabled={clearing} onChange={onSelect}/>}<h3>{video.name}</h3></label><span className={`badge ${badge.state}`}>{badge.label}</span></div>
     <p className="record-time">{active.startTime}<br/>至 {active.endTime}</p><p className="subtle">{duration(active.durationSeconds)} · 第{active.revision+1}版</p>
-    {progress&&<div className="pipeline-progress"><progress aria-label={`${video.name} ${label}`} value={progress.done} max={progress.total}/><small>{progress.unit==='bytes'?transferProgress(progress.done,progress.total):`${progress.done}/${progress.total} ${progress.unit}`}</small></div>}
+    {progress&&<div className="pipeline-progress"><progress aria-label={`${video.name} ${badge.label}`} value={progress.done} max={progress.total}/><small>{progress.unit==='bytes'?transferProgress(progress.done,progress.total):`${progress.done}/${progress.total} ${progress.unit}`}</small></div>}
     <button ref={trigger} className="secondary video-open-detail" aria-expanded={expanded}
       aria-controls={`video-details-${video.id}`} onClick={()=>{onOpen();if(expanded)trigger.current?.focus({preventScroll:true});}}>{expanded?'收起详情':'查看与更正'}</button>
     {children&&<div id={`video-details-${video.id}`} className="inline-video-details">{children}</div>}
@@ -297,28 +297,28 @@ function VideoDetails({video,onRefresh,onRemoved,onAccepted,processing}:{
     {active.state==='pending'&&!active.taskId&&!active.message&&
       <p className="notice">这条任务尚未发送到采集平台。可在“日期采集”的采集提交记录中查看本批进度。</p>}
     {recoveryRunning && <div className="recovery-progress" role="status"><strong>{recovery?.stage==='photos_paused'?'等待继续照片上传':recovery?.stage==='photos_processing'?'照片上传与导入中':video.operation?.stage === 'waiting_connection' ? '等待平台连接' : '可用部分处理中'}</strong>
-      <p>{recovery?.message || video.operation?.message || '正在识别可解码画面。'}</p>
+      <p>{video.finalProcessing?.issue?.message || video.finalProcessing?.message || recovery?.message || video.operation?.message || '正在识别可解码画面。'}</p>
       {recovery?.slicingItemId && <button className="link" onClick={() => window.dispatchEvent(new CustomEvent('simple-open-slicing'))}>查看切片进度</button>}
-      <button className="secondary" disabled={busy} onClick={() => void act('recover-decodable/pause', {version:active.revision,expectedRevision:video.revision,requestId:uid()})}>暂停此条</button>
+      {recoveryOperationInProgress(video) && <button className="secondary" disabled={busy} onClick={() => void act('recover-decodable/pause', {version:active.revision,expectedRevision:video.revision,requestId:uid()})}>暂停此条</button>}
     </div>}
-    {recovery && !recoveryRunning && <div className={`recovery-progress ${recovery.state === 'attention' ? 'needs-review' : ''}`}>
-      <strong>{partialComplete(active) ? '可用部分已保存' : recovery.state === 'attention' ? '可用部分需处理' : '部分视频处理状态'}</strong>
-      <p>{recovery.message || '坏位置已跳过；原视频仍标记为不完整。'}</p>
-      <span>有效判断 {recovery.successfulSamples || 0} · 跳过位置 {recovery.skippedSamples || 0}</span>
+    {recovery && !recoveryRunning && <div className={`recovery-progress ${(video.finalProcessing?.state || recovery.state) === 'attention' ? 'needs-review' : ''}`}>
+      <strong>{partialComplete(active) ? '可用部分已保存' : video.finalProcessing?.stageLabel || (recovery.state === 'attention' ? '可用部分需处理' : '部分视频处理状态')}</strong>
+      <p>{video.finalProcessing?.issue?.message || video.finalProcessing?.message || recovery.message || '异常位置已跳过，继续处理正常片段。'}</p>
+      <span>有效判断 {video.finalProcessing?.successfulSamples ?? recovery.successfulSamples ?? 0} · 跳过位置 {video.finalProcessing?.skippedSamples ?? recovery.skippedSamples ?? 0}</span>
       {recoveryPaused && <button disabled={busy} onClick={() => void act('recover-decodable/resume', {version:active.revision,expectedRevision:video.revision,requestId:uid()})}>继续此条</button>}
       {recovery.state==='attention'&&!recoveryProofReady&&recoveryOptions.failedMedia&&<p>当前版本缺少可恢复的下载凭证，请重新下载或更正采集时间。</p>}
       {recovery.state==='attention'&&!recoveryProofReady&&recoveryOptions.failedMedia&&<button className="secondary" disabled={busy||!video.capabilities?.canRestartDownload} title={video.capabilities?.restartDownloadReason} onClick={restartFullDownload}>重新下载完整文件</button>}
     </div>}
-    {!recoveryRunning && !recovery && !recoveryOptions.failedMedia && active.message && active.state !== 'attention' && <p className="notice">{active.message}</p>}
+    {!video.finalProcessing && !recoveryRunning && !recovery && !recoveryOptions.failedMedia && active.message && active.state !== 'attention' && <p className="notice">{active.message}</p>}
     {recoveryOptions.failedMedia && !recoveryRunning && !recovery && <div className="notice"><strong>视频末段缺失或无法解码</strong>
       <p>{recoveryProofReady?'可复用已下载文件，处理可解码部分；坏位置跳过。':'当前版本缺少可恢复的下载凭证，请重新下载或更正采集时间。'}</p>
       {!recoveryProofReady&&recoveryOptions.canRestartDownload&&<button className="secondary" disabled={busy || !video.capabilities?.canRestartDownload} title={video.capabilities?.restartDownloadReason} onClick={restartFullDownload}>重新下载完整文件</button>}</div>}
     {recoveryOptions.checkpointProblem && <div className="notice"><strong>断点校验未通过</strong><p>请在“更多操作”中核对平台任务或重新获取完整文件；历史版本和进度保留。</p></div>}
     {active.state === 'attention' && !recoveryOptions.failedMedia && !recovery && <div className="notice"><strong>需要核对</strong><p>{({task_missing:'先重新核对这一条；任务仍不存在时，可按保留的更正区间重新采集。',task_identity_changed:'平台任务信息已变化，原绑定保留；请先核对平台实际时间。',result_missing:'先核对平台结果ID；也可查看可用旧版。',platform_failed:'平台采集失败或终止，可核对时间后重新采集。',result_identity_changed:'平台结果ID不同，请在原平台核对确切视频；原绑定已保留。',multiple_results:'平台返回多个视频，需要人工选择正确结果。',submission_ambiguous:'提交后出现多个相同任务，请核对确切任务ID，暂勿重新提交。'} as Record<string,string>)[active.review?.code || ''] || active.message || '请核对本条的任务和结果绑定。'}</p>
       {active.review?.actual && <p>平台实际：{active.review.actual.videoName} · {active.review.actual.startTime} → {active.review.actual.endTime} · {active.review.actual.taskStatus}</p>}</div>}
-    {video.finalProcessing&&<p className="notice" role="status">{video.finalProcessing.issue?.message||video.finalProcessing.message}{!!video.finalProcessing.skippedSamples&&` · 跳过 ${video.finalProcessing.skippedSamples} 个坏位置`}
+    {video.finalProcessing&&!recovery&&<p className="notice" role="status">{video.finalProcessing.issue?.message||video.finalProcessing.message}{!!video.finalProcessing.skippedSamples&&` · 跳过 ${video.finalProcessing.skippedSamples} 个异常位置`}
       {video.finalProcessing.issue&&video.finalProcessing.environmentBlocker?.message&&<><br/><span>{video.finalProcessing.environmentBlocker.message}</span></>}</p>}
-    {video.error && !active.message && <p className="notice">{video.error}</p>}
+    {video.error && !video.finalProcessing && !active.message && <p className="notice">{video.error}</p>}
     {active.state === 'downloading' && <p className="notice">已下载 {size(active.receivedBytes || 0)} / {size(active.totalBytes || 0)} · 第 {active.attempts || 1} 次尝试</p>}
     {saved?.filePath && <p className="subtle">{saved.localCleanupState==='complete'?'本地文件已清理，云端成果保留。':'本地文件已保存。'}</p>}
     {video.cleanupPending && <p className="notice">新版已保存，旧版仍在核对清理。</p>}
@@ -602,13 +602,13 @@ export default function App() {
       if(current.id!==video.id||current.revision!==video.revision||current.activeRevision!==video.activeRevision)return current;
       if(path==='confirm-and-process' && result.videoId===current.id && result.version===current.activeRevision &&
          result.expectedRevision===current.revision && !current.finalProcessing && result.state && result.stage){
-        return {...current,finalProcessing:{...result,operationId,state:result.state,stage:result.stage,
+        return {...current,recordStatus:'download',finalProcessing:{...result,operationId,state:result.state,stage:result.stage,
           message:result.message||'已确认，等待自动下载。',stageLabel:result.stageLabel||'下载已登记'},
           capabilities:current.capabilities&&{...current.capabilities,canConfirmFinal:false}};
       }
       if((path==='corrections'||path==='recapture') && current.operation?.id!==operationId && result.state &&
          ['queued','running','reconciling','waiting_connection'].includes(result.state)){
-        return {...current,operation:{id:operationId,kind:path==='corrections'?'correction':'recapture',state:result.state,
+        return {...current,recordStatus:'waiting',operation:{id:operationId,kind:path==='corrections'?'correction':'recapture',state:result.state,
           version:video.activeRevision,expectedRevision:video.revision,message:'采集更正已登记，后台正在提交。'},
           capabilities:current.capabilities&&{...current.capabilities,canConfirmFinal:false}};
       }
